@@ -1545,6 +1545,8 @@ def test_canonical_parent_update_binds_12_step_8x64_recipe(tmp_path: Path) -> No
     assert bound["recipe"]["batch_size"] == 64
     assert bound["recipe"]["global_batch_size"] == 512
     assert bound["recipe"]["trunk_lr_mult"] == 0.25
+    assert bound["recipe"]["min_35m_params"] == 42_500_000
+    assert bound["recipe"]["max_35m_params"] == 43_000_000
     assert bound["recipe"]["scalar_value_objective"] == "binary_win_bce"
     assert bound["recipe"]["scalar_value_loss_readout"] == "deployed_tanh"
     assert bound["recipe"]["scalar_value_loss_scale"] == 1.0
@@ -1558,13 +1560,11 @@ def test_canonical_parent_update_binds_12_step_8x64_recipe(tmp_path: Path) -> No
         "symmetry_augment": True,
     }
     assert bound["canonical_parent_update"]["checkpoint_steps"] == [8, 10]
-    assert bound["training_science_commissioning"]["authorized"] is False
-    assert bound["training_science_commissioning"]["go_authorized"] is False
+    assert bound["training_science_commissioning"]["authorized"] is True
+    assert bound["training_science_commissioning"]["go_authorized"] is True
     assert bound["promotion_eligible"] is False
-    assert bound["eligible_for_full_gate"] is False
-    assert bound["promotion_block_reason"] == (
-        "training_science_admission_unauthorized"
-    )
+    assert bound["eligible_for_full_gate"] is True
+    assert bound["promotion_block_reason"] == "requires_normal_full_promotion_gates"
 
     initializer = tmp_path / "initializer.pt"
     initializer.write_bytes(b"initializer")
@@ -1585,7 +1585,7 @@ def test_canonical_parent_update_binds_12_step_8x64_recipe(tmp_path: Path) -> No
             },
         }
     )
-    command = executor.build_train_command(
+    command = executor._build_direct_train_command(  # noqa: SLF001
         bound,
         python=Path(sys.executable),
         checkpoint=tmp_path / "candidate.pt",
@@ -1595,6 +1595,8 @@ def test_canonical_parent_update_binds_12_step_8x64_recipe(tmp_path: Path) -> No
     assert _option(command, "--scalar-value-objective") == "binary_win_bce"
     assert _option(command, "--scalar-value-loss-readout") == "deployed_tanh"
     assert _option(command, "--scalar-value-loss-scale") == "1.0"
+    assert _option(command, "--min-35m-params") == "42500000"
+    assert _option(command, "--max-35m-params") == "43000000"
 
 
 def test_migration_claim_schema_replays_as_derived_identity(tmp_path: Path) -> None:

@@ -3,7 +3,7 @@
   "ssh_user": "ubuntu",
   "ssh_key": "/home/ubuntu/.ssh/catan_fleet_ed25519",
   "strict_host_key_checking": "accept-new",
-  "remote_repo": "/home/ubuntu/catan-zero-fleet-v2",
+  "remote_repo": "/home/ubuntu/catan-zero-v6-eval",
   "remote_python": "/home/ubuntu/catan-zero-fleet-v2/.venv/bin/python",
   "remote_root": "/home/ubuntu/a1-evaluation",
   "validation_ledger": "/home/ubuntu/catan-zero-production/private/VAL_ONLY_EVAL_LEDGER.jsonl",

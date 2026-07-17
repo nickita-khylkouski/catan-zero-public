@@ -9338,6 +9338,15 @@ def _effective_a1_learner_training_recipe(
         "ddp_shard_data",
     )
     effective = {field: getattr(args, field) for field in bound_fields}
+    min_35m_params = int(getattr(args, "min_35m_params", 30_000_000))
+    max_35m_params = int(getattr(args, "max_35m_params", 40_000_000))
+    if (min_35m_params, max_35m_params) != (30_000_000, 40_000_000):
+        # The V6 parent update intentionally grows the commissioned topology
+        # beyond the legacy 35M envelope.  Bind non-default architecture bounds
+        # into the effective recipe so the sealed child cannot inherit parser
+        # defaults or silently widen its accepted checkpoint shape.
+        effective["min_35m_params"] = min_35m_params
+        effective["max_35m_params"] = max_35m_params
     if bool(getattr(args, "symmetry_augment", False)):
         # Event/action ids and event target ids are part of the spatial input.
         # A symmetry-enabled recipe must bind whether that history is relabelled;

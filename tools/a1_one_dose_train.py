@@ -2449,6 +2449,8 @@ def bind_canonical_parent_update_recipe(
         "minimum_initial_road_policy_mass_fraction",
         "minimum_initial_settlement_policy_mass_fraction",
         "minimum_feature_learning_signal_observations",
+        "min_35m_params",
+        "max_35m_params",
         "objective_gradient_interference_every_batches",
         "require_feature_learning_signal_modules",
         "train_diagnostics_every_batches",
@@ -6161,6 +6163,19 @@ def _build_direct_train_command(
             "--trust-curated-data-quality",
         ]
     )
+    if "min_35m_params" in recipe or "max_35m_params" in recipe:
+        if not {"min_35m_params", "max_35m_params"}.issubset(recipe):
+            raise ExecutorError(
+                "canonical model-size contract must bind both minimum and maximum"
+            )
+        command.extend(
+            [
+                "--min-35m-params",
+                str(recipe["min_35m_params"]),
+                "--max-35m-params",
+                str(recipe["max_35m_params"]),
+            ]
+        )
     if int(recipe["max_steps"]) > 0:
         # Positive capped A1 recipes are sealed optimizer-update doses, not
         # best-effort epoch caps. Keep max_steps=0 historical epoch-bounded
