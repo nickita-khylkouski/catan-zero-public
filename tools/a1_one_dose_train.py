@@ -2272,6 +2272,27 @@ def verify_training_inputs(
     }
 
 
+def _same_checkpoint_reference(left: object, right: object) -> bool:
+    """Compare the immutable checkpoint identity, not optional registry metadata.
+
+    Migration receipts intentionally store the minimal ``path``/``sha256``
+    reference, while the generation lock enriches the same checkpoint with
+    registry fields such as id, role, version, md5, and metadata.  Comparing
+    the complete mappings makes every valid migration look different from its
+    corpus producer.
+    """
+
+    if not isinstance(left, Mapping) or not isinstance(right, Mapping):
+        return False
+    return {
+        "path": left.get("path"),
+        "sha256": left.get("sha256"),
+    } == {
+        "path": right.get("path"),
+        "sha256": right.get("sha256"),
+    }
+
+
 def bind_canonical_parent_update_recipe(
     verified: dict[str, Any], config_path: Path
 ) -> dict[str, Any]:
@@ -2396,7 +2417,9 @@ def bind_canonical_parent_update_recipe(
         not isinstance(migration, dict)
         or migration.get("migration")
         != information_migration.MIGRATION_CURRENT_V2_TO_V6_TOPOLOGY_SPLIT1
-        or migration.get("source") != verified["producer"]
+        or not _same_checkpoint_reference(
+            migration.get("source"), verified["producer"]
+        )
         or migration.get("forward_identical") is not False
         or migration.get("promotion_eligible") is not False
     ):
@@ -6788,7 +6811,9 @@ def bind_information_contract_migration(
     if (
         migration.get("migration")
         != information_migration.MIGRATION_CURRENT_V2_TO_V6_TOPOLOGY_SPLIT1
-        or migration.get("source") != verified.get("producer")
+        or not _same_checkpoint_reference(
+            migration.get("source"), verified.get("producer")
+        )
         or migration.get("forward_identical") is not False
         or migration.get("promotion_eligible") is not False
     ):
