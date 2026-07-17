@@ -49,6 +49,10 @@ from catan_zero.rl.aux_subgoal_targets import (
     AUX_SUBGOAL_TARGET_VERSION_KEY,
     AUX_TARGET_KEYS,
 )
+from catan_zero.rl.actor_public_rule_state_admission import (
+    ActorPublicRuleStateAdmissionError,
+    audit_actor_playable_development_cards,
+)
 from catan_zero.rl.pipeline_configs import TrainConfig
 from tools import a1_current_science_contract as current_science
 from catan_zero.rl.torch_ppo import build_action_feature_table, create_ppo_policy
@@ -12961,6 +12965,49 @@ def _audit_public_award_component_column(
     return result
 
 
+def _audit_actor_public_rule_state_corpus(
+    data: Any,
+    *,
+    ddp: dict[str, int | bool],
+) -> dict[str, object]:
+    """Authenticate playable-development-card inputs before optimization."""
+
+    corpora = tuple(getattr(data, "corpora", ())) or (data,)
+    component_ids = tuple(getattr(data, "component_ids", ()))
+
+    def _scan_components() -> list[dict[str, Any]]:
+        return [
+            audit_actor_playable_development_cards(
+                corpus,
+                where=(
+                    str(component_ids[index])
+                    if index < len(component_ids)
+                    else f"component_{index}"
+                ),
+            )
+            for index, corpus in enumerate(corpora)
+        ]
+
+    try:
+        components = _rank0_authoritative_call(
+            ddp,
+            "actor playable-development-card corpus admission",
+            _scan_components,
+        )
+    except ActorPublicRuleStateAdmissionError as error:
+        raise SystemExit(str(error)) from error
+    if not isinstance(components, list) or len(components) != len(corpora):
+        raise SystemExit(
+            "actor playable-development-card corpus admission returned malformed evidence"
+        )
+    return {
+        "schema_version": "actor-playable-development-card-corpus-admission-v1",
+        "authenticated": True,
+        "components": components,
+        "component_count": len(components),
+    }
+
+
 def _authorize_mixed_public_award_transition(data: Any) -> dict[str, object]:
     """Authorize the one exact 64/12/4/20 row-routed feature transition."""
 
@@ -14347,6 +14394,21 @@ def main(
         ),
         ddp,
     )
+    actor_public_rule_state_corpus_admission: dict[str, object] | None = None
+    if args.arch == "entity_graph" and bool(args.public_rule_state_features):
+        actor_public_rule_state_corpus_admission = (
+            _audit_actor_public_rule_state_corpus(data, ddp=ddp)
+        )
+        _rank0_print(
+            json.dumps(
+                {
+                    "progress": "actor_public_rule_state_corpus_admission",
+                    **actor_public_rule_state_corpus_admission,
+                },
+                sort_keys=True,
+            ),
+            ddp,
+        )
     public_award_feature_training: dict[str, object]
     model_parameter_accounting: dict[str, object] | None = None
     if args.arch == "candidate":
@@ -20016,6 +20078,9 @@ def main(
             else None
         ),
         "public_award_feature_training": public_award_feature_training,
+        "actor_public_rule_state_corpus_admission": (
+            actor_public_rule_state_corpus_admission
+        ),
         "seed": int(args.seed),
         "sampler_seed": int(sampler_seed),
         "sampler_seed_explicit": getattr(args, "sampler_seed", None) is not None,

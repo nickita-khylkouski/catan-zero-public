@@ -53,6 +53,9 @@ from typing import Any, Callable
 import numpy as np
 
 from catan_zero.deduction_tracker import DEDUCTION_FEATURES_KEY
+from catan_zero.rl.actor_public_rule_state_admission import (
+    audit_actor_playable_development_cards,
+)
 from catan_zero.rl.action_mask import ActionCatalog
 from catan_zero.rl.decision_taxonomy import (
     AUTOMATIC_TRANSITION,
@@ -76,7 +79,16 @@ from catan_zero.rl.aux_subgoal_targets import (
 )
 from catan_zero.rl.flywheel import ChampionRef, OpponentPolicy, choose_opponent
 from catan_zero.rl.flywheel.opponent_mix import OpponentMixConfig, choose_mix_opponent
-from catan_zero.rl.entity_feature_adapter import require_known_entity_feature_adapter
+from catan_zero.rl.entity_feature_adapter import (
+    RUST_ENTITY_ADAPTER_V4,
+    RUST_ENTITY_ADAPTER_V5,
+    require_known_entity_feature_adapter,
+)
+from catan_zero.rl.entity_token_features_rust import (
+    build_entity_features_rust,
+    compute_rust_topology,
+    require_rust_feature_path,
+)
 from catan_zero.rl.target_reliability import (
     TARGET_RELIABILITY_COLUMNS,
     TARGET_RELIABILITY_SCHEMA,
@@ -763,6 +775,7 @@ def _build_public_learner_features(
     meaningful_public_history_schema: str = (MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION),
     event_history_limit: int = 64,
     entity_feature_adapter_version: str = RUST_ENTITY_ADAPTER_VERSION,
+    rust_topology_cache: dict[str, Any] | None = None,
 ) -> tuple[
     tuple[int, ...],
     dict[str, np.ndarray],
@@ -821,6 +834,82 @@ def _build_public_learner_features(
         entity_feature_adapter_version=entity_feature_adapter_version,
         resolved=resolved,
     )
+    entity = {key: value[0] for key, value in entity.items()}
+    adapter_version = require_known_entity_feature_adapter(
+        entity_feature_adapter_version
+    )
+    if adapter_version in {RUST_ENTITY_ADAPTER_V4, RUST_ENTITY_ADAPTER_V5}:
+        # The actor public-rule-state contract depends on turn-local
+        # ``owned_at_start``.  Released wheels before the repaired JSON ABI
+        # retained that field authoritatively inside the native Game and used
+        # it in build_entity_features_flat, but omitted it from
+        # player_state_json.  The Python adapter therefore produced plausible
+        # all-zero playable-card slots.  Persist those four slots only from
+        # the authoritative native builder and prove every other learner
+        # tensor remains bit-exact with the Python path.
+        require_rust_feature_path()
+        cache = rust_topology_cache if rust_topology_cache is not None else {}
+        topology = cache.get("topology")
+        if topology is None:
+            topology = compute_rust_topology(resolved[1], str(actor))
+            cache["topology"] = topology
+        native_legal = tuple(
+            int(action)
+            for action in game.playable_action_indices(list(colors), None)
+        )
+        native_mapped = rust_policy_action_ids(
+            game,
+            native_legal,
+            colors=colors,
+            action_size=action_size,
+            action_by_id=action_by_id,
+        )
+        native_entity = build_entity_features_rust(
+            game,
+            colors=colors,
+            policy_action_ids=native_mapped,
+            action_size=action_size,
+            topology=topology,
+            public_observation=True,
+            meaningful_public_history=meaningful_public_history,
+            history_limit=event_history_limit,
+            meaningful_public_history_schema=meaningful_public_history_schema,
+            entity_feature_adapter_version=adapter_version,
+        )
+        if native_legal != tuple(legal_rust) or native_mapped != tuple(mapped):
+            raise RuntimeError(
+                "native actor public-rule-state repair requires identical legal "
+                "action ordering between learner and native featurizers"
+            )
+        parity_failures: list[str] = []
+        for key, python_value in entity.items():
+            if key not in native_entity:
+                parity_failures.append(f"{key}:missing_native")
+                continue
+            python_array = np.asarray(python_value)
+            native_array = np.asarray(native_entity[key])
+            if key == "global_tokens":
+                python_array = np.concatenate(
+                    (python_array[..., :12], python_array[..., 16:]), axis=-1
+                )
+                native_array = np.concatenate(
+                    (native_array[..., :12], native_array[..., 16:]), axis=-1
+                )
+            if (
+                python_array.shape != native_array.shape
+                or not np.array_equal(python_array, native_array, equal_nan=True)
+            ):
+                parity_failures.append(key)
+        if parity_failures:
+            raise RuntimeError(
+                "native actor public-rule-state repair found Python/native "
+                f"learner tensor drift outside slots 12:16: {parity_failures}"
+            )
+        repaired_global = np.asarray(entity["global_tokens"]).copy()
+        repaired_global[..., 12:16] = np.asarray(native_entity["global_tokens"])[
+            ..., 12:16
+        ]
+        entity["global_tokens"] = repaired_global
     context = rust_action_context_batch(
         game,
         legal_rust,
@@ -834,7 +923,7 @@ def _build_public_learner_features(
     )[0]
     return (
         mapped,
-        {key: value[0] for key, value in entity.items()},
+        entity,
         context,
         snapshot,
         action_by_id,
@@ -863,6 +952,7 @@ def _build_decision_row(
     decision_class: str = "normal_choice",
     search_budget_reason_value: str = "normal_choice_playout_cap_randomization",
     entity_feature_adapter_version: str = RUST_ENTITY_ADAPTER_VERSION,
+    rust_topology_cache: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, np.ndarray]]:
     if target_information_regime not in TARGET_INFORMATION_REGIMES:
         raise ValueError(
@@ -891,6 +981,7 @@ def _build_decision_row(
         meaningful_public_history_schema=meaningful_public_history_schema,
         event_history_limit=event_history_limit,
         entity_feature_adapter_version=entity_feature_adapter_version,
+        rust_topology_cache=rust_topology_cache,
     )
 
     # F4: fp32, not fp16. improved_policy assigns real (non-zero, non-one-hot)
@@ -1352,6 +1443,7 @@ def play_one_game(
     forced_decisions = 0
     simulations_used_total = 0
     terminal = False
+    learner_rust_topology_cache: dict[str, Any] = {}
 
     while decision_index < int(config.max_decisions):
         if game.winning_color() is not None:
@@ -1556,6 +1648,7 @@ def play_one_game(
                 decision_class=decision_class,
                 search_budget_reason_value=budget_reason,
                 entity_feature_adapter_version=(learner_entity_feature_adapter_version),
+                rust_topology_cache=learner_rust_topology_cache,
             )
             if reliability_fields is not None:
                 row.update(reliability_fields)
@@ -1715,6 +1808,23 @@ class GumbelShardWriter:
             self.rows,
             preserve_search_evidence=self.preserve_search_evidence,
         )
+        adapter_versions = set(
+            map(str, np.asarray(arrays.get("adapter_version", ())).tolist())
+        )
+        commissioned_rule_state_versions = {
+            RUST_ENTITY_ADAPTER_V4,
+            RUST_ENTITY_ADAPTER_V5,
+        }
+        if adapter_versions & commissioned_rule_state_versions:
+            if not adapter_versions <= commissioned_rule_state_versions:
+                raise RuntimeError(
+                    "one shard cannot mix commissioned actor public-rule-state "
+                    f"and legacy adapters: {sorted(adapter_versions)}"
+                )
+            audit_actor_playable_development_cards(
+                arrays,
+                where=f"pending shard {self.index}",
+            )
         path = self.output / f"gumbel_self_play_shard_{self.index:05d}.npz"
         tmp = path.with_name(path.name + ".tmp")
         with tmp.open("wb") as handle:

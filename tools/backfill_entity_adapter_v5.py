@@ -32,7 +32,7 @@ import tempfile
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Sequence
 
 import numpy as np
 
@@ -44,6 +44,9 @@ if str(_SRC) not in sys.path:
 from catan_zero.rl.entity_feature_adapter import (
     RUST_ENTITY_ADAPTER_V2,
     RUST_ENTITY_ADAPTER_V5,
+)
+from catan_zero.rl.actor_public_rule_state_admission import (
+    audit_actor_playable_development_cards,
 )
 from catan_zero.rl.gumbel_self_play import (
     _apply_selected_action,
@@ -109,6 +112,7 @@ class ShardReceipt:
     games: int
     v5_rule_slot_nonzero_counts: tuple[int, ...]
     live_event_rows: int
+    actor_playable_development_card_admission: dict[str, Any]
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -124,6 +128,9 @@ class ShardReceipt:
                 self.v5_rule_slot_nonzero_counts
             ),
             "live_event_rows": self.live_event_rows,
+            "actor_playable_development_card_admission": (
+                self.actor_playable_development_card_admission
+            ),
         }
 
 
@@ -326,6 +333,7 @@ def _replay_archive(
             game = catanatron_rs.Game.simple(list(COLORS), seed=seed)
             chance_rng = random.Random(seed ^ CHANCE_SEED_XOR)
             live_decision = 0
+            rust_topology_cache: dict[str, Any] = {}
             for row in range(first, int(span.stop)):
                 expected_decision = int(archive["decision_index"][row])
                 while live_decision < expected_decision:
@@ -411,6 +419,7 @@ def _replay_archive(
                         ),
                         event_history_limit=64,
                         entity_feature_adapter_version=RUST_ENTITY_ADAPTER_V5,
+                        rust_topology_cache=rust_topology_cache,
                     )
                 )
                 for key in ADAPTER_OWNED_KEYS:
@@ -512,6 +521,10 @@ def _process_one(args: tuple[str, str, str | None, str | None]) -> ShardReceipt:
     raw_source, source_relative, raw_output, output_relative = args
     source = Path(raw_source)
     arrays, games, counts, live_event_rows = _replay_archive(source)
+    actor_playable_admission = audit_actor_playable_development_cards(
+        arrays,
+        where=str(source),
+    )
     output = Path(raw_output) if raw_output else None
     output_sha = None
     if output is not None:
@@ -530,6 +543,7 @@ def _process_one(args: tuple[str, str, str | None, str | None]) -> ShardReceipt:
         games=int(games),
         v5_rule_slot_nonzero_counts=counts,
         live_event_rows=int(live_event_rows),
+        actor_playable_development_card_admission=actor_playable_admission,
     )
 
 
@@ -581,6 +595,12 @@ def _write_output_manifest(output_dir: Path, receipt_path: Path) -> Path:
             "schema": BACKFILL_SCHEMA,
             "source_adapter": RUST_ENTITY_ADAPTER_V2,
             "output_adapter": RUST_ENTITY_ADAPTER_V5,
+            "receipt": receipt_path.name,
+            "receipt_file_sha256": _sha256(receipt_path),
+        },
+        "actor_playable_development_card_admission": {
+            "schema_version": "actor-playable-development-card-admission-v1",
+            "status": "authenticated",
             "receipt": receipt_path.name,
             "receipt_file_sha256": _sha256(receipt_path),
         },
