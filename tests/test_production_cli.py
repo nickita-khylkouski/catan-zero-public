@@ -145,6 +145,134 @@ def _mock_exact_runtime(
     monkeypatch.setattr(cli, "_git_identity", lambda _root: clean_repository)
 
 
+def _commissioning_fixture(tmp_path: Path) -> tuple[Path, dict[str, object], Path]:
+    repo = tmp_path / "repo"
+    config = repo / "configs/training/recipe.json"
+    config.parent.mkdir(parents=True)
+    config.write_text("{}", encoding="utf-8")
+    evidence_dir = repo / "docs/evidence"
+    evidence_dir.mkdir(parents=True)
+    identity: dict[str, object] = {
+        "config": str(config),
+        "config_sha256": canonical_json_sha256({}),
+    }
+    return repo, identity, evidence_dir
+
+
+def _primary_commissioning(
+    identity: dict[str, object], repo: Path
+) -> dict[str, object]:
+    return {
+        "schema_version": "a1-coherent-v6-b12-commissioning-evidence-v1",
+        "code": {
+            "recipe": Path(str(identity["config"])).relative_to(repo).as_posix(),
+            "recipe_canonical_sha256": identity["config_sha256"],
+        },
+        "commissioning_gates": {"passed": True},
+        "decision": {"authorize_sealed_parent_update": True},
+    }
+
+
+def test_authorized_training_evidence_binds_exact_primary_and_support(
+    tmp_path: Path,
+) -> None:
+    repo, identity, evidence_dir = _commissioning_fixture(tmp_path)
+    primary = evidence_dir / "primary.json"
+    primary.write_text(
+        json.dumps(_primary_commissioning(identity, repo)), encoding="utf-8"
+    )
+    support = evidence_dir / "support.json"
+    support.write_text(
+        json.dumps({"schema_version": "a1-effective-policy-signal-audit-v1"}),
+        encoding="utf-8",
+    )
+
+    validated = contracts.validate_training_commissioning_evidence(
+        repo,
+        identity=identity,
+        evidence=["docs/evidence/primary.json", "docs/evidence/support.json"],
+    )
+
+    assert [item["schema_version"] for item in validated] == [
+        "a1-coherent-v6-b12-commissioning-evidence-v1",
+        "a1-effective-policy-signal-audit-v1",
+    ]
+
+
+@pytest.mark.parametrize("drift", ("recipe", "recipe_canonical_sha256"))
+def test_authorized_training_evidence_rejects_primary_identity_drift(
+    tmp_path: Path, drift: str
+) -> None:
+    repo, identity, evidence_dir = _commissioning_fixture(tmp_path)
+    payload = _primary_commissioning(identity, repo)
+    code = payload["code"]
+    assert isinstance(code, dict)
+    code[drift] = "wrong"
+    (evidence_dir / "primary.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(
+        contracts.ProductionContractError,
+        match="does not bind the exact recipe",
+    ):
+        contracts.validate_training_commissioning_evidence(
+            repo,
+            identity=identity,
+            evidence=["docs/evidence/primary.json"],
+        )
+
+
+@pytest.mark.parametrize("field", ("gates", "decision"))
+def test_authorized_training_evidence_rejects_failed_primary(
+    tmp_path: Path, field: str
+) -> None:
+    repo, identity, evidence_dir = _commissioning_fixture(tmp_path)
+    payload = _primary_commissioning(identity, repo)
+    if field == "gates":
+        payload["commissioning_gates"] = {"passed": False}
+    else:
+        payload["decision"] = {"authorize_sealed_parent_update": False}
+    (evidence_dir / "primary.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(
+        contracts.ProductionContractError,
+        match="does not authorize training",
+    ):
+        contracts.validate_training_commissioning_evidence(
+            repo,
+            identity=identity,
+            evidence=["docs/evidence/primary.json"],
+        )
+
+
+def test_authorized_training_evidence_rejects_support_only_and_unsafe_paths(
+    tmp_path: Path,
+) -> None:
+    repo, identity, evidence_dir = _commissioning_fixture(tmp_path)
+    support = evidence_dir / "support.json"
+    support.write_text(
+        json.dumps({"schema_version": "a1-effective-policy-signal-audit-v1"}),
+        encoding="utf-8",
+    )
+    with pytest.raises(
+        contracts.ProductionContractError,
+        match="matching primary commissioning evidence",
+    ):
+        contracts.validate_training_commissioning_evidence(
+            repo,
+            identity=identity,
+            evidence=["docs/evidence/support.json"],
+        )
+    with pytest.raises(
+        contracts.ProductionContractError,
+        match="checked-in JSON under docs/evidence",
+    ):
+        contracts.validate_training_commissioning_evidence(
+            repo,
+            identity=identity,
+            evidence=["../outside.json"],
+        )
+
+
 def test_status_exposes_v7_parent_and_scratch_as_fail_closed() -> None:
     status = production_status(ROOT)
 
@@ -158,9 +286,7 @@ def test_status_exposes_v7_parent_and_scratch_as_fail_closed() -> None:
     parent = train["recipes"]["a1-parent-update-35m-b200"]
     assert parent["authorized"] is False
     assert parent["status"] == "blocked"
-    assert parent["reason"] == (
-        "v7_action_decoder_requires_fresh_commissioning"
-    )
+    assert parent["reason"] == ("v7_action_decoder_requires_fresh_commissioning")
     assert len(parent["unresolved_requirements"]) == 2
     assert status["pipelines"]["ppo"]["authorized"] is False
 
@@ -266,7 +392,9 @@ def test_training_science_admission_cannot_authorize_recipe_digest_drift(
         contracts.pipeline_readiness(ROOT, "train", "a1-parent-update-35m-b200")
 
 
-def test_training_science_admission_keeps_v5_quarantine_after_v6_commissioning() -> None:
+def test_training_science_admission_keeps_v5_quarantine_after_v6_commissioning() -> (
+    None
+):
     payload = json.loads(
         (ROOT / contracts.TRAINING_SCIENCE_ADMISSION).read_text(encoding="utf-8")
     )
@@ -440,9 +568,7 @@ def _fake_native_runtime(
     )
     native_module = SimpleNamespace(__file__=str(loaded_path or extension))
     monkeypatch.setitem(cli.sys.modules, "catanatron_rs", package)
-    monkeypatch.setitem(
-        cli.sys.modules, "catanatron_rs.catanatron_rs", native_module
-    )
+    monkeypatch.setitem(cli.sys.modules, "catanatron_rs.catanatron_rs", native_module)
     return extension
 
 
@@ -757,9 +883,7 @@ def _write_admissible_outputs(plan: dict[str, object]) -> set[str]:
                     },
                 },
             }
-            execution["receipt_sha256"] = (
-                "sha256:" + canonical_json_sha256(execution)
-            )
+            execution["receipt_sha256"] = "sha256:" + canonical_json_sha256(execution)
             (run_dir / "scratch.execution.json").write_text(
                 json.dumps(execution), encoding="utf-8"
             )
@@ -894,9 +1018,10 @@ def test_zero_exit_with_input_mutation_is_failed_before_output_admission(
     assert receipt["status"] == "failed"
     assert receipt["command_returncode"] == 0
     assert receipt["returncode"] == 1
-    assert "production inputs changed during execution" in receipt[
-        "output_admission_error"
-    ]
+    assert (
+        "production inputs changed during execution"
+        in receipt["output_admission_error"]
+    )
     assert "input checkpoint drift" in receipt["output_admission_error"]
     assert "outputs" not in receipt
 

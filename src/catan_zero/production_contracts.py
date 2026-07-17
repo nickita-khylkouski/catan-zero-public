@@ -55,6 +55,15 @@ TRAIN_ACCELERATOR_MODELS = {
 }
 TRAINING_SCIENCE_ADMISSION = Path("configs/production/training_science_admission.json")
 TRAINING_SCIENCE_ADMISSION_SCHEMA = "catan-zero-training-science-admission-v1"
+PRIMARY_TRAINING_EVIDENCE_SCHEMAS = frozenset(
+    {"a1-coherent-v6-b12-commissioning-evidence-v1"}
+)
+SUPPORTING_TRAINING_EVIDENCE_SCHEMAS = frozenset(
+    {
+        "a1-coherent-v5-dose-selection-evidence-v1",
+        "a1-effective-policy-signal-audit-v1",
+    }
+)
 
 
 class ProductionContractError(RuntimeError):
@@ -80,6 +89,105 @@ def _read_json_object(path: Path, *, label: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ProductionContractError(f"{label} must contain a JSON object: {path}")
     return value
+
+
+def validate_training_commissioning_evidence(
+    repo: Path,
+    *,
+    identity: dict[str, Any],
+    evidence: list[Any],
+) -> list[dict[str, Any]]:
+    """Authenticate evidence before it is allowed to authorize training.
+
+    Supporting audits can explain a decision, but at least one primary
+    commissioning record must bind the exact live recipe and report passing
+    gates. Blocked admissions intentionally retain historical evidence without
+    calling this validator.
+    """
+
+    try:
+        repo_root = repo.resolve(strict=True)
+        evidence_root = (repo_root / "docs/evidence").resolve(strict=True)
+        config_path = Path(str(identity["config"])).resolve(strict=True)
+        config_relative = config_path.relative_to(repo_root).as_posix()
+    except (KeyError, OSError, ValueError) as error:
+        raise ProductionContractError(
+            f"cannot resolve training commissioning authority: {error}"
+        ) from error
+    expected_hash = identity.get("config_sha256")
+    if not isinstance(expected_hash, str) or not expected_hash:
+        raise ProductionContractError(
+            "training recipe identity has no canonical digest"
+        )
+
+    seen: set[str] = set()
+    validated: list[dict[str, Any]] = []
+    primary_count = 0
+    allowed_schemas = (
+        PRIMARY_TRAINING_EVIDENCE_SCHEMAS | SUPPORTING_TRAINING_EVIDENCE_SCHEMAS
+    )
+    for reference in evidence:
+        if not isinstance(reference, str) or not reference or reference in seen:
+            raise ProductionContractError(
+                "authorized training evidence paths must be unique nonempty strings"
+            )
+        seen.add(reference)
+        relative = Path(reference)
+        if (
+            relative.is_absolute()
+            or relative.suffix != ".json"
+            or ".." in relative.parts
+            or relative.parts[:2] != ("docs", "evidence")
+        ):
+            raise ProductionContractError(
+                "authorized training evidence must be checked-in JSON under docs/evidence"
+            )
+        candidate = repo_root / relative
+        try:
+            resolved = candidate.resolve(strict=True)
+            resolved.relative_to(evidence_root)
+        except (OSError, ValueError) as error:
+            raise ProductionContractError(
+                "authorized training evidence must be checked-in JSON under docs/evidence"
+            ) from error
+        if resolved != candidate or candidate.is_symlink() or not resolved.is_file():
+            raise ProductionContractError(
+                "authorized training evidence must be a regular non-symlink file"
+            )
+        payload = _read_json_object(resolved, label="training commissioning evidence")
+        schema = payload.get("schema_version")
+        if schema not in allowed_schemas:
+            raise ProductionContractError(
+                f"unsupported training evidence schema: {schema!r}"
+            )
+        if schema in PRIMARY_TRAINING_EVIDENCE_SCHEMAS:
+            code = payload.get("code")
+            gates = payload.get("commissioning_gates")
+            decision = payload.get("decision")
+            if (
+                not isinstance(code, dict)
+                or code.get("recipe") != config_relative
+                or code.get("recipe_canonical_sha256") != expected_hash
+            ):
+                raise ProductionContractError(
+                    "primary commissioning evidence does not bind the exact recipe"
+                )
+            if (
+                not isinstance(gates, dict)
+                or gates.get("passed") is not True
+                or not isinstance(decision, dict)
+                or decision.get("authorize_sealed_parent_update") is not True
+            ):
+                raise ProductionContractError(
+                    "primary commissioning evidence does not authorize training"
+                )
+            primary_count += 1
+        validated.append({"path": reference, "schema_version": schema})
+    if primary_count == 0:
+        raise ProductionContractError(
+            "authorized training requires matching primary commissioning evidence"
+        )
+    return validated
 
 
 def _recipe_entry(pipeline: str, recipe: str | None) -> dict[str, str]:
@@ -212,6 +320,12 @@ def pipeline_readiness(
         if authorized and (unresolved or not evidence):
             raise ProductionContractError(
                 "authorized training requires resolved blockers and commissioning evidence"
+            )
+        if authorized:
+            validate_training_commissioning_evidence(
+                repo,
+                identity=identity,
+                evidence=evidence,
             )
         if not authorized and not unresolved:
             raise ProductionContractError(

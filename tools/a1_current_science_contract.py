@@ -16,6 +16,11 @@ import os
 from pathlib import Path
 from typing import Any, Mapping
 
+from catan_zero.production_contracts import (
+    ProductionContractError,
+    validate_training_commissioning_evidence,
+)
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CONTRACT_PATH = (
@@ -24,13 +29,11 @@ CONTRACT_PATH = (
 )
 TEMPLATE_PATH = REPO_ROOT / "configs/experiments/a1_pre_wave_contract_v4.template.json"
 GENERATOR_CONFIG_PATH = (
-    REPO_ROOT
-    / "configs/generation/coherent_public_n128.schema20.json"
+    REPO_ROOT / "configs/generation/coherent_public_n128.schema20.json"
 )
 PRODUCTION_RECIPE_CATALOG_PATH = REPO_ROOT / "configs/production_recipes.json"
 GENERATOR_GUARD_PATH = (
-    REPO_ROOT
-    / "configs/guards/a1_generation_coherent_public_n128_v4.json"
+    REPO_ROOT / "configs/guards/a1_generation_coherent_public_n128_v4.json"
 )
 CANONICAL_PARENT_UPDATE_CONFIG_PATH = (
     REPO_ROOT / "configs/training/a1_parent_update_35m_b200.schema1.json"
@@ -41,9 +44,7 @@ TRAINING_SCIENCE_ADMISSION_PATH = (
 SCHEMA_VERSION = "a1-current-science-contract-v3"
 TEACHER_REPORT_SCHEMA = "teacher-operator-causal-report-v1"
 ADOPTION_RECEIPT_SCHEMA = "a1-teacher-operator-adoption-v1"
-TRAINING_SCIENCE_COMMISSIONING_SCHEMA = (
-    "a1-selected-parent-update-commissioning-v1"
-)
+TRAINING_SCIENCE_COMMISSIONING_SCHEMA = "a1-selected-parent-update-commissioning-v1"
 ADAPTIVE_FIELDS = (
     "n_full_wide",
     "n_full_wide_threshold",
@@ -54,12 +55,8 @@ CURRENT_TEACHER_ENTITY_ADAPTER = "rust_entity_adapter_v2_land_topology_ports_mar
 CURRENT_LEARNER_ENTITY_ADAPTER = (
     "rust_entity_adapter_v6_exact_actor_resources_initial_road_two_hop"
 )
-CURRENT_ARCHITECTURE_UPGRADE_FLAGS = (
-    "v5_to_v7_input_compatibility_migration"
-)
-CURRENT_ARCHITECTURE_UPGRADE_MODULE = (
-    "entity_graph.v5_to_v7_input_compatibility.v1"
-)
+CURRENT_ARCHITECTURE_UPGRADE_FLAGS = "v5_to_v7_input_compatibility_migration"
+CURRENT_ARCHITECTURE_UPGRADE_MODULE = "entity_graph.v5_to_v7_input_compatibility.v1"
 CURRENT_MEANINGFUL_HISTORY_POOLING = "ordered_attention_v2"
 PRODUCTION_LEARNER_SIGNAL_CONTRACT = {
     # The checked-in recipe is a representation-learning run from random
@@ -165,8 +162,7 @@ PRODUCTION_LEARNER_SIGNAL_CONTRACT = {
     # the previously audited exact-prompt hard-decision weights.  On that same
     # measure they reduce PLAY_TURN to 52.27% and raise road/discard/robber.
     "phase_weights": (
-        "PLAY_TURN=4.0,MOVE_ROBBER=3.0,"
-        "BUILD_INITIAL_ROAD=2.0,DISCARD=1.5"
+        "PLAY_TURN=4.0,MOVE_ROBBER=3.0,BUILD_INITIAL_ROAD=2.0,DISCARD=1.5"
     ),
     # Policy phase repair must not silently starve opening/robber/discard value
     # calibration.
@@ -210,9 +206,7 @@ PRODUCTION_LEARNER_MODEL_CONSTRUCTION_CONTRACT = {
         "dev_used_road_building_free_roads_discard_remainder_playable_dev_counts"
     ),
     "meaningful_public_history": True,
-    "meaningful_public_history_schema": (
-        "meaningful_public_history_2p_no_trade_v2"
-    ),
+    "meaningful_public_history_schema": ("meaningful_public_history_2p_no_trade_v2"),
     "meaningful_public_history_pooling": CURRENT_MEANINGFUL_HISTORY_POOLING,
     "meaningful_public_history_target_gather": True,
     "event_history_limit": 64,
@@ -286,9 +280,7 @@ PRODUCTION_LEARNER_SELECTION_CONTRACT = {
         "authorization_authority": (
             "configs/production/training_science_admission.json"
         ),
-        "authorization_reason": (
-            "v7_action_decoder_requires_fresh_commissioning"
-        ),
+        "authorization_reason": ("v7_action_decoder_requires_fresh_commissioning"),
     },
     "research_scratch_status": "research_only_unresolved_not_selected",
 }
@@ -367,14 +359,10 @@ PRODUCTION_GENERATION_RUNTIME_FIELD_MAP = {
     "eval_server_matmul_precision": "eval_server_matmul_precision",
     "eval_server_request_collector": "eval_server_request_collector",
     "eval_server_transport": "eval_server_transport",
-    "eval_server_shared_memory_slot_bytes": (
-        "eval_server_shared_memory_slot_bytes"
-    ),
+    "eval_server_shared_memory_slot_bytes": ("eval_server_shared_memory_slot_bytes"),
     "eval_server_event_token_limit": "eval_server_event_token_limit",
     "eval_server_cuda_graph": "eval_server_cuda_graph",
-    "eval_server_cuda_graph_batch_buckets": (
-        "eval_server_cuda_graph_batch_buckets"
-    ),
+    "eval_server_cuda_graph_batch_buckets": ("eval_server_cuda_graph_batch_buckets"),
     "eval_server_cuda_graph_warmup_iterations": (
         "eval_server_cuda_graph_warmup_iterations"
     ),
@@ -438,18 +426,15 @@ def _load() -> dict[str, Any]:
         "adopted_teacher_campaign",
     }:
         raise ScienceContractError("current operator selection status is invalid")
-    if (
-        selection.get("report_schema") != TEACHER_REPORT_SCHEMA
-        or selection.get("mutable_fields") != list(ADAPTIVE_FIELDS)
-    ):
+    if selection.get("report_schema") != TEACHER_REPORT_SCHEMA or selection.get(
+        "mutable_fields"
+    ) != list(ADAPTIVE_FIELDS):
         raise ScienceContractError("current operator selection authority drifted")
     if selection["status"] == "adopted_teacher_campaign":
         selected_fields = _selected_adaptive_fields(
             str(selection.get("selected_operator"))
         )
-        actual_fields = {
-            key: operator["search"].get(key) for key in ADAPTIVE_FIELDS
-        }
+        actual_fields = {key: operator["search"].get(key) for key in ADAPTIVE_FIELDS}
         if actual_fields != selected_fields or not isinstance(
             selection.get("report"), dict
         ):
@@ -497,14 +482,12 @@ def _load() -> dict[str, Any]:
     if (
         not isinstance(selected_engine, dict)
         or not isinstance(selected_train, dict)
-        or selected_engine.get("initialization_mode")
-        != selected_initialization["mode"]
+        or selected_engine.get("initialization_mode") != selected_initialization["mode"]
         or selected_engine.get("entity_feature_adapter_version")
         != selected_initialization["entity_feature_adapter_version"]
         or selected_train.get("resume_optimizer") is not False
         or selected_initialization.get("optimizer_state") != "fresh"
-        or selected_train.get("batch_size")
-        != selected_topology["local_batch_size"]
+        or selected_train.get("batch_size") != selected_topology["local_batch_size"]
         or selected_train.get("grad_accum_steps")
         != selected_topology["grad_accum_steps"]
         or selected_topology["world_size"]
@@ -527,8 +510,7 @@ def _load() -> dict[str, Any]:
         else None
     )
     if (
-        admission.get("schema_version")
-        != "catan-zero-training-science-admission-v1"
+        admission.get("schema_version") != "catan-zero-training-science-admission-v1"
         or not isinstance(admission_recipe, dict)
         or admission_recipe.get("recipe_canonical_sha256")
         != PRODUCTION_LEARNER_SELECTION_CONTRACT["config_canonical_sha256"]
@@ -536,8 +518,7 @@ def _load() -> dict[str, Any]:
         or not isinstance(selected_topology.get("go_authorized"), bool)
         or admission_recipe.get("authorized")
         is not selected_topology.get("go_authorized")
-        or admission_recipe.get("reason")
-        != selected_topology["authorization_reason"]
+        or admission_recipe.get("reason") != selected_topology["authorization_reason"]
         or (
             admission_recipe.get("authorized") is True
             and (
@@ -554,6 +535,22 @@ def _load() -> dict[str, Any]:
             "selected parent-update admission must remain exact and fail-closed "
             "unless its typed commissioning and go authority agree"
         )
+    if admission_recipe.get("authorized") is True:
+        try:
+            validate_training_commissioning_evidence(
+                REPO_ROOT,
+                identity={
+                    "config": str(CANONICAL_PARENT_UPDATE_CONFIG_PATH),
+                    "config_sha256": PRODUCTION_LEARNER_SELECTION_CONTRACT[
+                        "config_canonical_sha256"
+                    ],
+                },
+                evidence=admission_recipe["commissioning_evidence"],
+            )
+        except ProductionContractError as error:
+            raise ScienceContractError(
+                f"selected parent-update commissioning evidence refused: {error}"
+            ) from error
     if (
         learner_value.get("research_scratch_initialization")
         != PRODUCTION_LEARNER_INITIALIZATION_CONTRACT
@@ -576,12 +573,10 @@ def _load() -> dict[str, Any]:
         raise ScienceContractError("research-only scratch execution topology drifted")
     recipe = learner_value["research_scratch_training_recipe"]
     execution = learner_value["research_scratch_execution_topology"]
-    if (
-        execution["world_size"]
-        * execution["local_batch_size"]
-        * execution["grad_accum_steps"]
-        != execution["global_batch_size"]
-        or execution["global_batch_size"] != recipe.get("global_batch_size")
+    if execution["world_size"] * execution["local_batch_size"] * execution[
+        "grad_accum_steps"
+    ] != execution["global_batch_size"] or execution["global_batch_size"] != recipe.get(
+        "global_batch_size"
     ):
         raise ScienceContractError(
             "current scratch execution topology changes the logical global dose"
@@ -596,8 +591,7 @@ def _load() -> dict[str, Any]:
             "current coherent learner architecture upgrade authority drifted"
         )
     if (
-        recipe.get("policy_target_blend_semantics")
-        != POLICY_TARGET_BLEND_FALLBACK_V2
+        recipe.get("policy_target_blend_semantics") != POLICY_TARGET_BLEND_FALLBACK_V2
         or recipe.get("soft_target_weight") != 1.0
         or recipe.get("soft_target_source") != "policy"
         or recipe.get("soft_target_min_legal_coverage") != 1.0
@@ -757,11 +751,9 @@ def selected_parent_update_commissioning() -> dict[str, Any]:
     recipes = admission.get("recipes")
     record = recipes.get(selection["recipe"]) if isinstance(recipes, dict) else None
     if (
-        admission.get("schema_version")
-        != "catan-zero-training-science-admission-v1"
+        admission.get("schema_version") != "catan-zero-training-science-admission-v1"
         or not isinstance(record, dict)
-        or record.get("recipe_canonical_sha256")
-        != selection["config_canonical_sha256"]
+        or record.get("recipe_canonical_sha256") != selection["config_canonical_sha256"]
         or not isinstance(record.get("authorized"), bool)
         or not isinstance(selection["execution_topology"].get("go_authorized"), bool)
     ):
@@ -816,17 +808,13 @@ def learner_initialization() -> dict[str, Any]:
 def learner_model_construction() -> dict[str, Any]:
     """Return the unresolved research-only scratch model construction."""
 
-    return copy.deepcopy(
-        _load()["learner"]["research_scratch_model_construction"]
-    )
+    return copy.deepcopy(_load()["learner"]["research_scratch_model_construction"])
 
 
 def learner_execution_topology() -> dict[str, Any]:
     """Return the unresolved research-only scratch execution topology."""
 
-    return copy.deepcopy(
-        _load()["learner"]["research_scratch_execution_topology"]
-    )
+    return copy.deepcopy(_load()["learner"]["research_scratch_execution_topology"])
 
 
 def target_information_regime() -> str:
@@ -874,9 +862,7 @@ def require_current_operator(
         )
     if evaluator_value is not None:
         expected_evaluator = evaluator()
-        actual_evaluator = {
-            key: evaluator_value.get(key) for key in expected_evaluator
-        }
+        actual_evaluator = {key: evaluator_value.get(key) for key in expected_evaluator}
         if actual_evaluator != expected_evaluator:
             differing = sorted(
                 key
@@ -1055,9 +1041,7 @@ def _validate_target_quality_artifacts(contract: Mapping[str, Any]) -> None:
         ],
         "--exact-budget-sh": expected_generator["exact_budget_sh"],
         "--exact-budget-sh-min-n": expected_generator["exact_budget_sh_min_n"],
-        "--boundary-value-particles": expected_generator[
-            "boundary_value_particles"
-        ],
+        "--boundary-value-particles": expected_generator["boundary_value_particles"],
         "--learner-entity-feature-adapter-version": (
             expected_generator["learner_entity_feature_adapter_version"]
         ),
@@ -1076,8 +1060,7 @@ def _validate_target_quality_artifacts(contract: Mapping[str, Any]) -> None:
     }
     if guard_drift:
         raise ScienceContractError(
-            "current coherent generator target-quality guard drifted: "
-            f"{guard_drift}"
+            f"current coherent generator target-quality guard drifted: {guard_drift}"
         )
     category_variant = {
         "--workers",
@@ -1115,7 +1098,9 @@ def _selected_adaptive_fields(selected: str) -> dict[str, Any]:
             "n_full_wide_threshold": 20 if "w20" in selected else 40,
             "wide_roots_always_full": True,
         }
-    raise ScienceContractError(f"teacher campaign selected unknown operator {selected!r}")
+    raise ScienceContractError(
+        f"teacher campaign selected unknown operator {selected!r}"
+    )
 
 
 def adopt_teacher_campaign(
@@ -1150,8 +1135,7 @@ def adopt_teacher_campaign(
     if not isinstance(report_authority, dict) or (
         report_authority.get("sha256") != before_contract_sha
         or report_authority.get("contract_id") != contract["contract_id"]
-        or report_authority.get("experimental_dose_fields")
-        != list(ADAPTIVE_FIELDS)
+        or report_authority.get("experimental_dose_fields") != list(ADAPTIVE_FIELDS)
     ):
         raise ScienceContractError(
             "teacher campaign was not run against these provisional contract bytes"
@@ -1167,7 +1151,9 @@ def adopt_teacher_campaign(
         template["science"]["search"],
         generator["fields"],
     )
-    provisional = {key: contract["operator"]["search"].get(key) for key in ADAPTIVE_FIELDS}
+    provisional = {
+        key: contract["operator"]["search"].get(key) for key in ADAPTIVE_FIELDS
+    }
     for target in search_targets:
         observed = {key: target.get(key) for key in ADAPTIVE_FIELDS}
         if observed != provisional:
@@ -1178,7 +1164,9 @@ def adopt_teacher_campaign(
 
     try:
         lint_args = next(
-            item["args"] for item in guard["guards"] if item.get("name") == "cli_flag_lint"
+            item["args"]
+            for item in guard["guards"]
+            if item.get("name") == "cli_flag_lint"
         )
         critical = lint_args["critical_flags"]
         expected = lint_args["expected_values"]
@@ -1259,9 +1247,7 @@ def fleet_evaluation_science_config() -> dict[str, Any]:
         "public_observation": evaluator_value["public_observation"],
         "information_set_search": search_value["information_set_search"],
         "belief_chance_spectra": search_value["belief_chance_spectra"],
-        "coherent_public_belief_search": search_value[
-            "coherent_public_belief_search"
-        ],
+        "coherent_public_belief_search": search_value["coherent_public_belief_search"],
         "determinization_particles": search_value["determinization_particles"],
         "determinization_min_simulations": search_value[
             "determinization_min_simulations"
@@ -1282,9 +1268,7 @@ def fleet_evaluation_science_config() -> dict[str, Any]:
         "max_depth": search_value["max_depth"],
         "max_decisions": contract["generation"]["max_decisions"],
         "max_root_candidates": evaluation_value["max_root_candidates"],
-        "max_root_candidates_wide": evaluation_value[
-            "max_root_candidates_wide"
-        ],
+        "max_root_candidates_wide": evaluation_value["max_root_candidates_wide"],
         "wide_candidates_threshold": search_value["wide_candidates_threshold"],
         "gate_config": evaluation_value["gate_config"],
         "external_vps_to_win": evaluation_value["external_vps_to_win"],
