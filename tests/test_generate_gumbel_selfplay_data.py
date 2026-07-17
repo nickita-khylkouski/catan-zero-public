@@ -537,6 +537,10 @@ def test_coherent_row_surface_is_copied_into_spawned_worker_payload(
             str(tmp_path / "out"),
             "--games",
             "1",
+            # This test captures the parent-to-worker contract only.  Keep it
+            # independent of the machine-local Rust wheel required by the
+            # production default feature path.
+            "--no-rust-featurize",
             "--meaningful-public-history",
             "--event-history-limit",
             "32",
