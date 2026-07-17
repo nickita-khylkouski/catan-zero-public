@@ -617,6 +617,21 @@ def test_default_true_card_bias_is_omitted_only_from_legacy_receipt_digest_view(
     assert upgrade._effective_config_receipt_view(bias_free) == bias_free  # noqa: SLF001
 
 
+def test_legacy_full_action_cross_topology_keeps_existing_receipt_digest_view():
+    legacy = {"state_layers": 6}
+    reconstructed = {
+        "state_layers": 6,
+        "action_cross_attention_bottleneck": 0,
+    }
+    budgeted_v7 = {
+        "state_layers": 6,
+        "action_cross_attention_bottleneck": 80,
+    }
+
+    assert upgrade._effective_config_receipt_view(reconstructed) == legacy  # noqa: SLF001
+    assert upgrade._effective_config_receipt_view(budgeted_v7) == budgeted_v7  # noqa: SLF001
+
+
 def test_receipt_replays_combined_topology_target_gather_upgrade(tmp_path: Path) -> None:
     source, initializer = _topology_checkpoints(tmp_path)
     evidence = upgrade.inspect_upgrade(

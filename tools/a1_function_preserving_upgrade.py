@@ -787,6 +787,13 @@ def _effective_config_receipt_view(value: Mapping[str, Any]) -> dict[str, Any]:
     # existed, while the order-aware v2 value remains receipt-significant.
     if result.get("meaningful_public_history_pooling") == MASKED_MEAN_V1:
         result.pop("meaningful_public_history_pooling")
+    # Historical Transformer action-cross receipts describe the original
+    # full-width block and predate the explicit topology field. Zero is exactly
+    # that legacy topology; omit it so appending the field does not invalidate
+    # already-issued config digests. Positive V7 bottlenecks remain
+    # receipt-significant.
+    if result.get("action_cross_attention_bottleneck") == 0:
+        result.pop("action_cross_attention_bottleneck")
     return result
 
 
