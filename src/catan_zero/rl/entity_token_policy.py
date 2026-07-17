@@ -421,6 +421,13 @@ class EntityGraphConfig:
     # legal_action_value_residual because it extends that exact-mask contract.
     # Appended last for positional legacy-pickle compatibility.
     legal_action_value_set_statistics: bool = False
+    # V7 routes V6's exact physical actor-resource counts around the mature V5
+    # player encoder.  That encoder learned the historical clipped /20 and /10
+    # normalization; feeding it V6's /95 and /19 values directly is an input
+    # distribution migration, not a function-preserving feature addition.  The
+    # legacy-compatible view remains its input, while a bias-free zero-output
+    # residual learns the new exact counts.  Appended for pickle compatibility.
+    v6_compatibility_preserving_inputs: bool = False
 
 
 class EntityGraphNet:
@@ -602,6 +609,15 @@ class EntityGraphNet:
                 self.vertex_encoder = _token_encoder(VERTEX_FEATURE_SIZE, h, dropout)
                 self.edge_encoder = _token_encoder(EDGE_FEATURE_SIZE, h, dropout)
                 self.player_encoder = _token_encoder(PLAYER_FEATURE_SIZE, h, dropout)
+                self.v6_compatibility_preserving_inputs_enabled = bool(
+                    getattr(cfg, "v6_compatibility_preserving_inputs", False)
+                )
+                if self.v6_compatibility_preserving_inputs_enabled:
+                    # total, resource-known bit, and five exact composition
+                    # values. The raw V6 values remain available to the new
+                    # residual; only the inherited encoder sees the legacy view.
+                    self.v6_exact_resource_residual = nn.Linear(7, h, bias=False)
+                    nn.init.zeros_(self.v6_exact_resource_residual.weight)
                 self.public_card_count_features_enabled = bool(
                     getattr(cfg, "public_card_count_features", False)
                 )
@@ -1964,7 +1980,36 @@ class EntityGraphNet:
                     if self.meaningful_public_history_enabled
                     else event_piece
                 )
-                player_piece = self.player_encoder(batch["player_tokens"].float())
+                raw_player_tokens = batch["player_tokens"].float()
+                if self.v6_compatibility_preserving_inputs_enabled:
+                    legacy_player_tokens = raw_player_tokens.clone()
+                    # Recover integer card counts from V6's physical scales,
+                    # then reproduce the V2--V5 clipped normalization expected
+                    # by the inherited player encoder.
+                    legacy_player_tokens[..., 6] = torch.clamp(
+                        torch.round(raw_player_tokens[..., 6] * 95.0) / 20.0,
+                        min=0.0,
+                        max=1.0,
+                    )
+                    legacy_player_tokens[..., 16:21] = torch.clamp(
+                        torch.round(raw_player_tokens[..., 16:21] * 19.0) / 10.0,
+                        min=0.0,
+                        max=1.0,
+                    )
+                    player_piece = self.player_encoder(legacy_player_tokens)
+                    exact_resource_features = torch.cat(
+                        (
+                            raw_player_tokens[..., 6:7],
+                            raw_player_tokens[..., 15:16],
+                            raw_player_tokens[..., 16:21],
+                        ),
+                        dim=-1,
+                    )
+                    player_piece = player_piece + self.v6_exact_resource_residual(
+                        exact_resource_features
+                    )
+                else:
+                    player_piece = self.player_encoder(raw_player_tokens)
                 if self.public_card_count_features_enabled:
                     player_piece = player_piece + self.public_card_count_residual(
                         batch[DEDUCTION_FEATURES_KEY].float()
@@ -2327,6 +2372,12 @@ class EntityGraphPolicy:
         self.entity_feature_adapter_version = require_known_entity_feature_adapter(
             entity_feature_adapter_version
         )
+        if bool(getattr(config, "v6_compatibility_preserving_inputs", False)) and (
+            self.entity_feature_adapter_version != RUST_ENTITY_ADAPTER_V6
+        ):
+            raise ValueError(
+                "v6 compatibility-preserving inputs require the V6 entity adapter"
+            )
         if bool(getattr(config, "meaningful_public_history", False)):
             uses_history_v2 = (
                 str(getattr(config, "meaningful_public_history_schema", ""))
@@ -2444,6 +2495,7 @@ class EntityGraphPolicy:
         event_history_limit: int = 64,
         meaningful_public_history_pooling: str = MASKED_MEAN_V1,
         meaningful_public_history_target_gather: bool = False,
+        v6_compatibility_preserving_inputs: bool = False,
         value_tower_split_layers: int = 0,
         public_rule_state_features: bool = False,
         public_rule_state_feature_schema: str = (
@@ -2514,6 +2566,9 @@ class EntityGraphPolicy:
                 ),
                 meaningful_public_history_target_gather=bool(
                     meaningful_public_history_target_gather
+                ),
+                v6_compatibility_preserving_inputs=bool(
+                    v6_compatibility_preserving_inputs
                 ),
                 value_tower_split_layers=int(value_tower_split_layers),
                 public_rule_state_features=bool(public_rule_state_features),
@@ -3226,6 +3281,7 @@ class EntityGraphPolicy:
             "meaningful_history_sequence.",
             "meaningful_history_target_proj.",
             "public_rule_state_residual.",
+            "v6_exact_resource_residual.",
         )
         if bool(allow_missing_optional_parameters):
             allowed_missing_prefixes += optional_warmstart_prefixes
