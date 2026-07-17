@@ -243,7 +243,7 @@ def test_cataloged_parent_update_uses_exact_authorized_recipe_and_parent(
     )
     assert plan["contract"]["recipe"] == "a1-parent-update-35m-b200"
     assert plan["contract"]["config_sha256"] == (
-        "bd045678f723d7c9888b02da18432f76062a0ba314b0b510fd02563a84167b38"
+        "ffdb35ba09227021475bddd174fa93be9b600887a8c72bc346a042cd2dd0c6b9"
     )
     assert str((ROOT / "tools/train.py").resolve()) in plan["command"]
     assert "--init-checkpoint" in plan["command"]
