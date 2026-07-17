@@ -5,6 +5,11 @@ from typing import Any
 import numpy as np
 
 from catan_zero.rl.entity_token_features import _node_pips_by_resource
+from catan_zero.rl.entity_feature_adapter import (
+    LEGACY_MISSING_CHECKPOINT_ADAPTER_VERSION,
+    RUST_ENTITY_ADAPTER_V6,
+    require_known_entity_feature_adapter,
+)
 from catan_zero.rl.multiagent_env import ColonistMultiAgentEnv
 
 
@@ -37,9 +42,14 @@ _DISCARD_RANK = {"wood": 0, "brick": 1, "sheep": 2, "wheat": 3, "ore": 4}
 def build_action_context_feature_table(
     env: ColonistMultiAgentEnv,
     info: dict[str, Any] | None = None,
+    *,
+    entity_feature_adapter_version: str = LEGACY_MISSING_CHECKPOINT_ADAPTER_VERSION,
 ) -> np.ndarray:
     """Build board/current-state action features for every discrete action id."""
 
+    adapter_version = require_known_entity_feature_adapter(
+        entity_feature_adapter_version
+    )
     valid_actions = set(int(action) for action in (info or {}).get("valid_actions", ()))
     payload = env.observation_payload(env.current_player_name(), include_event_log=False)
     actor_public_vp = float(
@@ -61,6 +71,8 @@ def build_action_context_feature_table(
             actor_public_vp=actor_public_vp,
             payload=payload,
             prompt=prompt,
+            actor=env.current_player_name(),
+            entity_feature_adapter_version=adapter_version,
         )
     return table
 
@@ -73,7 +85,12 @@ def _context_vector(
     actor_public_vp: float,
     payload: dict[str, Any],
     prompt: str,
+    actor: str,
+    entity_feature_adapter_version: str,
 ) -> np.ndarray:
+    adapter_version = require_known_entity_feature_adapter(
+        entity_feature_adapter_version
+    )
     features = np.zeros(CONTEXT_ACTION_FEATURE_SIZE, dtype=np.float32)
     action_type = str(structured["action_type"])
     args = structured.get("args") or {}
@@ -93,7 +110,14 @@ def _context_vector(
         if productions:
             features[3] = max(productions)
             features[4] = float(sum(productions) / len(productions))
-        features[16] = _road_expansion_score(env, payload, args["edge"])
+        features[16] = _road_expansion_score(
+            env,
+            payload,
+            args["edge"],
+            prompt=prompt,
+            actor=actor,
+            entity_feature_adapter_version=adapter_version,
+        )
     elif action_type == "MOVE_ROBBER":
         victim = args.get("victim")
         if victim is not None:
@@ -159,7 +183,25 @@ def _road_expansion_score(
     env: ColonistMultiAgentEnv,
     payload: dict[str, Any],
     edge: Any,
+    *,
+    prompt: str,
+    actor: str,
+    entity_feature_adapter_version: str,
 ) -> float:
+    adapter_version = require_known_entity_feature_adapter(
+        entity_feature_adapter_version
+    )
+    if adapter_version == RUST_ENTITY_ADAPTER_V6 and prompt == "BUILD_INITIAL_ROAD":
+        return _initial_road_two_hop_expansion_score(
+            env,
+            payload,
+            edge,
+            actor=actor,
+        )
+
+    # Frozen v2-v5 contract. Do not repair or refactor this branch: deployed
+    # checkpoints were trained with the proposed edge's unoccupied endpoint,
+    # even though that adjacent endpoint cannot host the next settlement.
     occupied_nodes = _occupied_nodes(payload)
     scores = []
     for node in edge or ():
@@ -168,6 +210,50 @@ def _road_expansion_score(
             scores.append(0.0)
         else:
             scores.append(_scaled_production(env, node_id))
+    return max(scores, default=0.0)
+
+
+def _initial_road_two_hop_expansion_score(
+    env: ColonistMultiAgentEnv,
+    payload: dict[str, Any],
+    edge: Any,
+    *,
+    actor: str,
+) -> float:
+    """Best production site opened by one further road from an initial road.
+
+    The initial road is incident to the actor's just-built settlement. Its
+    other endpoint is distance one and therefore cannot itself host the next
+    settlement. V6 scores the legal distance-two settlement sites that become
+    connected after one additional, currently unoccupied land edge.
+    """
+
+    endpoints = tuple(int(node) for node in (edge or ()))
+    if len(endpoints) != 2:
+        return 0.0
+    owners = _building_owners(payload)
+    origins = [node for node in endpoints if owners.get(node) == str(actor)]
+    if len(origins) != 1:
+        return 0.0
+    origin = origins[0]
+    frontier = endpoints[1] if endpoints[0] == origin else endpoints[0]
+    if frontier in owners:
+        return 0.0
+
+    occupied_nodes = set(owners)
+    occupied_edges = _occupied_edges(payload)
+    scores: list[float] = []
+    for target in _neighbor_nodes(payload, frontier):
+        target = int(target)
+        if target == origin or target in occupied_nodes:
+            continue
+        next_edge = tuple(sorted((frontier, target)))
+        if next_edge in occupied_edges:
+            continue
+        # Catan distance rule: no building may be adjacent to the target.
+        if any(int(neighbor) in occupied_nodes for neighbor in _neighbor_nodes(payload, target)):
+            continue
+        scores.append(_scaled_production(env, target))
     return max(scores, default=0.0)
 
 
@@ -180,6 +266,31 @@ def _occupied_nodes(payload: dict[str, Any]) -> set[int]:
         for building in board.get("buildings", ())
         if isinstance(building, dict) and "node" in building
     }
+
+
+def _building_owners(payload: dict[str, Any]) -> dict[int, str]:
+    board = payload.get("board")
+    if not isinstance(board, dict):
+        return {}
+    return {
+        int(building["node"]): str(building.get("player", ""))
+        for building in board.get("buildings", ())
+        if isinstance(building, dict) and "node" in building
+    }
+
+
+def _occupied_edges(payload: dict[str, Any]) -> set[tuple[int, int]]:
+    board = payload.get("board")
+    if not isinstance(board, dict):
+        return set()
+    occupied: set[tuple[int, int]] = set()
+    for road in board.get("roads", ()):
+        if not isinstance(road, dict):
+            continue
+        edge = road.get("edge")
+        if isinstance(edge, (list, tuple)) and len(edge) == 2:
+            occupied.add(tuple(sorted((int(edge[0]), int(edge[1])))))
+    return occupied
 
 
 def _neighbor_nodes(payload: dict[str, Any], node_id: int) -> tuple[int, ...]:

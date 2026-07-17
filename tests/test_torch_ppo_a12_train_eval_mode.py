@@ -276,6 +276,135 @@ def test_fresh_entity_actor_to_learner_starts_at_ratio_one() -> None:
     assert metrics["clip_fraction"] == 0.0
 
 
+def test_v6_opening_context_roundtrips_actor_log_probs_from_stored_sample(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import torch
+
+    from catan_zero.rl import torch_ppo
+    from catan_zero.rl.action_features import build_action_context_feature_table
+    from catan_zero.rl.entity_feature_adapter import RUST_ENTITY_ADAPTER_V6
+    from catan_zero.rl.entity_token_policy import EntityGraphPolicy
+    from catan_zero.rl.meaningful_history import (
+        MEANINGFUL_PUBLIC_HISTORY_SCHEMA_V2,
+    )
+    from catan_zero.rl.multiagent_env import ColonistMultiAgentEnv
+    from catan_zero.rl.self_play import make_env_config
+
+    class OpeningRoadEnv(ColonistMultiAgentEnv):
+        road_action_ids: dict[tuple[int, int], int] = {}
+        legacy_context: np.ndarray | None = None
+        v6_context: np.ndarray | None = None
+
+        def reset(self, *args, **kwargs):
+            observations, info = super().reset(*args, **kwargs)
+            settlement = next(
+                action
+                for action in info["structured_legal_actions"]
+                if action["action_type"] == "BUILD_SETTLEMENT"
+                and int(action["args"]["node"]) == 15
+            )
+            observations, _rewards, terminated, truncated, info = self.step(
+                int(settlement["index"])
+            )
+            assert not terminated and not truncated
+            type(self).road_action_ids = {
+                tuple(sorted(int(node) for node in action["args"]["edge"])): int(
+                    action["index"]
+                )
+                for action in info["structured_legal_actions"]
+                if action["action_type"] == "BUILD_ROAD"
+            }
+            type(self).legacy_context = build_action_context_feature_table(self, info)
+            type(self).v6_context = build_action_context_feature_table(
+                self,
+                info,
+                entity_feature_adapter_version=RUST_ENTITY_ADAPTER_V6,
+            )
+            return observations, info
+
+    config = make_env_config(players=2, vps_to_win=10)
+    policy = EntityGraphPolicy.create(
+        env_config=config,
+        hidden_size=16,
+        state_layers=1,
+        attention_heads=2,
+        dropout=0.0,
+        seed=0,
+        meaningful_public_history=True,
+        meaningful_public_history_schema=MEANINGFUL_PUBLIC_HISTORY_SCHEMA_V2,
+        event_history_limit=64,
+        public_rule_state_features=True,
+        entity_feature_adapter_version=RUST_ENTITY_ADAPTER_V6,
+    )
+    monkeypatch.setattr(torch_ppo, "ColonistMultiAgentEnv", OpeningRoadEnv)
+    trajectory = torch_ppo.collect_ppo_episode(
+        policy,
+        {},
+        seed=500_003,
+        config=config,
+        max_decisions=1,
+        rng=np.random.default_rng(1),
+        training_seats={"BLUE", "RED"},
+        action_temperature=1.0,
+    )
+
+    assert len(trajectory.samples) == 1
+    sample = trajectory.samples[0]
+    assert sample.phase == "initial_build"
+    assert OpeningRoadEnv.legacy_context is not None
+    assert OpeningRoadEnv.v6_context is not None
+    np.testing.assert_array_equal(
+        sample.action_context_features,
+        OpeningRoadEnv.v6_context,
+    )
+    edge_4_15 = OpeningRoadEnv.road_action_ids[(4, 15)]
+    edge_15_17 = OpeningRoadEnv.road_action_ids[(15, 17)]
+    assert sample.action_context_features[edge_4_15, 16] == pytest.approx(9.0 / 18.0)
+    assert sample.action_context_features[edge_15_17, 16] == pytest.approx(
+        11.0 / 18.0
+    )
+    assert OpeningRoadEnv.legacy_context[edge_4_15, 16] == pytest.approx(
+        11.0 / 18.0
+    )
+    assert OpeningRoadEnv.legacy_context[edge_15_17, 16] == pytest.approx(
+        9.0 / 18.0
+    )
+    assert not np.array_equal(
+        sample.action_context_features[:, 16],
+        OpeningRoadEnv.legacy_context[:, 16],
+    )
+
+    with torch.no_grad():
+        outputs = torch_ppo._entity_graph_outputs(policy, [sample])  # noqa: SLF001
+        behavior_logits = torch_ppo._behavior_policy_logits(  # noqa: SLF001
+            outputs["logits"],
+            1.0,
+            valid_mask=torch_ppo._entity_behavior_valid_mask(  # noqa: SLF001
+                [sample],
+                outputs["logits"],
+            ),
+        )
+        action_columns = torch.as_tensor(
+            [sample.valid_actions.index(sample.action)],
+            dtype=torch.long,
+            device=policy.device,
+        )
+        recomputed = (
+            torch.distributions.Categorical(logits=behavior_logits)
+            .log_prob(action_columns)
+            .cpu()
+            .numpy()
+        )
+
+    np.testing.assert_allclose(
+        recomputed,
+        np.asarray(trajectory.old_log_probs, dtype=np.float32),
+        atol=1e-6,
+        rtol=0.0,
+    )
+
+
 def test_entity_truncation_drains_to_learner_decision_boundary() -> None:
     from types import SimpleNamespace
 

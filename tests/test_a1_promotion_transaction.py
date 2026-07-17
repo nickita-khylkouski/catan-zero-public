@@ -7725,11 +7725,17 @@ def _typed_final_training_report(
         source_checkpoint: Path,
         transitioned_checkpoint: Path,
         expected_origin_tool_sha256: str,
+        expected_source_checkpoint_sha256: str,
+        expected_transitioned_checkpoint_sha256: str,
     ):
         assert path == transition_receipt
         assert source_checkpoint == raw
         assert transitioned_checkpoint == transitioned
         assert expected_origin_tool_sha256
+        assert expected_source_checkpoint_sha256 == promotion._sha256(raw)
+        assert expected_transitioned_checkpoint_sha256 == promotion._sha256(
+            transitioned
+        )
         return transition_evidence
 
     monkeypatch.setattr(

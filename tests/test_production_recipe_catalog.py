@@ -72,7 +72,7 @@ def test_generation_guard_is_authenticated_by_the_same_catalog() -> None:
 
     assert Path(entry["guard"]).is_absolute()
     assert entry["guard_sha256"] == (
-        "efbe8419a0b49e0ea7684c1218cb766e9a496f4a5a0f7ac51eefb29d2888ba95"
+        "68e9766d449be58b4a7891a82a3b6ba34a8cc7f7697d43369f6187b036faef5c"
     )
 
 
@@ -83,7 +83,7 @@ def test_generation_guard_drift_is_rejected_from_catalog(
     for relative in (
         "configs/production_recipes.json",
         APPROVED["generate"][0],
-        "configs/guards/a1_generation_coherent_public_n128_adaptive256_forced_value_v3.json",
+        "configs/guards/a1_generation_coherent_public_n128_adaptive256_forced_value_v4.json",
     ):
         source = ROOT / relative
         destination = copied_root / relative
@@ -91,7 +91,7 @@ def test_generation_guard_drift_is_rejected_from_catalog(
         destination.write_bytes(source.read_bytes())
     guard = (
         copied_root
-        / "configs/guards/a1_generation_coherent_public_n128_adaptive256_forced_value_v3.json"
+        / "configs/guards/a1_generation_coherent_public_n128_adaptive256_forced_value_v4.json"
     )
     payload = json.loads(guard.read_text(encoding="utf-8"))
     payload["schema_version"] = "drifted"

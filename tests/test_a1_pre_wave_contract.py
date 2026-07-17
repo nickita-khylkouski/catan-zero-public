@@ -37,7 +37,7 @@ TEMPLATE = (
     Path(__file__).resolve().parents[1]
     / "configs"
     / "experiments"
-    / "a1_pre_wave_contract.template.json"
+    / "a1_pre_wave_contract_v4.template.json"
 )
 HISTORICAL_DRAFT = (
     Path(__file__).resolve().parents[1]
@@ -610,7 +610,7 @@ def _legacy_scalar_pair(
 
 def _resolved_draft(tmp_path: Path) -> Path:
     # The large replay suite intentionally exercises immutable v2 behavior.
-    # TEMPLATE is the current v3/64-GPU operator template and has dedicated
+    # TEMPLATE is the current v4-authority/64-GPU operator template and has dedicated
     # topology/provenance tests below.
     payload = json.loads(HISTORICAL_DRAFT.read_text(encoding="utf-8"))
     search = payload["science"]["search"]
@@ -1153,6 +1153,49 @@ def test_checked_in_relative_provenance_paths_canonicalize_to_required_files() -
     assert all(
         any(path.as_posix().endswith(suffix) for path in learner_paths)
         for suffix in contract.REQUIRED_LEARNER_CODE_SUFFIXES
+    )
+
+
+def test_current_v4_provenance_resolves_exact_v6_science_authority() -> None:
+    payload = json.loads(TEMPLATE.read_text(encoding="utf-8"))
+    generation = payload["generation"]
+    contract._validate_generation(generation)  # noqa: SLF001
+
+    generator, learner, runtime = contract._resolve_provenance_code_records(  # noqa: SLF001
+        payload["provenance"],
+        base=TEMPLATE.parent,
+        generation=generation,
+        target_information_regime=(
+            contract.TARGET_INFORMATION_REGIME_PUBLIC_COHERENT
+        ),
+    )
+
+    required = (
+        "configs/operations/a1-next-wave-coherent-public-v4/"
+        "science.contract.json"
+    )
+    for records in (generator, learner):
+        paths = {Path(record["path"]).as_posix() for record in records}
+        assert any(path.endswith(required) for path in paths)
+        assert not any(
+            path.endswith(
+                "configs/operations/a1-next-wave-coherent-public-v3/"
+                "science.contract.json"
+            )
+            for path in paths
+        )
+    assert runtime
+
+    historical = json.loads(
+        (
+            Path(__file__).resolve().parents[1]
+            / "configs/experiments/a1_pre_wave_contract.template.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert contract._coherent_public_science_contract_suffix(  # noqa: SLF001
+        historical["generation"]
+    ).endswith(
+        "configs/operations/a1-next-wave-coherent-public-v3/science.contract.json"
     )
 
 
@@ -3212,6 +3255,167 @@ def test_post_wave_feature_semantics_require_exact_existing_contracts(
         contract._require_public_award_feature_provenance(  # noqa: SLF001
             drifted_award, rust_featurize=True, where="fixture"
         )
+
+
+def test_v6_post_wave_feature_semantics_bind_history_and_structured_resources(
+    tmp_path: Path,
+) -> None:
+    rows = 1
+    action_catalog = contract.ActionCatalog(("BLUE", "RED"))
+    shard = tmp_path / "semantic-v6.npz"
+    player_tokens = np.zeros((rows, 4, 31), dtype=np.float16)
+    player_tokens[:, 0, 0] = 1.0
+    player_tokens[:, 0, 1] = 1.0
+    player_tokens[:, 0, 6] = np.float16(1.0 / 95.0)
+    player_tokens[:, 0, 16] = np.float16(1.0 / 19.0)
+    np.savez(
+        shard,
+        adapter_version=np.full(
+            rows, contract.RUST_ENTITY_ADAPTER_V6, dtype="U96"
+        ),
+        legal_action_ids=np.zeros((rows, 1), dtype=np.int16),
+        legal_action_mask=np.ones((rows, 1), dtype=bool),
+        legal_action_tokens=np.zeros((rows, 1, 50), dtype=np.float16),
+        event_tokens=np.zeros((rows, 64, 41), dtype=np.float16),
+        event_mask=np.zeros((rows, 64), dtype=bool),
+        event_target_ids=np.full((rows, 64, 4), -1, dtype=np.int16),
+        player_tokens=player_tokens,
+    )
+
+    with np.load(shard, allow_pickle=False) as payload:
+        report = contract._require_shard_feature_semantics(  # noqa: SLF001
+            payload,
+            rows=rows,
+            action_catalog=action_catalog,
+            where="v6-fixture",
+            meaningful_public_history=True,
+            event_history_limit=64,
+            expected_adapter_version=contract.RUST_ENTITY_ADAPTER_V6,
+        )
+
+    assert report["entity_feature_adapter_version"] == (
+        contract.RUST_ENTITY_ADAPTER_V6
+    )
+    assert report["event_history"]["semantic"] == (
+        contract.MEANINGFUL_PUBLIC_HISTORY_SCHEMA_V2
+    )
+    assert report["event_history"]["event_mask_scan"]["padded_event_width"] == 64
+    assert report["structured_action_resources"]["row_count"] == rows
+    assert report["actor_resource_identity"]["row_count"] == rows
+    assert report["actor_resource_identity"]["invalid_row_count"] == 0
+
+
+def test_v6_post_wave_feature_semantics_reject_malformed_actor_resources(
+    tmp_path: Path,
+) -> None:
+    rows = 1
+    action_catalog = contract.ActionCatalog(("BLUE", "RED"))
+    player_tokens = np.zeros((rows, 4, 31), dtype=np.float16)
+    player_tokens[:, 0, 0] = 1.0
+    player_tokens[:, 0, 1] = 1.0
+    player_tokens[:, 0, 6] = np.float16(1.0 / 95.0)
+    player_tokens[:, 0, 16] = np.float16(1.0 / 19.0)
+    arrays = {
+        "adapter_version": np.full(
+            rows, contract.RUST_ENTITY_ADAPTER_V6, dtype="U96"
+        ),
+        "legal_action_ids": np.zeros((rows, 1), dtype=np.int16),
+        "legal_action_mask": np.ones((rows, 1), dtype=bool),
+        "legal_action_tokens": np.zeros((rows, 1, 50), dtype=np.float16),
+        "event_tokens": np.zeros((rows, 64, 41), dtype=np.float16),
+        "event_mask": np.zeros((rows, 64), dtype=bool),
+        "event_target_ids": np.full((rows, 64, 4), -1, dtype=np.int16),
+        "player_tokens": player_tokens,
+    }
+
+    def require(payload: object) -> None:
+        contract._require_shard_feature_semantics(  # noqa: SLF001
+            payload,
+            rows=rows,
+            action_catalog=action_catalog,
+            where="v6-malformed",
+            meaningful_public_history=True,
+            event_history_limit=64,
+            expected_adapter_version=contract.RUST_ENTITY_ADAPTER_V6,
+        )
+
+    shard = tmp_path / "malformed-v6.npz"
+    missing = dict(arrays)
+    missing.pop("player_tokens")
+    np.savez(shard, **missing)
+    with np.load(shard, allow_pickle=False) as payload:
+        with pytest.raises(contract.ContractError, match="player_tokens"):
+            require(payload)
+
+    drifted = dict(arrays)
+    drifted["player_tokens"] = player_tokens[:, :3]
+    np.savez(shard, **drifted)
+    with np.load(shard, allow_pickle=False) as payload:
+        with pytest.raises(contract.ContractError, match="player_tokens shape"):
+            require(payload)
+
+    drifted = dict(arrays)
+    nonfinite = player_tokens.copy()
+    nonfinite[0, 1, 2] = np.nan
+    drifted["player_tokens"] = nonfinite
+    np.savez(shard, **drifted)
+    with np.load(shard, allow_pickle=False) as payload:
+        with pytest.raises(contract.ContractError, match="non-finite"):
+            require(payload)
+
+    drifted = dict(arrays)
+    missing_actor = player_tokens.copy()
+    missing_actor[:, :, 1] = 0.0
+    drifted["player_tokens"] = missing_actor
+    np.savez(shard, **drifted)
+    with np.load(shard, allow_pickle=False) as payload:
+        with pytest.raises(contract.ContractError, match="exactly one actor"):
+            require(payload)
+
+    drifted = dict(arrays)
+    mismatched = player_tokens.copy()
+    mismatched[:, 0, 6] = np.float16(2.0 / 95.0)
+    drifted["player_tokens"] = mismatched
+    np.savez(shard, **drifted)
+    with np.load(shard, allow_pickle=False) as payload:
+        with pytest.raises(contract.ContractError, match="total slot 6"):
+            require(payload)
+
+
+def test_v5_post_wave_feature_semantics_preserve_historical_player_compatibility(
+    tmp_path: Path,
+) -> None:
+    rows = 1
+    action_catalog = contract.ActionCatalog(("BLUE", "RED"))
+    shard = tmp_path / "semantic-v5.npz"
+    np.savez(
+        shard,
+        adapter_version=np.full(
+            rows, contract.RUST_ENTITY_ADAPTER_V5, dtype="U96"
+        ),
+        legal_action_ids=np.zeros((rows, 1), dtype=np.int16),
+        legal_action_mask=np.ones((rows, 1), dtype=bool),
+        legal_action_tokens=np.zeros((rows, 1, 50), dtype=np.float16),
+        event_tokens=np.zeros((rows, 64, 41), dtype=np.float16),
+        event_mask=np.zeros((rows, 64), dtype=bool),
+        event_target_ids=np.full((rows, 64, 4), -1, dtype=np.int16),
+    )
+
+    with np.load(shard, allow_pickle=False) as payload:
+        report = contract._require_shard_feature_semantics(  # noqa: SLF001
+            payload,
+            rows=rows,
+            action_catalog=action_catalog,
+            where="v5-historical",
+            meaningful_public_history=True,
+            event_history_limit=64,
+            expected_adapter_version=contract.RUST_ENTITY_ADAPTER_V5,
+        )
+
+    assert report["entity_feature_adapter_version"] == (
+        contract.RUST_ENTITY_ADAPTER_V5
+    )
+    assert report["actor_resource_identity"] is None
 
 
 @pytest.mark.parametrize(

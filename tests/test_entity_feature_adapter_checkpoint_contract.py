@@ -14,9 +14,11 @@ from catan_zero.rl.entity_feature_adapter import (
     ENTITY_FEATURE_ADAPTER_CHECKPOINT_SCHEMA,
     EntityFeatureAdapterContractError,
     RUST_ENTITY_ADAPTER_V2,
+    RUST_ENTITY_ADAPTER_V6,
     checkpoint_entity_feature_adapter_metadata,
 )
 from catan_zero.rl.entity_token_policy import EntityGraphConfig, EntityGraphPolicy
+from catan_zero.rl.meaningful_history import MEANINGFUL_PUBLIC_HISTORY_SCHEMA_V2
 from catan_zero.search.eval_server import (
     RemoteEvalClient,
     _require_implemented_entity_feature_adapter,
@@ -121,6 +123,46 @@ def test_missing_legacy_metadata_maps_explicitly_to_v2_and_resaves_canonically(
         "schema_version": ENTITY_FEATURE_ADAPTER_CHECKPOINT_SCHEMA,
         "version": RUST_ENTITY_ADAPTER_V2,
     }
+
+
+def test_v6_checkpoint_roundtrip_and_evaluator_binding_are_exact(
+    tmp_path: Path,
+) -> None:
+    config = EntityGraphConfig(
+        action_size=8,
+        static_action_feature_size=4,
+        hidden_size=16,
+        state_layers=1,
+        attention_heads=2,
+        dropout=0.0,
+        meaningful_public_history=True,
+        meaningful_public_history_schema=MEANINGFUL_PUBLIC_HISTORY_SCHEMA_V2,
+        event_history_limit=64,
+        public_rule_state_features=True,
+    )
+    policy = EntityGraphPolicy(
+        config,
+        np.zeros((8, 4), dtype=np.float32),
+        device="cpu",
+        entity_feature_adapter_version=RUST_ENTITY_ADAPTER_V6,
+    )
+    path = tmp_path / "v6.pt"
+    policy.save(path)
+
+    assert _raw(path)["entity_feature_adapter"] == (
+        checkpoint_entity_feature_adapter_metadata(RUST_ENTITY_ADAPTER_V6)
+    )
+    loaded = EntityGraphPolicy.load(path, device="cpu")
+    assert loaded.entity_feature_adapter_version == RUST_ENTITY_ADAPTER_V6
+    evaluator = EntityGraphRustEvaluator(loaded)
+    assert evaluator.config.entity_feature_adapter_version == RUST_ENTITY_ADAPTER_V6
+    with pytest.raises(ValueError, match="adapter/checkpoint mismatch"):
+        EntityGraphRustEvaluator(
+            loaded,
+            config=EntityGraphRustEvaluatorConfig(
+                entity_feature_adapter_version=RUST_ENTITY_ADAPTER_V2
+            ),
+        )
 
 
 @pytest.mark.parametrize(

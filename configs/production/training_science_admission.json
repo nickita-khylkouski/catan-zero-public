@@ -2,23 +2,32 @@
   "schema_version": "catan-zero-training-science-admission-v1",
   "recipes": {
     "a1-current-35m-b200": {
-      "recipe_canonical_sha256": "fe54aa667d8dfe869ab3c9888f11d47fac754f7763238795c1943e6acc52ad32",
+      "recipe_canonical_sha256": "874037bc25b47da8f91eddfd93d17d9eaaba921906ec9ea9a8c33d2066715d4e",
       "authorized": false,
       "reason": "scratch_training_signal_contract_unresolved",
       "unresolved_requirements": [
         "commission scratch optimizer horizon and schedule",
         "commission topology_residual_adapter learning signal and topology-sensitive value behavior",
         "commission minimum realized initial-settlement and initial-road policy-loss mass",
-        "materialize and authenticate a full adapter-v5 training composite"
+        "materialize and authenticate a fresh rust_entity_adapter_v6_exact_actor_resources_initial_road_two_hop training composite"
       ],
       "observations": {
         "architecture_information_surface": "topology_path_present_zero_output_pending_learning_evidence",
-        "retained_composite_adapter_status": "adapter_v2_retained_v5_r2_quarantined",
+        "retained_composite_adapter_status": "adapter_v2_retained_v5_r2_quarantined_v6_required",
+        "required_fresh_learner_adapter": "rust_entity_adapter_v6_exact_actor_resources_initial_road_two_hop",
         "adapter_v5_r2_quarantine": {
           "status": "quarantined_actor_public_rule_state_contradiction",
           "rows": 959142,
           "playable_development_card_slot_nonzero_counts": [0, 0, 0, 0],
           "selected_development_card_play_rows": 57640,
+          "training_admission": false
+        },
+        "adapter_v5_resource_quarantine": {
+          "status": "quarantined_actor_resource_clipping_contradiction",
+          "contradictory_rows": 4061,
+          "contradictory_games": 1271,
+          "full_search_rows": 1868,
+          "saturation_risk_rows": 7440,
           "training_admission": false
         },
         "opening_policy_loss_mass_fraction": 0.027885,
@@ -27,18 +36,30 @@
       "commissioning_evidence": []
     },
     "a1-parent-update-35m-b200": {
-      "recipe_canonical_sha256": "08923652c214c876d3ed6409da6caac67371ed0109f78d093b026eb54d3d1e7a",
-      "authorized": true,
-      "reason": "commissioned_b12_parent_update_with_runtime_topology_signal_gate",
-      "unresolved_requirements": [],
+      "recipe_canonical_sha256": "2dfcc1b95a37d7e292bc5f1bc182950523a791274461e4518bc71e28d45fbe75",
+      "authorized": false,
+      "reason": "commissioned_b12_invalidated_by_adapter_v5_information_aliasing",
+      "unresolved_requirements": [
+        "materialize and authenticate a fresh rust_entity_adapter_v6_exact_actor_resources_initial_road_two_hop training composite",
+        "recommission B12 topology, opening-policy, and value no-regression gates on adapter v6"
+      ],
       "observations": {
-        "architecture_information_surface": "b12_v5_split1_plus_zero_output_topology_runtime_signal_gated",
-        "retained_composite_adapter_status": "fresh_adapter_v5_required_old_v5_r2_quarantined",
+        "architecture_information_surface": "b12_v5_signal_commissioned_but_requires_v6_revalidation",
+        "retained_composite_adapter_status": "adapter_v2_retained_v5_r2_quarantined_v6_required",
+        "required_fresh_learner_adapter": "rust_entity_adapter_v6_exact_actor_resources_initial_road_two_hop",
         "adapter_v5_r2_quarantine": {
           "status": "quarantined_actor_public_rule_state_contradiction",
           "rows": 959142,
           "playable_development_card_slot_nonzero_counts": [0, 0, 0, 0],
           "selected_development_card_play_rows": 57640,
+          "training_admission": false
+        },
+        "adapter_v5_resource_quarantine": {
+          "status": "quarantined_actor_resource_clipping_contradiction",
+          "contradictory_rows": 4061,
+          "contradictory_games": 1271,
+          "full_search_rows": 1868,
+          "saturation_risk_rows": 7440,
           "training_admission": false
         },
         "opening_policy_loss_mass_fraction": 0.027885,

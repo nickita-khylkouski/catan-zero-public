@@ -29,10 +29,39 @@ from typing import Any
 import numpy as np
 
 from catan_zero.rl.action_features import CONTEXT_ACTION_FEATURE_SIZE
+from catan_zero.rl.entity_feature_adapter import (
+    LEGACY_MISSING_CHECKPOINT_ADAPTER_VERSION,
+    RUST_ENTITY_ADAPTER_V6,
+    require_known_entity_feature_adapter,
+)
 from catan_zero.rl.entity_token_features_rust import RustTopology
 
 
-def build_action_context_rust(rust_game: Any, *, topology: RustTopology) -> np.ndarray:
+def _require_native_context_adapter(catanatron_rs: Any, adapter_version: str) -> None:
+    if adapter_version != RUST_ENTITY_ADAPTER_V6:
+        return
+    capability = getattr(
+        catanatron_rs, "supported_action_context_adapter_versions", None
+    )
+    if not callable(capability):
+        raise RuntimeError(
+            "entity adapter v6 requires a catanatron_rs wheel with versioned "
+            "opening-road action-context support"
+        )
+    supported = {str(version) for version in capability()}
+    if adapter_version not in supported:
+        raise RuntimeError(
+            "catanatron_rs does not implement the requested action-context "
+            f"adapter {adapter_version!r}; supported={sorted(supported)!r}"
+        )
+
+
+def build_action_context_rust(
+    rust_game: Any,
+    *,
+    topology: RustTopology,
+    entity_feature_adapter_version: str = LEGACY_MISSING_CHECKPOINT_ADAPTER_VERSION,
+) -> np.ndarray:
     """Rust-backed equivalent of `rust_action_context_batch`'s per-game row
     block (i.e. `rust_action_context_batch(...)[0]`), for a single game.
     Returns `(n_legal, CONTEXT_ACTION_FEATURE_SIZE)` float32, matching the
@@ -40,7 +69,19 @@ def build_action_context_rust(rust_game: Any, *, topology: RustTopology) -> np.n
     """
     import catanatron_rs
 
-    flat, shape = catanatron_rs.build_action_context_flat(rust_game, topology.rust)
+    adapter_version = require_known_entity_feature_adapter(
+        entity_feature_adapter_version
+    )
+    _require_native_context_adapter(catanatron_rs, adapter_version)
+    if adapter_version == RUST_ENTITY_ADAPTER_V6:
+        flat, shape = catanatron_rs.build_action_context_flat(
+            rust_game, topology.rust, adapter_version
+        )
+    else:
+        # Preserve compatibility with released wheels and the exact v2-v5 ABI.
+        flat, shape = catanatron_rs.build_action_context_flat(
+            rust_game, topology.rust
+        )
     assert shape[1] == CONTEXT_ACTION_FEATURE_SIZE
     # `flat` is raw little-endian f64 bytes (a `bytes` object, one bulk copy)
     # -- `np.frombuffer` is a zero-copy view, `.astype` is the same single
@@ -52,6 +93,7 @@ def build_action_context_batch_rust(
     rust_games: list[Any],
     *,
     topology: RustTopology,
+    entity_feature_adapter_version: str = LEGACY_MISSING_CHECKPOINT_ADAPTER_VERSION,
     parallel: bool = False,
 ) -> tuple[np.ndarray, list[int]]:
     """Batched companion to `build_action_context_rust`: one call builds
@@ -66,12 +108,27 @@ def build_action_context_batch_rust(
     `entity_token_features_rust.build_entity_features_batch_rust`).
     """
     if len(rust_games) == 1:
-        single = build_action_context_rust(rust_games[0], topology=topology)
+        single = build_action_context_rust(
+            rust_games[0],
+            topology=topology,
+            entity_feature_adapter_version=entity_feature_adapter_version,
+        )
         return single[None, ...], [int(single.shape[0])]
 
     import catanatron_rs
 
-    raw = catanatron_rs.build_action_context_batch(list(rust_games), topology.rust, parallel)
+    adapter_version = require_known_entity_feature_adapter(
+        entity_feature_adapter_version
+    )
+    _require_native_context_adapter(catanatron_rs, adapter_version)
+    if adapter_version == RUST_ENTITY_ADAPTER_V6:
+        raw = catanatron_rs.build_action_context_batch(
+            list(rust_games), topology.rust, parallel, adapter_version
+        )
+    else:
+        raw = catanatron_rs.build_action_context_batch(
+            list(rust_games), topology.rust, parallel
+        )
     widths = [int(w) for w in raw["widths"]]
     flat, shape = raw["context_tokens"]
     arr = np.frombuffer(flat, dtype="<f8").reshape(shape).astype(np.float32)

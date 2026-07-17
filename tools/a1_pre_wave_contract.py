@@ -63,9 +63,14 @@ from catan_zero.rl.entity_feature_adapter import (  # noqa: E402
     RUST_ENTITY_ADAPTER_V3,
     RUST_ENTITY_ADAPTER_V4,
     RUST_ENTITY_ADAPTER_V5,
+    RUST_ENTITY_ADAPTER_V6,
     require_known_entity_feature_adapter,
 )
-from catan_zero.rl.entity_token_features import ACTION_TYPES  # noqa: E402
+from catan_zero.rl.entity_token_features import (  # noqa: E402
+    ACTION_TYPES,
+    PLAYER_FEATURE_SIZE,
+    v6_actor_resource_identity_violations,
+)
 from catan_zero.rl.decision_taxonomy import (  # noqa: E402
     AUTOMATIC_TRANSITION,
     DECISION_TAXONOMY_SCHEMA_VERSION,
@@ -2648,9 +2653,12 @@ def _validate_generation(generation: dict[str, Any]) -> None:
         teacher_adapter = require_known_entity_feature_adapter(
             generation["teacher_entity_feature_adapter_version"]
         )
-        if learner_adapter != RUST_ENTITY_ADAPTER_V5:
+        if learner_adapter not in {
+            RUST_ENTITY_ADAPTER_V5,
+            RUST_ENTITY_ADAPTER_V6,
+        }:
             raise ContractError(
-                "current generation learner rows must use the reviewed v5 "
+                "current generation learner rows must use the reviewed v5/v6 "
                 "ordered-history/public-rule-state adapter"
             )
         if teacher_adapter != RUST_ENTITY_ADAPTER_V2:
@@ -2660,7 +2668,7 @@ def _validate_generation(generation: dict[str, Any]) -> None:
             )
         if int(generation["event_history_limit"]) != MEANINGFUL_PUBLIC_HISTORY_V2_LIMIT:
             raise ContractError(
-                "v5 meaningful-history waves require the reviewed 64-event bound"
+                "v5/v6 meaningful-history waves require the reviewed 64-event bound"
             )
     reliability_keys = {
         "target_reliability_audit_fraction",
@@ -6947,6 +6955,94 @@ def _verify_checkpoint_provenance_records(
             )
 
 
+def _coherent_public_science_contract_suffix(
+    generation: Mapping[str, Any],
+) -> str:
+    """Select the immutable science authority for one learner-row contract."""
+
+    raw_adapter = generation.get("learner_entity_feature_adapter_version")
+    if raw_adapter is None:
+        # Historical coherent-public drafts predate explicit adapter metadata
+        # and were issued against the immutable v3 authority.
+        return "configs/operations/a1-next-wave-coherent-public-v3/science.contract.json"
+    adapter = require_known_entity_feature_adapter(raw_adapter)
+    if adapter == RUST_ENTITY_ADAPTER_V6:
+        return "configs/operations/a1-next-wave-coherent-public-v4/science.contract.json"
+    return "configs/operations/a1-next-wave-coherent-public-v3/science.contract.json"
+
+
+def _resolve_provenance_code_records(
+    provenance: Mapping[str, Any],
+    *,
+    base: Path,
+    generation: Mapping[str, Any],
+    target_information_regime: str,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    """Resolve and validate explicit and transitive runtime provenance."""
+
+    code_records = [
+        _file_record(_absolute_ref(str(raw), base=base), kind="generator_code")
+        for raw in provenance["generator_code_files"]
+    ]
+    code_paths = {Path(record["path"]).as_posix() for record in code_records}
+    missing_code = {
+        suffix
+        for suffix in REQUIRED_GENERATOR_CODE_SUFFIXES
+        if not any(path.endswith(suffix) for path in code_paths)
+    }
+    if generation.get("meaningful_public_history") is True and not any(
+        path.endswith("src/catan_zero/rl/meaningful_history.py")
+        for path in code_paths
+    ):
+        missing_code.add("src/catan_zero/rl/meaningful_history.py")
+    required_current_files: set[str] = set()
+    if target_information_regime == TARGET_INFORMATION_REGIME_PUBLIC_COHERENT:
+        required_current_files.update(
+            {
+                "tools/a1_current_science_contract.py",
+                _coherent_public_science_contract_suffix(generation),
+            }
+        )
+    missing_code.update(
+        suffix
+        for suffix in required_current_files
+        if not any(path.endswith(suffix) for path in code_paths)
+    )
+    if missing_code:
+        raise ContractError(
+            f"generator_code_files omits required semantics files: {sorted(missing_code)}"
+        )
+
+    learner_code_records = [
+        _file_record(_absolute_ref(str(raw), base=base), kind="learner_code")
+        for raw in provenance["learner_code_files"]
+    ]
+    learner_code_paths = {
+        Path(record["path"]).as_posix() for record in learner_code_records
+    }
+    missing_learner_code = {
+        suffix
+        for suffix in REQUIRED_LEARNER_CODE_SUFFIXES
+        if not any(path.endswith(suffix) for path in learner_code_paths)
+    }
+    if generation.get("meaningful_public_history") is True and not any(
+        path.endswith("src/catan_zero/rl/meaningful_history.py")
+        for path in learner_code_paths
+    ):
+        missing_learner_code.add("src/catan_zero/rl/meaningful_history.py")
+    missing_learner_code.update(
+        suffix
+        for suffix in required_current_files
+        if not any(path.endswith(suffix) for path in learner_code_paths)
+    )
+    if missing_learner_code:
+        raise ContractError(
+            "learner_code_files omits required learner semantics files: "
+            f"{sorted(missing_learner_code)}"
+        )
+    return code_records, learner_code_records, _runtime_code_tree_records()
+
+
 def build_lock(
     draft_path: Path,
     *,
@@ -7407,62 +7503,14 @@ def build_lock(
         s1_evidence=evidence_by_kind["s1"],
     )
     guard_record = _file_record(guard_path, kind="guard_config")
-    code_records = [
-        _file_record(_absolute_ref(str(raw), base=base), kind="generator_code")
-        for raw in provenance["generator_code_files"]
-    ]
-    code_paths = {Path(record["path"]).as_posix() for record in code_records}
-    missing_code = {
-        suffix
-        for suffix in REQUIRED_GENERATOR_CODE_SUFFIXES
-        if not any(path.endswith(suffix) for path in code_paths)
-    }
-    if generation.get("meaningful_public_history") is True and not any(
-        path.endswith("src/catan_zero/rl/meaningful_history.py")
-        for path in code_paths
-    ):
-        missing_code.add("src/catan_zero/rl/meaningful_history.py")
-    if target_information_regime == TARGET_INFORMATION_REGIME_PUBLIC_COHERENT:
-        for suffix in (
-            "tools/a1_current_science_contract.py",
-            "configs/operations/a1-next-wave-coherent-public-v3/science.contract.json",
-        ):
-            if not any(path.endswith(suffix) for path in code_paths):
-                missing_code.add(suffix)
-    if missing_code:
-        raise ContractError(
-            f"generator_code_files omits required semantics files: {sorted(missing_code)}"
+    code_records, learner_code_records, runtime_code_tree = (
+        _resolve_provenance_code_records(
+            provenance,
+            base=base,
+            generation=generation,
+            target_information_regime=target_information_regime,
         )
-    learner_code_records = [
-        _file_record(_absolute_ref(str(raw), base=base), kind="learner_code")
-        for raw in provenance["learner_code_files"]
-    ]
-    learner_code_paths = {
-        Path(record["path"]).as_posix() for record in learner_code_records
-    }
-    missing_learner_code = {
-        suffix
-        for suffix in REQUIRED_LEARNER_CODE_SUFFIXES
-        if not any(path.endswith(suffix) for path in learner_code_paths)
-    }
-    if generation.get("meaningful_public_history") is True and not any(
-        path.endswith("src/catan_zero/rl/meaningful_history.py")
-        for path in learner_code_paths
-    ):
-        missing_learner_code.add("src/catan_zero/rl/meaningful_history.py")
-    if target_information_regime == TARGET_INFORMATION_REGIME_PUBLIC_COHERENT:
-        for suffix in (
-            "tools/a1_current_science_contract.py",
-            "configs/operations/a1-next-wave-coherent-public-v3/science.contract.json",
-        ):
-            if not any(path.endswith(suffix) for path in learner_code_paths):
-                missing_learner_code.add(suffix)
-    if missing_learner_code:
-        raise ContractError(
-            "learner_code_files omits required learner semantics files: "
-            f"{sorted(missing_learner_code)}"
-        )
-    runtime_code_tree = _runtime_code_tree_records()
+    )
     _validate_post_wave(
         dict(draft["post_wave_acceptance"]),
         expected_target_information_regime=target_information_regime,
@@ -9877,12 +9925,12 @@ def _meaningful_public_event_authority(
     )
     expected_schema = (
         MEANINGFUL_PUBLIC_HISTORY_SCHEMA_V2
-        if adapter_version == RUST_ENTITY_ADAPTER_V5
+        if adapter_version in {RUST_ENTITY_ADAPTER_V5, RUST_ENTITY_ADAPTER_V6}
         else MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION
     )
     expected_limit = (
         MEANINGFUL_PUBLIC_HISTORY_V2_LIMIT
-        if adapter_version == RUST_ENTITY_ADAPTER_V5
+        if adapter_version in {RUST_ENTITY_ADAPTER_V5, RUST_ENTITY_ADAPTER_V6}
         else MEANINGFUL_PUBLIC_HISTORY_LIMIT
     )
     if (
@@ -10103,7 +10151,10 @@ def _require_shard_feature_semantics(
         if meaningful_public_history
         else _authenticated_empty_event_authority()
     )
+    expected_adapter = str(authority["entity_feature_adapter_version"])
     required = {"adapter_version", "event_tokens", "event_mask", "event_target_ids"}
+    if expected_adapter == RUST_ENTITY_ADAPTER_V6:
+        required.add("player_tokens")
     missing = sorted(required.difference(payload.files))
     if missing:
         raise ContractError(
@@ -10114,12 +10165,49 @@ def _require_shard_feature_semantics(
     if adapters.shape != (rows,):
         raise ContractError(f"{where}: adapter_version is not row-aligned")
     observed_adapters = set(adapters.astype(str).tolist())
-    expected_adapter = str(authority["entity_feature_adapter_version"])
     if observed_adapters != {expected_adapter}:
         raise ContractError(
             f"{where}: adapter_version drift; observed={sorted(observed_adapters)} "
             f"expected={[expected_adapter]}"
         )
+    actor_resource_scan = None
+    if expected_adapter == RUST_ENTITY_ADAPTER_V6:
+        player_tokens = np.asarray(payload["player_tokens"])
+        expected_shape = (rows, 4, PLAYER_FEATURE_SIZE)
+        if player_tokens.shape != expected_shape:
+            raise ContractError(
+                f"{where}: adapter-v6 player_tokens shape {player_tokens.shape} "
+                f"differs from {expected_shape}"
+            )
+        if player_tokens.dtype.kind not in "fc":
+            raise ContractError(
+                f"{where}: adapter-v6 player_tokens must be floating point"
+            )
+        if np.any(~np.isfinite(player_tokens)):
+            raise ContractError(
+                f"{where}: adapter-v6 player_tokens contain non-finite values"
+            )
+        invalid_rows, checked_rows = v6_actor_resource_identity_violations(
+            player_tokens
+        )
+        if checked_rows != rows:
+            raise ContractError(
+                f"{where}: adapter-v6 actor-resource scan checked "
+                f"{checked_rows} rows, expected {rows}"
+            )
+        if invalid_rows:
+            raise ContractError(
+                f"{where}: adapter-v6 actor-resource identity failed after "
+                "physical-scale decoding: exactly one actor is required and "
+                "actor total slot 6 must equal sum slots 16:21; "
+                f"invalid_rows={invalid_rows}/{checked_rows}"
+            )
+        actor_resource_scan = {
+            "schema": "training-v6-actor-resource-identity-scan-v1",
+            "row_count": rows,
+            "invalid_row_count": 0,
+        }
+        actor_resource_scan["scan_sha256"] = _digest_value(actor_resource_scan)
     structured_action_resource_scan = (
         _require_v3_structured_action_resource_semantics(
             payload,
@@ -10128,7 +10216,12 @@ def _require_shard_feature_semantics(
             where=where,
         )
         if expected_adapter
-        in {RUST_ENTITY_ADAPTER_V3, RUST_ENTITY_ADAPTER_V4, RUST_ENTITY_ADAPTER_V5}
+        in {
+            RUST_ENTITY_ADAPTER_V3,
+            RUST_ENTITY_ADAPTER_V4,
+            RUST_ENTITY_ADAPTER_V5,
+            RUST_ENTITY_ADAPTER_V6,
+        }
         else None
     )
 
@@ -10180,6 +10273,7 @@ def _require_shard_feature_semantics(
         return {
             "row_count": rows,
             "entity_feature_adapter_version": expected_adapter,
+            "actor_resource_identity": actor_resource_scan,
             "structured_action_resources": structured_action_resource_scan,
             "event_history": {
                 "authenticated_empty": False,
@@ -10199,6 +10293,7 @@ def _require_shard_feature_semantics(
     return {
         "row_count": rows,
         "entity_feature_adapter_version": expected_adapter,
+        "actor_resource_identity": actor_resource_scan,
         "structured_action_resources": structured_action_resource_scan,
         "event_history": {
             "authenticated_empty": True,

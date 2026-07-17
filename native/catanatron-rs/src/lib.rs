@@ -9116,6 +9116,8 @@ pub mod python_bindings {
     const ENTITY_ADAPTER_V3: &str = "rust_entity_adapter_v3_structured_action_resources";
     const ENTITY_ADAPTER_V4: &str = "rust_entity_adapter_v4_actor_public_rule_state";
     const ENTITY_ADAPTER_V5: &str = "rust_entity_adapter_v5_meaningful_history_v2";
+    const ENTITY_ADAPTER_V6: &str =
+        "rust_entity_adapter_v6_exact_actor_resources_initial_road_two_hop";
     const ENTITY_PLAYERS_ORDER: [&str; 4] = ["BLUE", "RED", "ORANGE", "WHITE"];
     const ENTITY_PROMPTS: [&str; 8] = [
         "BUILD_INITIAL_SETTLEMENT",
@@ -9151,9 +9153,11 @@ pub mod python_bindings {
     fn entity_adapter_encodes_action_resources(version: &str) -> PyResult<bool> {
         match version {
             ENTITY_ADAPTER_V2 => Ok(false),
-            ENTITY_ADAPTER_V3 | ENTITY_ADAPTER_V4 | ENTITY_ADAPTER_V5 => Ok(true),
+            ENTITY_ADAPTER_V3 | ENTITY_ADAPTER_V4 | ENTITY_ADAPTER_V5 | ENTITY_ADAPTER_V6 => {
+                Ok(true)
+            }
             _ => Err(PyValueError::new_err(format!(
-                "unknown entity feature adapter version {version:?}; expected {ENTITY_ADAPTER_V2:?}, {ENTITY_ADAPTER_V3:?}, {ENTITY_ADAPTER_V4:?}, or {ENTITY_ADAPTER_V5:?}"
+                "unknown entity feature adapter version {version:?}; expected {ENTITY_ADAPTER_V2:?}, {ENTITY_ADAPTER_V3:?}, {ENTITY_ADAPTER_V4:?}, {ENTITY_ADAPTER_V5:?}, or {ENTITY_ADAPTER_V6:?}"
             ))),
         }
     }
@@ -9309,6 +9313,7 @@ pub mod python_bindings {
         encode_structured_action_resources: bool,
         encode_actor_public_rule_state: bool,
         encode_meaningful_history_v2: bool,
+        encode_exact_actor_resources: bool,
     ) -> PyResult<EntityFeatureArrays> {
         let state = &game.state;
         let actions = &game.playable_actions;
@@ -9507,7 +9512,17 @@ pub mod python_bindings {
             }
             let resource_card_count: i64 = ps.resources.iter().map(|&count| count as i64).sum();
             let dev_card_count: i64 = ps.dev_cards.iter().map(|&count| count as i64).sum();
-            player_tokens[base + 6] = entity_scale(resource_card_count, 20.0);
+            let resource_total_scale = if encode_exact_actor_resources {
+                95.0
+            } else {
+                20.0
+            };
+            let resource_composition_scale = if encode_exact_actor_resources {
+                19.0
+            } else {
+                10.0
+            };
+            player_tokens[base + 6] = entity_scale(resource_card_count, resource_total_scale);
             player_tokens[base + 7] = entity_scale(dev_card_count, 10.0);
             player_tokens[base + 8] = entity_scale(ps.roads_available as i64, 15.0);
             player_tokens[base + 9] = entity_scale(ps.settlements_available as i64, 5.0);
@@ -9520,7 +9535,8 @@ pub mod python_bindings {
             if !masked {
                 player_tokens[base + 15] = 1.0;
                 for (offset, &count) in ps.resources.iter().enumerate() {
-                    player_tokens[base + 16 + offset] = entity_scale(count as i64, 10.0);
+                    player_tokens[base + 16 + offset] =
+                        entity_scale(count as i64, resource_composition_scale);
                 }
             }
             if !masked {
@@ -9955,9 +9971,13 @@ pub mod python_bindings {
             entity_adapter_encodes_action_resources(entity_feature_adapter_version)?;
         let encode_actor_public_rule_state = matches!(
             entity_feature_adapter_version,
-            ENTITY_ADAPTER_V4 | ENTITY_ADAPTER_V5
+            ENTITY_ADAPTER_V4 | ENTITY_ADAPTER_V5 | ENTITY_ADAPTER_V6
         );
-        let encode_meaningful_history_v2 = entity_feature_adapter_version == ENTITY_ADAPTER_V5;
+        let encode_meaningful_history_v2 = matches!(
+            entity_feature_adapter_version,
+            ENTITY_ADAPTER_V5 | ENTITY_ADAPTER_V6
+        );
+        let encode_exact_actor_resources = entity_feature_adapter_version == ENTITY_ADAPTER_V6;
         let arrays = build_entity_feature_arrays(
             &game.game,
             &colors,
@@ -9970,6 +9990,7 @@ pub mod python_bindings {
             encode_structured_action_resources,
             encode_actor_public_rule_state,
             encode_meaningful_history_v2,
+            encode_exact_actor_resources,
         )?;
         entity_feature_arrays_to_pydict(py, arrays)
     }
@@ -10058,9 +10079,13 @@ pub mod python_bindings {
             entity_adapter_encodes_action_resources(entity_feature_adapter_version)?;
         let encode_actor_public_rule_state = matches!(
             entity_feature_adapter_version,
-            ENTITY_ADAPTER_V4 | ENTITY_ADAPTER_V5
+            ENTITY_ADAPTER_V4 | ENTITY_ADAPTER_V5 | ENTITY_ADAPTER_V6
         );
-        let encode_meaningful_history_v2 = entity_feature_adapter_version == ENTITY_ADAPTER_V5;
+        let encode_meaningful_history_v2 = matches!(
+            entity_feature_adapter_version,
+            ENTITY_ADAPTER_V5 | ENTITY_ADAPTER_V6
+        );
+        let encode_exact_actor_resources = entity_feature_adapter_version == ENTITY_ADAPTER_V6;
         let batch_size = games.len();
 
         // Borrow every game's inner `Game` up front (needs the GIL) so the
@@ -10085,6 +10110,7 @@ pub mod python_bindings {
                         encode_structured_action_resources,
                         encode_actor_public_rule_state,
                         encode_meaningful_history_v2,
+                        encode_exact_actor_resources,
                     )
                 })
                 .collect::<PyResult<Vec<_>>>()?
@@ -10105,6 +10131,7 @@ pub mod python_bindings {
                         encode_structured_action_resources,
                         encode_actor_public_rule_state,
                         encode_meaningful_history_v2,
+                        encode_exact_actor_resources,
                     )
                 })
                 .collect::<PyResult<Vec<_>>>()?
@@ -10339,9 +10366,24 @@ pub mod python_bindings {
         n_legal: usize,
     }
 
+    fn context_adapter_uses_initial_road_two_hop(version: Option<&str>) -> PyResult<bool> {
+        match version {
+            None
+            | Some(ENTITY_ADAPTER_V2)
+            | Some(ENTITY_ADAPTER_V3)
+            | Some(ENTITY_ADAPTER_V4)
+            | Some(ENTITY_ADAPTER_V5) => Ok(false),
+            Some(ENTITY_ADAPTER_V6) => Ok(true),
+            Some(other) => Err(PyValueError::new_err(format!(
+                "unknown action-context entity adapter {other:?}"
+            ))),
+        }
+    }
+
     fn build_action_context_arrays(
         game: &Game,
         topology: &PyEntityTopology,
+        use_initial_road_two_hop: bool,
     ) -> ContextFeatureArrays {
         let state = &game.state;
         let actions = &game.playable_actions;
@@ -10459,18 +10501,62 @@ pub mod python_bindings {
                     context_tokens[base + 3] = productions.iter().copied().fold(f64::MIN, f64::max);
                     context_tokens[base + 4] =
                         productions.iter().sum::<f64>() / productions.len() as f64;
-                    let expansion_scores: Vec<f64> = [a, b]
-                        .iter()
-                        .map(|&node| {
-                            if occupied_nodes.contains(&node) {
+                    if use_initial_road_two_hop && prompt_name == "BUILD_INITIAL_ROAD" {
+                        let actor_origins: Vec<usize> = [a, b]
+                            .iter()
+                            .copied()
+                            .filter(|node| {
+                                matches!(
+                                    state.board.buildings.get(node),
+                                    Some((owner, _)) if *owner == perspective_color
+                                )
+                            })
+                            .collect();
+                        context_tokens[base + 16] = if actor_origins.len() != 1 {
+                            0.0
+                        } else {
+                            let origin = actor_origins[0];
+                            let frontier = if a == origin { b } else { a };
+                            if state.board.buildings.contains_key(&frontier) {
                                 0.0
                             } else {
-                                scaled_production(node)
+                                node_neighbors(frontier)
+                                    .into_iter()
+                                    .filter(|target| *target != origin)
+                                    .filter(|target| !state.board.buildings.contains_key(target))
+                                    .filter(|target| {
+                                        !state
+                                            .board
+                                            .roads
+                                            .contains_key(&canonical_edge((frontier, *target)))
+                                    })
+                                    .filter(|target| {
+                                        node_neighbors(*target).iter().all(|neighbor| {
+                                            !state.board.buildings.contains_key(neighbor)
+                                        })
+                                    })
+                                    .map(scaled_production)
+                                    .fold(0.0, f64::max)
                             }
-                        })
-                        .collect();
-                    context_tokens[base + 16] =
-                        expansion_scores.iter().copied().fold(0.0, f64::max);
+                        };
+                    } else {
+                        // Frozen v2-v5 behavior: score the unoccupied endpoint
+                        // of the proposed road, even though it is distance one
+                        // from the opening settlement and cannot host the next
+                        // settlement.
+                        let expansion_scores: Vec<f64> = [a, b]
+                            .iter()
+                            .map(|&node| {
+                                if occupied_nodes.contains(&node) {
+                                    0.0
+                                } else {
+                                    scaled_production(node)
+                                }
+                            })
+                            .collect();
+                        context_tokens[base + 16] =
+                            expansion_scores.iter().copied().fold(0.0, f64::max);
+                    }
                 }
                 (ActionType::MoveRobber, ActionValue::Robber(_, Some(color))) => {
                     let vp = state.player_state(*color).victory_points as f64;
@@ -10501,11 +10587,26 @@ pub mod python_bindings {
     }
 
     #[pyfunction]
+    fn supported_action_context_adapter_versions() -> Vec<&'static str> {
+        vec![
+            ENTITY_ADAPTER_V2,
+            ENTITY_ADAPTER_V3,
+            ENTITY_ADAPTER_V4,
+            ENTITY_ADAPTER_V5,
+            ENTITY_ADAPTER_V6,
+        ]
+    }
+
+    #[pyfunction]
+    #[pyo3(signature = (game, topology, entity_feature_adapter_version=None))]
     fn build_action_context_flat(
         game: &PyGame,
         topology: &PyEntityTopology,
+        entity_feature_adapter_version: Option<&str>,
     ) -> PyResult<(Vec<u8>, (usize, usize))> {
-        let arrays = build_action_context_arrays(&game.game, topology);
+        let use_initial_road_two_hop =
+            context_adapter_uses_initial_road_two_hop(entity_feature_adapter_version)?;
+        let arrays = build_action_context_arrays(&game.game, topology, use_initial_road_two_hop);
         Ok((
             f64_vec_to_le_bytes(arrays.context_tokens),
             (arrays.n_legal, CONTEXT_ACTION_FEATURE_SIZE),
@@ -10517,25 +10618,28 @@ pub mod python_bindings {
     /// its doc comment). Returns `{"context_tokens": (flat, (B, max_width,
     /// CONTEXT_ACTION_FEATURE_SIZE)), "widths": [...]}`.
     #[pyfunction]
-    #[pyo3(signature = (games, topology, parallel=false))]
+    #[pyo3(signature = (games, topology, parallel=false, entity_feature_adapter_version=None))]
     fn build_action_context_batch(
         py: Python<'_>,
         games: Vec<Py<PyGame>>,
         topology: &PyEntityTopology,
         parallel: bool,
+        entity_feature_adapter_version: Option<&str>,
     ) -> PyResult<Py<PyDict>> {
         let borrowed: Vec<PyRef<'_, PyGame>> = games.iter().map(|g| g.borrow(py)).collect();
         let game_refs: Vec<&Game> = borrowed.iter().map(|g| &g.game).collect();
 
+        let use_initial_road_two_hop =
+            context_adapter_uses_initial_road_two_hop(entity_feature_adapter_version)?;
         let arrays: Vec<ContextFeatureArrays> = if parallel {
             game_refs
                 .par_iter()
-                .map(|game| build_action_context_arrays(game, topology))
+                .map(|game| build_action_context_arrays(game, topology, use_initial_road_two_hop))
                 .collect()
         } else {
             game_refs
                 .iter()
-                .map(|game| build_action_context_arrays(game, topology))
+                .map(|game| build_action_context_arrays(game, topology, use_initial_road_two_hop))
                 .collect()
         };
 
@@ -10583,6 +10687,10 @@ pub mod python_bindings {
         module.add_function(wrap_pyfunction!(build_entity_features_batch, module)?)?;
         module.add_function(wrap_pyfunction!(build_action_context_flat, module)?)?;
         module.add_function(wrap_pyfunction!(build_action_context_batch, module)?)?;
+        module.add_function(wrap_pyfunction!(
+            supported_action_context_adapter_versions,
+            module
+        )?)?;
         module.add_function(wrap_pyfunction!(action_space_json, module)?)?;
         module.add_function(wrap_pyfunction!(simulate_batch_stats, module)?)?;
         Ok(())
@@ -10681,6 +10789,7 @@ pub mod python_bindings {
                 false,
                 false,
                 false,
+                false,
             )
             .unwrap();
             let actor_base =
@@ -10693,6 +10802,137 @@ pub mod python_bindings {
             assert_eq!(arrays.player_tokens[opponent_base + 4], 0.0);
             assert_eq!(arrays.player_tokens[opponent_base + 15], 0.0);
             assert_eq!(arrays.player_tokens[opponent_base + 21], 0.0);
+        }
+
+        #[test]
+        fn entity_v6_preserves_exact_actor_resource_composition_and_total() {
+            let mut py_game =
+                PyGame::simple(Some(vec!["RED".to_string(), "BLUE".to_string()]), Some(32))
+                    .unwrap();
+            let actor = py_game.game.state.current_color();
+            py_game.game.state.player_state_mut(actor).resources = [11, 10, 0, 0, 0];
+            let topology = PyEntityTopology {
+                hex_vertex_ids: vec![vec![-1; 6]; 19],
+                hex_edge_ids: vec![vec![-1; 6]; 19],
+                edge_vertex_ids: vec![vec![-1; 2]; 72],
+                port_base_nodes: vec![vec![-1; 2]; 16],
+            };
+            let colors = py_game.game.state.colors.clone();
+            let policy_action_ids = vec![0; py_game.game.playable_actions.len()];
+            let legacy = build_entity_feature_arrays(
+                &py_game.game,
+                &colors,
+                &policy_action_ids,
+                400,
+                &topology,
+                true,
+                false,
+                ENTITY_EVENT_HISTORY_LIMIT,
+                false,
+                false,
+                false,
+                false,
+            )
+            .unwrap();
+            let v6 = build_entity_feature_arrays(
+                &py_game.game,
+                &colors,
+                &policy_action_ids,
+                400,
+                &topology,
+                true,
+                false,
+                ENTITY_EVENT_HISTORY_LIMIT,
+                true,
+                true,
+                true,
+                true,
+            )
+            .unwrap();
+            let base = entity_player_index(color_name(actor)).unwrap() * ENTITY_PLAYER_FEATURE_SIZE;
+
+            assert_eq!(legacy.player_tokens[base + 6], 1.0);
+            assert_eq!(legacy.player_tokens[base + 16], 1.0);
+            assert_eq!(legacy.player_tokens[base + 17], 1.0);
+            assert_eq!(v6.player_tokens[base + 6], 21.0 / 95.0);
+            assert_eq!(v6.player_tokens[base + 16], 11.0 / 19.0);
+            assert_eq!(v6.player_tokens[base + 17], 10.0 / 19.0);
+            let decoded_total = (v6.player_tokens[base + 6] * 95.0).round() as i64;
+            let decoded_composition: i64 = (0..5)
+                .map(|offset| (v6.player_tokens[base + 16 + offset] * 19.0).round() as i64)
+                .sum();
+            assert_eq!(decoded_total, decoded_composition);
+        }
+
+        #[test]
+        fn action_context_v6_initial_road_uses_legal_two_hop_settlement_sites() {
+            let mut py_game = PyGame::random(
+                Some(vec!["RED".to_string(), "BLUE".to_string()]),
+                Some(500_003),
+            )
+            .unwrap();
+            let settlement = py_game
+                .game
+                .playable_actions
+                .iter()
+                .find(|action| {
+                    action.action_type == ActionType::BuildSettlement
+                        && action.value == ActionValue::Node(15)
+                })
+                .cloned()
+                .unwrap();
+            py_game.game.execute(settlement, true, None).unwrap();
+            assert_eq!(
+                action_prompt_name(py_game.game.state.current_prompt),
+                "BUILD_INITIAL_ROAD"
+            );
+
+            let mut hex_vertex_ids = vec![vec![-1; 6]; 19];
+            let mut edge_set = std::collections::HashSet::new();
+            for tile in py_game.game.state.board.map.land_tiles.values() {
+                hex_vertex_ids[tile.id] = tile.nodes.iter().map(|node| *node as i16).collect();
+                edge_set.extend(tile.edges.iter().copied().map(canonical_edge));
+            }
+            let mut edges: Vec<Edge> = edge_set.into_iter().collect();
+            edges.sort_unstable();
+            let mut edge_vertex_ids = vec![vec![-1; 2]; 72];
+            for (edge_id, (a, b)) in edges.into_iter().enumerate() {
+                edge_vertex_ids[edge_id] = vec![a as i16, b as i16];
+            }
+            let topology = PyEntityTopology {
+                hex_vertex_ids,
+                hex_edge_ids: vec![vec![-1; 6]; 19],
+                edge_vertex_ids,
+                port_base_nodes: vec![vec![-1; 2]; 16],
+            };
+
+            let legacy = build_action_context_arrays(&py_game.game, &topology, false);
+            let v6 = build_action_context_arrays(&py_game.game, &topology, true);
+            let row_for_edge = |target: Edge| {
+                py_game
+                    .game
+                    .playable_actions
+                    .iter()
+                    .position(|action| {
+                        matches!(
+                            action.value,
+                            ActionValue::Edge(edge) if canonical_edge(edge) == canonical_edge(target)
+                        )
+                    })
+                    .unwrap()
+            };
+            let strong = row_for_edge((4, 15));
+            let weak = row_for_edge((15, 17));
+            let strong_slot = strong * CONTEXT_ACTION_FEATURE_SIZE + 16;
+            let weak_slot = weak * CONTEXT_ACTION_FEATURE_SIZE + 16;
+
+            assert_eq!(
+                legacy.context_tokens[strong_slot],
+                legacy.context_tokens[weak_slot]
+            );
+            assert_eq!(v6.context_tokens[strong_slot], 9.0 / 18.0);
+            assert_eq!(v6.context_tokens[weak_slot], 7.0 / 18.0);
+            assert!(v6.context_tokens[strong_slot] > v6.context_tokens[weak_slot]);
         }
 
         #[test]
@@ -10732,6 +10972,7 @@ pub mod python_bindings {
                 true,
                 false,
                 false,
+                false,
             )
             .unwrap();
             let v4 = build_entity_feature_arrays(
@@ -10745,6 +10986,7 @@ pub mod python_bindings {
                 ENTITY_EVENT_HISTORY_LIMIT,
                 true,
                 true,
+                false,
                 false,
             )
             .unwrap();
@@ -10848,6 +11090,7 @@ pub mod python_bindings {
                 true,
                 false,
                 false,
+                false,
             )
             .unwrap();
             assert_eq!(enabled.event_history_limit, 32);
@@ -10879,6 +11122,7 @@ pub mod python_bindings {
                 true,
                 false,
                 ENTITY_EVENT_HISTORY_LIMIT,
+                false,
                 false,
                 false,
                 false,
@@ -10933,6 +11177,7 @@ pub mod python_bindings {
                 true,
                 true,
                 false,
+                false,
             )
             .unwrap();
             assert_eq!(v1.event_history_limit, 32);
@@ -10954,6 +11199,7 @@ pub mod python_bindings {
                 true,
                 true,
                 true,
+                false,
             )
             .unwrap();
             assert_eq!(v2.event_history_limit, 64);
@@ -11047,6 +11293,7 @@ pub mod python_bindings {
                 false,
                 false,
                 false,
+                false,
             )
             .unwrap();
             let v3 = build_entity_feature_arrays(
@@ -11059,6 +11306,7 @@ pub mod python_bindings {
                 false,
                 ENTITY_EVENT_HISTORY_LIMIT,
                 true,
+                false,
                 false,
                 false,
             )

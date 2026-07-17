@@ -21,6 +21,7 @@ from catan_zero.rl.entity_feature_adapter import (
     RUST_ENTITY_ADAPTER_V3,
     RUST_ENTITY_ADAPTER_V4,
     RUST_ENTITY_ADAPTER_V5,
+    RUST_ENTITY_ADAPTER_V6,
     policy_entity_feature_adapter_version,
     require_known_entity_feature_adapter,
 )
@@ -559,7 +560,11 @@ class EntityGraphRustEvaluator:
         from catan_zero.rl.action_context_features_rust import build_action_context_rust
 
         topology = self._get_or_init_rust_topology(adapter, acting_color=acting_color)
-        context = build_action_context_rust(game, topology=topology)
+        context = build_action_context_rust(
+            game,
+            topology=topology,
+            entity_feature_adapter_version=self.config.entity_feature_adapter_version,
+        )
         return context[None, ...]
 
     def _entity_context_batch_via_rust(
@@ -596,7 +601,9 @@ class EntityGraphRustEvaluator:
             entity_feature_adapter_version=(self.config.entity_feature_adapter_version),
         )
         context, context_widths = build_action_context_batch_rust(
-            games, topology=topology
+            games,
+            topology=topology,
+            entity_feature_adapter_version=self.config.entity_feature_adapter_version,
         )
         expected_widths = [len(ids) for ids in policy_action_ids]
         if widths != expected_widths or context_widths != expected_widths:
@@ -830,6 +837,7 @@ class EntityGraphRustEvaluator:
                 fill=float(self.config.context_fill),
                 policy_action_ids=policy_action_ids,
                 public_observation=bool(self.config.public_observation),
+                entity_feature_adapter_version=self.config.entity_feature_adapter_version,
                 resolved=resolved,
             )
 
@@ -976,6 +984,7 @@ class EntityGraphRustEvaluator:
                 fill=float(self.config.context_fill),
                 policy_action_ids=policy_action_ids,
                 public_observation=bool(self.config.public_observation),
+                entity_feature_adapter_version=self.config.entity_feature_adapter_version,
                 resolved=resolved,
             )
         legal_ids = np.asarray(policy_action_ids, dtype=np.int64)[None, :]
@@ -1203,6 +1212,7 @@ class EntityGraphRustEvaluator:
                     fill=float(self.config.context_fill),
                     policy_action_ids=policy_action_ids,
                     public_observation=bool(self.config.public_observation),
+                    entity_feature_adapter_version=self.config.entity_feature_adapter_version,
                     resolved=resolved,
                 )
             pending_indices.append(request_index)
@@ -1497,6 +1507,7 @@ class BatchedEntityGraphRustEvaluator(EntityGraphRustEvaluator):
                 fill=float(self.config.context_fill),
                 policy_action_ids=policy_action_ids,
                 public_observation=bool(self.config.public_observation),
+                entity_feature_adapter_version=self.config.entity_feature_adapter_version,
                 resolved=resolved,
             )
         request = _BatchedEvalRequest(
@@ -1912,6 +1923,9 @@ def rust_action_context_batch(
         payload.get("players", {}).get(actor, {}).get("public_victory_points", 0)
     )
     prompt = str(payload.get("current_prompt", ""))
+    adapter_version = require_known_entity_feature_adapter(
+        entity_feature_adapter_version
+    )
     rows = np.full(
         (len(legal_actions), CONTEXT_ACTION_FEATURE_SIZE),
         float(fill),
@@ -1925,6 +1939,8 @@ def rust_action_context_batch(
             actor_public_vp=actor_public_vp,
             payload=payload,
             prompt=prompt,
+            actor=actor,
+            entity_feature_adapter_version=adapter_version,
         )
     return rows[None, ...]
 
@@ -2302,6 +2318,7 @@ def _structured_action(
             RUST_ENTITY_ADAPTER_V3,
             RUST_ENTITY_ADAPTER_V4,
             RUST_ENTITY_ADAPTER_V5,
+            RUST_ENTITY_ADAPTER_V6,
         }
     ):
         resources = value if isinstance(value, (list, tuple)) else ()

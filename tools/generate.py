@@ -107,10 +107,10 @@ REQUIRED_SCIENCE_FIELDS = {
     "meaningful_public_history": True,
     "event_history_limit": 64,
     "learner_entity_feature_adapter_version": (
-        "rust_entity_adapter_v5_meaningful_history_v2"
+        "rust_entity_adapter_v6_exact_actor_resources_initial_road_two_hop"
     ),
     "teacher_entity_feature_adapter_version": (
-        "rust_entity_adapter_v5_meaningful_history_v2"
+        "rust_entity_adapter_v2_land_topology_ports_maritime"
     ),
     "public_card_count_feature_schema": "public_card_state_v2",
     "preserve_search_evidence": True,

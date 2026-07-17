@@ -82,6 +82,7 @@ from catan_zero.rl.flywheel.opponent_mix import OpponentMixConfig, choose_mix_op
 from catan_zero.rl.entity_feature_adapter import (
     RUST_ENTITY_ADAPTER_V4,
     RUST_ENTITY_ADAPTER_V5,
+    RUST_ENTITY_ADAPTER_V6,
     require_known_entity_feature_adapter,
 )
 from catan_zero.rl.entity_token_features_rust import (
@@ -880,7 +881,11 @@ def _build_public_learner_features(
     adapter_version = require_known_entity_feature_adapter(
         entity_feature_adapter_version
     )
-    if adapter_version in {RUST_ENTITY_ADAPTER_V4, RUST_ENTITY_ADAPTER_V5}:
+    if adapter_version in {
+        RUST_ENTITY_ADAPTER_V4,
+        RUST_ENTITY_ADAPTER_V5,
+        RUST_ENTITY_ADAPTER_V6,
+    }:
         # The actor public-rule-state contract depends on turn-local
         # ``owned_at_start``.  Released wheels before the repaired JSON ABI
         # retained that field authoritatively inside the native Game and used
@@ -1858,6 +1863,7 @@ class GumbelShardWriter:
         commissioned_rule_state_versions = {
             RUST_ENTITY_ADAPTER_V4,
             RUST_ENTITY_ADAPTER_V5,
+            RUST_ENTITY_ADAPTER_V6,
         }
         if adapter_versions & commissioned_rule_state_versions:
             if not adapter_versions <= commissioned_rule_state_versions:

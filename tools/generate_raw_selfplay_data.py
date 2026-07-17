@@ -31,7 +31,10 @@ from catan_zero.rl.gumbel_self_play import (
     TARGET_INFORMATION_REGIME_AUTHORITATIVE,
     TARGET_INFORMATION_REGIME_PUBLIC_COHERENT,
 )
-from catan_zero.rl.entity_feature_adapter import RUST_ENTITY_ADAPTER_V5
+from catan_zero.rl.entity_feature_adapter import (
+    RUST_ENTITY_ADAPTER_V5,
+    RUST_ENTITY_ADAPTER_V6,
+)
 from catan_zero.rl.meaningful_history import MEANINGFUL_PUBLIC_HISTORY_SCHEMA_V2
 from catan_zero.search.gumbel_chance_mcts import HeuristicRustEvaluator
 from catan_zero.search.neural_rust_mcts import (
@@ -166,7 +169,7 @@ def main() -> None:
                 "meaningful_public_history_schema": (
                     MEANINGFUL_PUBLIC_HISTORY_SCHEMA_V2
                     if str(args.learner_entity_feature_adapter_version)
-                    == RUST_ENTITY_ADAPTER_V5
+                    in {RUST_ENTITY_ADAPTER_V5, RUST_ENTITY_ADAPTER_V6}
                     else RawSelfPlayConfig().meaningful_public_history_schema
                 ),
                 "event_history_limit": int(args.event_history_limit),

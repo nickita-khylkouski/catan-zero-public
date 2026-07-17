@@ -29,6 +29,14 @@ from catan_zero.rl.entity_token_features import (  # noqa: E402
     PLAYER_ACTOR_FLAG_SLOT,
     PUBLIC_MASK_PLAYER_SLOTS,
 )
+from catan_zero.rl.entity_feature_adapter import (  # noqa: E402
+    CURRENT_RUST_ENTITY_ADAPTER_VERSION,
+    RUST_ENTITY_ADAPTER_V2,
+    RUST_ENTITY_ADAPTER_V3,
+    RUST_ENTITY_ADAPTER_V4,
+    RUST_ENTITY_ADAPTER_V5,
+    RUST_ENTITY_ADAPTER_V6,
+)
 from catan_zero.deduction_tracker import DEDUCTION_FEATURES_KEY  # noqa: E402
 from catan_zero.rl.entity_token_features_rust import (  # noqa: E402
     build_entity_features_batch_rust,
@@ -64,7 +72,14 @@ def _collect_states(num_games: int, max_ticks: int, seed_base: int) -> list[tupl
     return states
 
 
-def _reference_entity(game, actor, legal_action_ids, policy_action_ids, public_observation):
+def _reference_entity(
+    game,
+    actor,
+    legal_action_ids,
+    policy_action_ids,
+    public_observation,
+    adapter_version=CURRENT_RUST_ENTITY_ADAPTER_VERSION,
+):
     resolved = _resolve_entity_adapter(
         game,
         legal_action_ids,
@@ -75,6 +90,7 @@ def _reference_entity(game, actor, legal_action_ids, policy_action_ids, public_o
         action_by_id=None,
         public_observation=public_observation,
         perspective=actor,
+        entity_feature_adapter_version=adapter_version,
     )
     batched = rust_game_to_entity_batch(
         game,
@@ -84,12 +100,19 @@ def _reference_entity(game, actor, legal_action_ids, policy_action_ids, public_o
         action_size=ACTION_SIZE,
         policy_action_ids=policy_action_ids,
         public_observation=public_observation,
+        entity_feature_adapter_version=adapter_version,
         resolved=resolved,
     )
     return {key: value[0] for key, value in batched.items()}
 
 
-def _rust_entity(game, policy_action_ids, public_observation, topology):
+def _rust_entity(
+    game,
+    policy_action_ids,
+    public_observation,
+    topology,
+    adapter_version=CURRENT_RUST_ENTITY_ADAPTER_VERSION,
+):
     # NOTE: no `perspective`/`legal_action_ids` params anymore -- the Rust
     # builder derives perspective from `game.current_color()` and requires
     # `policy_action_ids` index-aligned to `game.playable_actions`'s native
@@ -102,6 +125,7 @@ def _rust_entity(game, policy_action_ids, public_observation, topology):
         action_size=ACTION_SIZE,
         topology=topology,
         public_observation=public_observation,
+        entity_feature_adapter_version=adapter_version,
     )
 
 
@@ -269,6 +293,121 @@ def test_batch_matches_single_item(states, public_observation, parallel, wave_si
             assert (batch["legal_action_tokens"][row, width:] == 0.0).all(), "token padding must be 0.0"
 
     assert not mismatches, "batch vs single-item parity FAILED for:\n" + "\n".join(mismatches[:40])
+
+
+def test_v6_resource_scales_python_native_single_and_batch_parity(states):
+    game = max(
+        (candidate for (candidate,) in states),
+        key=lambda candidate: sum(
+            map(
+                int,
+                json.loads(
+                    candidate.player_state_json(candidate.current_color())
+                )["resources"],
+            )
+        ),
+    )
+    actor = game.current_color()
+    legal_action_ids = tuple(
+        int(action) for action in game.playable_action_indices(list(COLORS), None)
+    )
+    policy_action_ids = rust_policy_action_ids(
+        game, legal_action_ids, colors=COLORS, action_size=ACTION_SIZE
+    )
+    resolved = _resolve_entity_adapter(
+        game,
+        legal_action_ids,
+        colors=COLORS,
+        action_size=ACTION_SIZE,
+        policy_action_ids=policy_action_ids,
+        snapshot=None,
+        action_by_id=None,
+        public_observation=True,
+        perspective=actor,
+        entity_feature_adapter_version=RUST_ENTITY_ADAPTER_V6,
+    )
+    topology = compute_rust_topology(
+        _RustEntityFeatureEnv(resolved[0], action_size=ACTION_SIZE), actor
+    )
+
+    python_v6 = _reference_entity(
+        game,
+        actor,
+        legal_action_ids,
+        policy_action_ids,
+        True,
+        RUST_ENTITY_ADAPTER_V6,
+    )
+    native_v6 = _rust_entity(
+        game,
+        policy_action_ids,
+        True,
+        topology,
+        RUST_ENTITY_ADAPTER_V6,
+    )
+    for key in ALL_KEYS:
+        assert np.array_equal(python_v6[key], native_v6[key]), key
+
+    player_tokens = np.asarray(native_v6["player_tokens"], dtype=np.float32)
+    actor_row = player_tokens[player_tokens[:, PLAYER_ACTOR_FLAG_SLOT] > 0.5]
+    assert actor_row.shape[0] == 1
+    decoded_total = int(np.rint(actor_row[0, 6] * 95.0))
+    decoded_composition = np.rint(actor_row[0, 16:21] * 19.0).astype(int)
+    authoritative_resources = json.loads(game.player_state_json(actor))["resources"]
+    expected_composition = np.asarray(authoritative_resources, dtype=int)
+    assert decoded_total > 0
+    assert decoded_total == int(expected_composition.sum())
+    assert np.array_equal(decoded_composition, expected_composition)
+    assert decoded_total == int(decoded_composition.sum())
+
+    batch, widths = build_entity_features_batch_rust(
+        [game.copy(), game.copy()],
+        colors=COLORS,
+        policy_action_ids=[policy_action_ids, policy_action_ids],
+        action_size=ACTION_SIZE,
+        topology=topology,
+        public_observation=True,
+        parallel=True,
+        entity_feature_adapter_version=RUST_ENTITY_ADAPTER_V6,
+    )
+    assert widths == [len(legal_action_ids), len(legal_action_ids)]
+    for key in ALL_KEYS:
+        expected = native_v6[key]
+        if key.startswith("legal_action_"):
+            assert np.array_equal(batch[key][0, : widths[0]], expected), key
+            assert np.array_equal(batch[key][1, : widths[1]], expected), key
+        else:
+            assert np.array_equal(batch[key][0], expected), key
+            assert np.array_equal(batch[key][1], expected), key
+
+    legacy_player_rows = []
+    for adapter_version in (
+        RUST_ENTITY_ADAPTER_V2,
+        RUST_ENTITY_ADAPTER_V3,
+        RUST_ENTITY_ADAPTER_V4,
+        RUST_ENTITY_ADAPTER_V5,
+    ):
+        legacy_player_rows.append(
+            _rust_entity(
+                game,
+                policy_action_ids,
+                True,
+                topology,
+                adapter_version,
+            )["player_tokens"]
+        )
+    for rows in legacy_player_rows[1:]:
+        assert np.array_equal(
+            legacy_player_rows[0][:, [6, 16, 17, 18, 19, 20]],
+            rows[:, [6, 16, 17, 18, 19, 20]],
+        )
+    legacy_actor_row = legacy_player_rows[-1][
+        legacy_player_rows[-1][:, PLAYER_ACTOR_FLAG_SLOT] > 0.5
+    ][0]
+    assert not np.array_equal(
+        legacy_actor_row[[6, 16, 17, 18, 19, 20]],
+        actor_row[0, [6, 16, 17, 18, 19, 20]],
+    )
 
 
 def test_public_observation_masks_opponent_hidden_slots(states):

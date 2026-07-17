@@ -429,7 +429,7 @@ def test_missing_handoff_fails_closed_but_historical_is_explicit(
 def test_schema_boundary_allows_history_only_on_legacy_v2(tmp_path: Path) -> None:
     template = (
         Path(__file__).resolve().parents[1]
-        / "configs/experiments/a1_pre_wave_contract.template.json"
+        / "configs/experiments/a1_pre_wave_contract_v4.template.json"
     )
     payload = json.loads(template.read_text())
     payload["schema_version"] = contract.DRAFT_SCHEMA

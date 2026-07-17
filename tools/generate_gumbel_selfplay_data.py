@@ -57,6 +57,7 @@ from catan_zero.rl.entity_feature_adapter import (
     CURRENT_RUST_ENTITY_ADAPTER_VERSION,
     IMPLEMENTED_RUST_ENTITY_ADAPTER_VERSIONS,
     RUST_ENTITY_ADAPTER_V5,
+    RUST_ENTITY_ADAPTER_V6,
     policy_entity_feature_adapter_version,
     require_known_entity_feature_adapter,
 )
@@ -120,7 +121,7 @@ def _requested_history_options(
     )
     schema = (
         MEANINGFUL_PUBLIC_HISTORY_SCHEMA_V2
-        if adapter == RUST_ENTITY_ADAPTER_V5
+        if adapter in {RUST_ENTITY_ADAPTER_V5, RUST_ENTITY_ADAPTER_V6}
         else MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION
     )
     limit = int(worker_args.get("event_history_limit", 64) or 0)
@@ -130,7 +131,7 @@ def _requested_history_options(
         # to the schema's fixed 32-token surface.  Preserve that compatibility
         # for archived callers.  v5/v2 is a new explicit contract and therefore
         # fails closed rather than silently changing the requested learner input.
-        if adapter == RUST_ENTITY_ADAPTER_V5 and limit != expected_limit:
+        if adapter in {RUST_ENTITY_ADAPTER_V5, RUST_ENTITY_ADAPTER_V6} and limit != expected_limit:
             raise ValueError(
                 f"{adapter} requires event_history_limit={expected_limit}, got {limit}"
             )

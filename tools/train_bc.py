@@ -81,12 +81,14 @@ from catan_zero.rl.entity_token_features import (
     PUBLIC_RULE_STATE_FEATURE_SCHEMA_VERSION,
     VERTEX_FEATURE_SIZE,
     public_card_count_features_from_entity_tokens,
+    v6_actor_resource_identity_violations,
 )
 from catan_zero.rl.entity_feature_adapter import (
     CURRENT_RUST_ENTITY_ADAPTER_VERSION,
     LEGACY_MISSING_CHECKPOINT_ADAPTER_VERSION,
     RUST_ENTITY_ADAPTER_V4,
     RUST_ENTITY_ADAPTER_V5,
+    RUST_ENTITY_ADAPTER_V6,
     checkpoint_entity_feature_adapter_metadata,
     policy_entity_feature_adapter_version,
     require_known_entity_feature_adapter,
@@ -277,6 +279,7 @@ _CROP_AUTHENTICATED_EMPTY_EVENT_HISTORY = False
 _MEANINGFUL_EVENT_HISTORY_LIMIT: int | None = None
 _PUBLIC_AWARD_FEATURE_CONTRACT = PUBLIC_AWARD_FEATURE_CONTRACT_LEGACY_ZERO
 _PUBLIC_CARD_COUNT_FEATURES_ENABLED = False
+_TRAINING_ENTITY_FEATURE_ADAPTER_VERSION = CURRENT_RUST_ENTITY_ADAPTER_VERSION
 
 # The only mixed-corpus transition that can produce an authoritative checkpoint.
 # Each component remains semantically homogeneous; routing is derived from the
@@ -13330,6 +13333,7 @@ def main(
     argv: Sequence[str] | argparse.Namespace | None = None,
 ) -> None:
     global _PUBLIC_AWARD_FEATURE_CONTRACT, _PUBLIC_CARD_COUNT_FEATURES_ENABLED
+    global _TRAINING_ENTITY_FEATURE_ADAPTER_VERSION
     checkout_runtime_binding = _assert_checkout_runtime_binding()
     initial_checkout_runtime_binding = checkout_runtime_binding
     parser = build_parser()
@@ -14602,6 +14606,11 @@ def main(
             env_config,
             allow_legacy_upgrade=bool(args.allow_legacy_action_mask_upgrade),
             checkpoint_path=args.init_checkpoint or "",
+        )
+        _TRAINING_ENTITY_FEATURE_ADAPTER_VERSION = (
+            policy_entity_feature_adapter_version(policy)
+            if args.arch == "entity_graph"
+            else CURRENT_RUST_ENTITY_ADAPTER_VERSION
         )
         if args.grow_from_checkpoint:
             grow_report = _warm_start_grow(
@@ -21355,7 +21364,11 @@ def _entity_batch(data: dict, batch: np.ndarray) -> dict[str, np.ndarray]:
         # private player-token slots.
         result[DEDUCTION_FEATURES_KEY] = (
             public_card_count_features_from_entity_tokens(
-                result["player_tokens"], result["global_tokens"]
+                result["player_tokens"],
+                result["global_tokens"],
+                entity_feature_adapter_version=(
+                    _TRAINING_ENTITY_FEATURE_ADAPTER_VERSION
+                ),
             )
         )
     if _MASK_HIDDEN_INFO_PLAYER_TOKENS:
@@ -29088,6 +29101,21 @@ def validate_teacher_data_schema(policy, data: dict, data_quality: dict, env_con
         )
     if len(nonempty_adapters) > 1:
         problems.append(f"mixed adapter_version values: {nonempty_adapters}")
+    if nonempty_adapters == [RUST_ENTITY_ADAPTER_V6] and "player_tokens" in data:
+        invalid_resource_rows, checked_resource_rows = (
+            v6_actor_resource_identity_violations(data["player_tokens"])
+        )
+        if checked_resource_rows != len(actions):
+            problems.append(
+                "adapter-v6 actor-resource admission could not inspect every row: "
+                f"checked={checked_resource_rows} expected={len(actions)}"
+            )
+        elif invalid_resource_rows:
+            problems.append(
+                "adapter-v6 actor-resource identity failed after physical-scale "
+                "decoding: actor total slot 6 must equal sum slots 16:21; "
+                f"invalid_rows={invalid_resource_rows}/{checked_resource_rows}"
+            )
     checkpoint_adapter_version = (
         policy_entity_feature_adapter_version(policy)
         if getattr(policy, "policy_type", "") == "entity_graph"
@@ -29095,7 +29123,12 @@ def validate_teacher_data_schema(policy, data: dict, data_quality: dict, env_con
     )
     if (
         checkpoint_adapter_version
-        in {CURRENT_RUST_ENTITY_ADAPTER_VERSION, RUST_ENTITY_ADAPTER_V4}
+        in {
+            CURRENT_RUST_ENTITY_ADAPTER_VERSION,
+            RUST_ENTITY_ADAPTER_V4,
+            RUST_ENTITY_ADAPTER_V5,
+            RUST_ENTITY_ADAPTER_V6,
+        }
         and not nonempty_adapters
         and len(actions) >= 1000
     ):
@@ -36149,23 +36182,23 @@ def _resolved_training_entity_adapter(args: argparse.Namespace) -> str:
         resolved = RUST_ENTITY_ADAPTER_V4
     else:
         resolved = CURRENT_RUST_ENTITY_ADAPTER_VERSION
-    if resolved == RUST_ENTITY_ADAPTER_V5:
+    if resolved in {RUST_ENTITY_ADAPTER_V5, RUST_ENTITY_ADAPTER_V6}:
         if not bool(getattr(args, "public_rule_state_features", False)):
             raise SystemExit(
-                "entity adapter v5 requires --public-rule-state-features"
+                "entity adapter v5/v6 requires --public-rule-state-features"
             )
         if not bool(getattr(args, "meaningful_public_history", False)):
             raise SystemExit(
-                "entity adapter v5 requires --meaningful-public-history"
+                "entity adapter v5/v6 requires --meaningful-public-history"
             )
         if int(getattr(args, "event_history_limit", 0)) != 64:
-            raise SystemExit("entity adapter v5 requires --event-history-limit 64")
+            raise SystemExit("entity adapter v5/v6 requires --event-history-limit 64")
     return resolved
 
 
 def _history_schema_for_entity_adapter(adapter_version: object) -> str:
     resolved = require_known_entity_feature_adapter(adapter_version)
-    if resolved == RUST_ENTITY_ADAPTER_V5:
+    if resolved in {RUST_ENTITY_ADAPTER_V5, RUST_ENTITY_ADAPTER_V6}:
         return MEANINGFUL_PUBLIC_HISTORY_SCHEMA_V2
     return MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION
 

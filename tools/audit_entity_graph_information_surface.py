@@ -384,9 +384,15 @@ def native_meaningful_public_history_capability(
         MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION,
         MEANINGFUL_PUBLIC_HISTORY_V2_LIMIT,
     )
-    from catan_zero.rl.entity_feature_adapter import RUST_ENTITY_ADAPTER_V5
+    from catan_zero.rl.entity_feature_adapter import (
+        RUST_ENTITY_ADAPTER_V5,
+        RUST_ENTITY_ADAPTER_V6,
+    )
 
-    history_v2 = str(adapter_version or "") == RUST_ENTITY_ADAPTER_V5
+    history_v2 = str(adapter_version or "") in {
+        RUST_ENTITY_ADAPTER_V5,
+        RUST_ENTITY_ADAPTER_V6,
+    }
 
     return {
         "schema": "native-meaningful-public-history-capability-v1",

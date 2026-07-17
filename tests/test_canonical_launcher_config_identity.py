@@ -18,6 +18,12 @@ import generate  # noqa: E402
 import train  # noqa: E402
 
 
+def test_canonical_generation_default_requires_adapter_v6() -> None:
+    assert generate.REQUIRED_SCIENCE_FIELDS[
+        "learner_entity_feature_adapter_version"
+    ] == "rust_entity_adapter_v6_exact_actor_resources_initial_road_two_hop"
+
+
 @pytest.mark.parametrize(
     ("validator", "relative_path"),
     (

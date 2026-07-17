@@ -38,6 +38,9 @@ RUST_ENTITY_ADAPTER_V4 = (
 RUST_ENTITY_ADAPTER_V5 = (
     "rust_entity_adapter_v5_meaningful_history_v2"
 )
+RUST_ENTITY_ADAPTER_V6 = (
+    "rust_entity_adapter_v6_exact_actor_resources_initial_road_two_hop"
+)
 LEGACY_MISSING_CHECKPOINT_ADAPTER_VERSION = RUST_ENTITY_ADAPTER_V2
 CURRENT_RUST_ENTITY_ADAPTER_VERSION = RUST_ENTITY_ADAPTER_V3
 IMPLEMENTED_RUST_ENTITY_ADAPTER_VERSIONS = frozenset(
@@ -46,6 +49,7 @@ IMPLEMENTED_RUST_ENTITY_ADAPTER_VERSIONS = frozenset(
         RUST_ENTITY_ADAPTER_V3,
         RUST_ENTITY_ADAPTER_V4,
         RUST_ENTITY_ADAPTER_V5,
+        RUST_ENTITY_ADAPTER_V6,
     }
 )
 
@@ -64,6 +68,8 @@ class EntityFeatureAdapterSpec:
     event_history: str
     structured_action_resources: str
     actor_public_rule_state: str
+    player_resource_counts: str
+    context_road_expansion: str
 
 
 # These strings are executable documentation: tests and checkpoint/runtime
@@ -83,6 +89,8 @@ ENTITY_FEATURE_ADAPTER_SPECS: Mapping[str, EntityFeatureAdapterSpec] = (
                 event_history="empty",
                 structured_action_resources="legacy_yop_and_singular_identity_omitted",
                 actor_public_rule_state="historical_zero_slots",
+                player_resource_counts="legacy_total_div20_composition_div10_clamped",
+                context_road_expansion="legacy_unoccupied_proposed_edge_endpoint_pips",
             ),
             RUST_ENTITY_ADAPTER_V3: EntityFeatureAdapterSpec(
                 version=RUST_ENTITY_ADAPTER_V3,
@@ -97,6 +105,8 @@ ENTITY_FEATURE_ADAPTER_SPECS: Mapping[str, EntityFeatureAdapterSpec] = (
                     "yop_bundle_and_discard_monopoly_singular_identity"
                 ),
                 actor_public_rule_state="historical_zero_slots",
+                player_resource_counts="legacy_total_div20_composition_div10_clamped",
+                context_road_expansion="legacy_unoccupied_proposed_edge_endpoint_pips",
             ),
             RUST_ENTITY_ADAPTER_V4: EntityFeatureAdapterSpec(
                 version=RUST_ENTITY_ADAPTER_V4,
@@ -114,6 +124,8 @@ ENTITY_FEATURE_ADAPTER_SPECS: Mapping[str, EntityFeatureAdapterSpec] = (
                     "dev_used_road_building_free_roads_discard_remainder_"
                     "playable_dev_counts"
                 ),
+                player_resource_counts="legacy_total_div20_composition_div10_clamped",
+                context_road_expansion="legacy_unoccupied_proposed_edge_endpoint_pips",
             ),
             RUST_ENTITY_ADAPTER_V5: EntityFeatureAdapterSpec(
                 version=RUST_ENTITY_ADAPTER_V5,
@@ -132,6 +144,34 @@ ENTITY_FEATURE_ADAPTER_SPECS: Mapping[str, EntityFeatureAdapterSpec] = (
                 actor_public_rule_state=(
                     "dev_used_road_building_free_roads_discard_remainder_"
                     "playable_dev_counts"
+                ),
+                player_resource_counts="legacy_total_div20_composition_div10_clamped",
+                context_road_expansion="legacy_unoccupied_proposed_edge_endpoint_pips",
+            ),
+            RUST_ENTITY_ADAPTER_V6: EntityFeatureAdapterSpec(
+                version=RUST_ENTITY_ADAPTER_V6,
+                player_has_longest_road="authoritative_public_state",
+                trade_action_type_one_hot="legacy_case_sensitive_miss",
+                trade_prompt_one_hot="legacy_prompt_name_miss",
+                trade_panel="offers_remaining_zero_current_offer_none",
+                context_trade_totals="legacy_maritime_list_cardinality",
+                topology="base_layout_static_lookup",
+                event_history=(
+                    "meaningful_public_history_v2_public_turn_keys_64_when_enabled"
+                ),
+                structured_action_resources=(
+                    "yop_bundle_and_discard_monopoly_singular_identity"
+                ),
+                actor_public_rule_state=(
+                    "dev_used_road_building_free_roads_discard_remainder_"
+                    "playable_dev_counts"
+                ),
+                player_resource_counts=(
+                    "exact_physical_deck_scale_total_div95_composition_div19"
+                ),
+                context_road_expansion=(
+                    "initial_road_max_pips_at_legal_settlement_after_one_more_road;"
+                    "non_initial_legacy_endpoint_pips"
                 ),
             ),
         }

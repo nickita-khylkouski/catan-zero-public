@@ -1,0 +1,125 @@
+{
+  "guards": [
+    {
+      "name": "cli_flag_lint",
+      "args": {
+        "critical_flags": [
+          "--track",
+          "--vps-to-win",
+          "--c-scale",
+          "--c-visit",
+          "--sigma-eval",
+          "--n-full",
+          "--n-fast",
+          "--p-full",
+          "--wide-roots-always-full",
+          "--base-seed",
+          "--games",
+          "--max-decisions",
+          "--max-depth",
+          "--temperature-clock",
+          "--temperature-decisions",
+          "--temperature-high",
+          "--temperature-low",
+          "--late-temperature-decisions",
+          "--late-temperature",
+          "--public-observation",
+          "--coherent-public-belief-search",
+          "--information-set-search",
+          "--determinization-particles",
+          "--determinization-min-simulations",
+          "--belief-chance-spectra",
+          "--correct-rust-chance-spectra",
+          "--lazy-interior-chance",
+          "--symmetry-averaged-eval",
+          "--symmetry-averaged-eval-threshold",
+          "--exact-budget-sh",
+          "--exact-budget-sh-min-n",
+          "--native-mcts-hot-loop",
+          "--forced-root-target-mode",
+          "--boundary-value-particles",
+          "--target-reliability-audit-fraction",
+          "--target-reliability-audit-seed",
+          "--preserve-search-evidence",
+          "--record-automatic-transitions",
+          "--meaningful-public-history",
+          "--teacher-entity-feature-adapter-version",
+          "--learner-entity-feature-adapter-version",
+          "--event-history-limit",
+          "--rust-featurize",
+          "--eval-cache-size",
+          "--workers",
+          "--eval-server",
+          "--format",
+          "--score-actions"
+        ],
+        "expected_values": {
+          "--track": "2p_no_trade",
+          "--vps-to-win": 10,
+          "--c-scale": 0.1,
+          "--c-visit": 50.0,
+          "--sigma-eval": 0.79,
+          "--n-full": 128,
+          "--n-fast": 16,
+          "--p-full": 0.25,
+          "--wide-roots-always-full": false,
+          "--max-decisions": 600,
+          "--max-depth": 80,
+          "--temperature-clock": "nonforced_choice",
+          "--temperature-decisions": 40,
+          "--temperature-high": 1.0,
+          "--temperature-low": 0.0,
+          "--late-temperature-decisions": 100,
+          "--late-temperature": 0.1,
+          "--public-observation": true,
+          "--coherent-public-belief-search": true,
+          "--information-set-search": false,
+          "--determinization-particles": 1,
+          "--determinization-min-simulations": 32,
+          "--belief-chance-spectra": false,
+          "--correct-rust-chance-spectra": true,
+          "--lazy-interior-chance": true,
+          "--symmetry-averaged-eval": true,
+          "--symmetry-averaged-eval-threshold": 20,
+          "--exact-budget-sh": false,
+          "--exact-budget-sh-min-n": 0,
+          "--native-mcts-hot-loop": true,
+          "--forced-root-target-mode": "trajectory_only",
+          "--boundary-value-particles": 1,
+          "--target-reliability-audit-fraction": 0.05,
+          "--target-reliability-audit-seed": 20260716,
+          "--preserve-search-evidence": true,
+          "--record-automatic-transitions": true,
+          "--meaningful-public-history": true,
+          "--teacher-entity-feature-adapter-version": "rust_entity_adapter_v2_land_topology_ports_maritime",
+          "--learner-entity-feature-adapter-version": "rust_entity_adapter_v6_exact_actor_resources_initial_road_two_hop",
+          "--event-history-limit": 64,
+          "--rust-featurize": true,
+          "--eval-cache-size": 0,
+          "--workers": 24,
+          "--eval-server": true,
+          "--format": "npz",
+          "--score-actions": true
+        }
+      }
+    },
+    {
+      "name": "seed_ledger",
+      "args": {
+        "purpose": "generate"
+      }
+    },
+    {
+      "name": "ledger_overlap",
+      "args": {
+        "purpose": "generate"
+      }
+    },
+    {
+      "name": "fd_limit",
+      "args": {
+        "minimum": 65536
+      }
+    }
+  ]
+}

@@ -36,6 +36,15 @@ def test_current_production_learner_binds_full_value_and_exact_dose() -> None:
         == current_science.PRODUCTION_LEARNER_MODEL_CONSTRUCTION_CONTRACT
     )
     model = current_science.learner_model_construction()
+    assert current_science.CURRENT_LEARNER_ENTITY_ADAPTER == (
+        "rust_entity_adapter_v6_exact_actor_resources_initial_road_two_hop"
+    )
+    assert current_science.learner_initialization()[
+        "entity_feature_adapter_version"
+    ] == current_science.CURRENT_LEARNER_ENTITY_ADAPTER
+    assert model["entity_feature_adapter_version"] == (
+        current_science.CURRENT_LEARNER_ENTITY_ADAPTER
+    )
     assert model["graph_tokens"] is None
     assert model["hidden_size"] == 640
     assert model["min_parameter_count"] == 42_500_000
@@ -118,7 +127,7 @@ def test_current_production_learner_binds_full_value_and_exact_dose() -> None:
         ("optimizer_state", "resume"),
     ),
 )
-def test_current_contract_rejects_non_scratch_v5_initialization(
+def test_current_contract_rejects_non_scratch_v6_initialization(
     tmp_path, monkeypatch, field: str, bad_value
 ) -> None:
     contract = copy.deepcopy(current_science.load())
@@ -129,7 +138,7 @@ def test_current_contract_rejects_non_scratch_v5_initialization(
 
     with pytest.raises(
         current_science.ScienceContractError,
-        match="native from-scratch v5",
+        match="native from-scratch v6",
     ):
         current_science.load()
 
@@ -242,10 +251,8 @@ def test_current_target_quality_generation_is_bound_to_config_and_guard() -> Non
     assert lint["expected_values"][
         "--teacher-entity-feature-adapter-version"
     ] == current_science.CURRENT_TEACHER_ENTITY_ADAPTER
-    assert (
-        current_science.CURRENT_TEACHER_ENTITY_ADAPTER
-        == current_science.CURRENT_LEARNER_ENTITY_ADAPTER
-    )
+    assert "forced_value_v4.json" in current_science.GENERATOR_GUARD_PATH.name
+    assert "coherent-public-v4" in str(current_science.CONTRACT_PATH)
     assert "--workers" in lint["critical_flags"]
     assert "--eval-server" in lint["critical_flags"]
     assert lint["expected_values"]["--workers"] == 24

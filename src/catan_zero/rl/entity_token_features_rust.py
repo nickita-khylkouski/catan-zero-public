@@ -47,6 +47,7 @@ from catan_zero.deduction_tracker import (
 from catan_zero.rl.entity_feature_adapter import (
     CURRENT_RUST_ENTITY_ADAPTER_VERSION,
     RUST_ENTITY_ADAPTER_V5,
+    RUST_ENTITY_ADAPTER_V6,
     require_known_entity_feature_adapter,
 )
 from catan_zero.rl.meaningful_history import (
@@ -313,9 +314,11 @@ def build_entity_features_rust(
             )
         if (
             meaningful_public_history_schema == MEANINGFUL_PUBLIC_HISTORY_SCHEMA_V2
-        ) != (adapter_version == RUST_ENTITY_ADAPTER_V5):
+        ) != (
+            adapter_version in {RUST_ENTITY_ADAPTER_V5, RUST_ENTITY_ADAPTER_V6}
+        ):
             raise ValueError(
-                "meaningful public-history v2 and entity adapter v5 must be "
+                "meaningful public-history v2 and entity adapter v5/v6 must be "
                 "enabled together"
             )
     raw = catanatron_rs.build_entity_features_flat(
@@ -341,7 +344,9 @@ def build_entity_features_rust(
     # clipped counts and add serialization to every MCTS leaf.
     result[DEDUCTION_FEATURES_KEY] = (
         public_card_count_features_from_entity_tokens(
-            result["player_tokens"], result["global_tokens"]
+            result["player_tokens"],
+            result["global_tokens"],
+            entity_feature_adapter_version=adapter_version,
         )
     )
     result["hex_vertex_ids"] = topology.hex_vertex_ids.copy()
@@ -422,9 +427,11 @@ def build_entity_features_batch_rust(
             )
         if (
             meaningful_public_history_schema == MEANINGFUL_PUBLIC_HISTORY_SCHEMA_V2
-        ) != (adapter_version == RUST_ENTITY_ADAPTER_V5):
+        ) != (
+            adapter_version in {RUST_ENTITY_ADAPTER_V5, RUST_ENTITY_ADAPTER_V6}
+        ):
             raise ValueError(
-                "meaningful public-history v2 and entity adapter v5 must be "
+                "meaningful public-history v2 and entity adapter v5/v6 must be "
                 "enabled together"
             )
     raw = catanatron_rs.build_entity_features_batch(
@@ -444,7 +451,9 @@ def build_entity_features_batch_rust(
     result = _reshape_raw(raw, mask_has_shape=True)
     result[DEDUCTION_FEATURES_KEY] = (
         public_card_count_features_from_entity_tokens(
-            result["player_tokens"], result["global_tokens"]
+            result["player_tokens"],
+            result["global_tokens"],
+            entity_feature_adapter_version=adapter_version,
         )
     )
     batch_size = len(rust_games)

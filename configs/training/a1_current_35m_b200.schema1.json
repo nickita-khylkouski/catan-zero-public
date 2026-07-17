@@ -4,7 +4,7 @@
     "checkpoint_steps": "8,16,32,64,128,256,512,1024",
     "data_loader_prefetch": 4,
     "data_loader_workers": 4,
-    "entity_feature_adapter_version": "rust_entity_adapter_v5_meaningful_history_v2",
+    "entity_feature_adapter_version": "rust_entity_adapter_v6_exact_actor_resources_initial_road_two_hop",
     "initialization_mode": "scratch_fresh_optimizer",
     "max_35m_params": 43000000,
     "min_35m_params": 42500000,

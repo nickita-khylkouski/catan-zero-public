@@ -15,7 +15,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 BUILDER = REPO_ROOT / "tools" / "build_catanatron_rs_wheel.sh"
 CHECKSUM_INVENTORY = "native/catanatron-rs/WHEEL_SHA256SUMS"
-RECEIPT_NAME = "catanatron_rs-0.1.12-build-receipt.json"
+RECEIPT_NAME = "catanatron_rs-0.1.13-build-receipt.json"
 RECEIPT_SCHEMA = "catanatron-rs-wheel-build-receipt-v2"
 
 
@@ -89,8 +89,8 @@ def test_all_cargo_resolution_is_locked() -> None:
     assert "native/gumbel_mcts_rs/Cargo.lock" in _script()
 
 
-def test_native_mcts_wheel_has_one_unique_0112_package_identity() -> None:
-    expected = "0.1.12"
+def test_native_mcts_wheel_has_one_unique_0113_package_identity() -> None:
+    expected = "0.1.13"
     manifests = (
         REPO_ROOT / "native/catanatron-rs/Cargo.toml",
         REPO_ROOT / "native/catanatron-rs/python/Cargo.toml",
@@ -101,9 +101,22 @@ def test_native_mcts_wheel_has_one_unique_0112_package_identity() -> None:
         assert match is not None
         assert match.group(1) == expected
 
+    for lock_path in (
+        REPO_ROOT / "native/catanatron-rs/Cargo.lock",
+        REPO_ROOT / "native/catanatron-rs/python/Cargo.lock",
+        REPO_ROOT / "native/gumbel_mcts_rs/Cargo.lock",
+    ):
+        lock_text = lock_path.read_text()
+        package = re.search(
+            r'\[\[package\]\]\s+name = "catanatron-rs"\s+version = "([^"]+)"',
+            lock_text,
+        )
+        assert package is not None, lock_path
+        assert package.group(1) == expected, lock_path
+
     script = _script()
-    assert "catanatron_rs-0.1.12-cp311-cp311-manylinux_2_34_x86_64.whl" in script
-    assert "catanatron_rs-0.1.12-build-receipt.json" in script
+    assert "catanatron_rs-0.1.13-cp311-cp311-manylinux_2_34_x86_64.whl" in script
+    assert "catanatron_rs-0.1.13-build-receipt.json" in script
     assert "catanatron_rs-0.1.4-cp311" not in script
 
     gumbel_manifest = REPO_ROOT / "native/gumbel_mcts_rs/Cargo.toml"
@@ -147,7 +160,7 @@ def test_source_identity_is_bound_only_after_compilation() -> None:
     assert 'CATAN_RS_SOURCE_COMMIT="$SOURCE_COMMIT"' not in staged_environment
     assert 'CATAN_RS_SOURCE_TREE="$SOURCE_TREE"' not in staged_environment
     assert (
-        'SEALED_COMPILE_IDENTITY="catanatron-rs-0.1.12-'
+        'SEALED_COMPILE_IDENTITY="catanatron-rs-0.1.13-'
         'dense-native-search-wheel-v1"' in script
     )
     assert 'payload["source_commit"] = sys.argv[2]' in script
@@ -194,7 +207,7 @@ def test_builder_smokes_the_compiled_capability_contract_before_hashing() -> Non
     digest = script.index('WHEEL_SHA256="$(sha256sum "$WHEEL_PATH"')
 
     assert smoke < digest
-    assert 'version("catanatron-rs") == "0.1.12"' in script
+    assert 'version("catanatron-rs") == "0.1.13"' in script
     assert "public_card_deductions_json" in script
     assert "public_card_deductions_2p_v1" in script
     assert "gumbel_search_capabilities" in script
@@ -203,6 +216,8 @@ def test_builder_smokes_the_compiled_capability_contract_before_hashing() -> Non
     assert "initial_road_d1_scope" in script
     assert "public_award_feature_parity" in script
     assert "entity_feature_adapter_version" in script
+    assert "supported_action_context_adapter_versions" in script
+    assert "rust_entity_adapter_v6_exact_actor_resources_initial_road_two_hop" in script
     assert "policy_temperature_semantics" in script
     assert "coherent_public_belief_search" in script
     assert "boundary_value_particles" in script
@@ -215,6 +230,12 @@ def test_builder_runs_semantic_tests_for_advertised_corrected_capabilities() -> 
 
     public_award = script.index(
         "entity_player_tokens_preserve_public_awards_when_hidden_hands_are_masked"
+    )
+    exact_resources = script.index(
+        "entity_v6_preserves_exact_actor_resource_composition_and_total"
+    )
+    opening_road = script.index(
+        "action_context_v6_initial_road_uses_legal_two_hop_settlement_sites"
     )
     public_belief = script.index("public_belief_determinization_tests")
     public_cards = script.index("public_card_deductions")
@@ -236,6 +257,8 @@ def test_builder_runs_semantic_tests_for_advertised_corrected_capabilities() -> 
     )
 
     assert public_award < build
+    assert exact_resources < build
+    assert opening_road < build
     assert public_belief < build
     assert public_cards < build
     assert meaningful_history < build

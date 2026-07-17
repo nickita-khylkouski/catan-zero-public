@@ -145,23 +145,29 @@ def _mock_exact_runtime(
     monkeypatch.setattr(cli, "_git_identity", lambda _root: clean_repository)
 
 
-def test_status_exposes_only_commissioned_production_state() -> None:
+def test_status_exposes_v5_parent_commissioning_as_invalidated() -> None:
     status = production_status(ROOT)
 
     assert status["supported_operator_interface"] == "catan-zero"
     assert status["pipelines"]["generate"]["authorized"] is True
     assert status["pipelines"]["evaluate"]["authorized"] is True
     train = status["pipelines"]["train"]
-    assert train["authorized"] is True
+    assert train["authorized"] is False
     assert train["reason"] == "recipe_specific_authorization"
     assert train["recipes"]["a1-current-35m-b200"]["authorized"] is False
     parent = train["recipes"]["a1-parent-update-35m-b200"]
-    assert parent["authorized"] is True
-    assert parent["status"] == "ready"
+    assert parent["authorized"] is False
+    assert parent["status"] == "blocked"
     assert parent["reason"] == (
-        "commissioned_b12_parent_update_with_runtime_topology_signal_gate"
+        "commissioned_b12_invalidated_by_adapter_v5_information_aliasing"
     )
-    assert parent["unresolved_requirements"] == []
+    assert parent["unresolved_requirements"] == [
+        "materialize and authenticate a fresh "
+        "rust_entity_adapter_v6_exact_actor_resources_initial_road_two_hop "
+        "training composite",
+        "recommission B12 topology, opening-policy, and value no-regression "
+        "gates on adapter v6",
+    ]
     assert status["pipelines"]["ppo"]["authorized"] is False
 
 
@@ -224,20 +230,20 @@ def test_other_pipelines_resolve_through_compact_launchers(
         assert "--lock" in plan["command"]
 
 
-def test_cataloged_parent_update_uses_exact_recipe_and_parent_and_is_ready(
+def test_cataloged_parent_update_uses_exact_recipe_and_parent_but_is_quarantined(
     tmp_path: Path,
 ) -> None:
     plan = cli.build_plan(
         _write_job(tmp_path, "train", recipe="a1-parent-update-35m-b200")
     )
 
-    assert plan["readiness"]["authorized"] is True
+    assert plan["readiness"]["authorized"] is False
     assert plan["readiness"]["reason"] == (
-        "commissioned_b12_parent_update_with_runtime_topology_signal_gate"
+        "commissioned_b12_invalidated_by_adapter_v5_information_aliasing"
     )
     assert plan["contract"]["recipe"] == "a1-parent-update-35m-b200"
     assert plan["contract"]["config_sha256"] == (
-        "08923652c214c876d3ed6409da6caac67371ed0109f78d093b026eb54d3d1e7a"
+        "2dfcc1b95a37d7e292bc5f1bc182950523a791274461e4518bc71e28d45fbe75"
     )
     assert str((ROOT / "tools/train.py").resolve()) in plan["command"]
     assert "--init-checkpoint" in plan["command"]
@@ -264,6 +270,32 @@ def test_training_science_admission_cannot_authorize_recipe_digest_drift(
         match="does not bind the exact recipe",
     ):
         contracts.pipeline_readiness(ROOT, "train", "a1-parent-update-35m-b200")
+
+
+def test_training_science_admission_quarantines_v5_and_requires_fresh_v6() -> None:
+    payload = json.loads(
+        (ROOT / contracts.TRAINING_SCIENCE_ADMISSION).read_text(encoding="utf-8")
+    )
+    expected_adapter = (
+        "rust_entity_adapter_v6_exact_actor_resources_initial_road_two_hop"
+    )
+
+    for admission in payload["recipes"].values():
+        assert admission["authorized"] is False
+        assert any(
+            expected_adapter in requirement
+            for requirement in admission["unresolved_requirements"]
+        )
+        observations = admission["observations"]
+        assert observations["required_fresh_learner_adapter"] == expected_adapter
+        assert observations["adapter_v5_resource_quarantine"] == {
+            "status": "quarantined_actor_resource_clipping_contradiction",
+            "contradictory_rows": 4061,
+            "contradictory_games": 1271,
+            "full_search_rows": 1868,
+            "saturation_risk_rows": 7440,
+            "training_admission": False,
+        }
 
 
 def test_parent_update_requires_receipt_only_for_changed_initializer(

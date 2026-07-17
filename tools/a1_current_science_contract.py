@@ -20,9 +20,9 @@ from typing import Any, Mapping
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CONTRACT_PATH = (
     REPO_ROOT
-    / "configs/operations/a1-next-wave-coherent-public-v3/science.contract.json"
+    / "configs/operations/a1-next-wave-coherent-public-v4/science.contract.json"
 )
-TEMPLATE_PATH = REPO_ROOT / "configs/experiments/a1_pre_wave_contract.template.json"
+TEMPLATE_PATH = REPO_ROOT / "configs/experiments/a1_pre_wave_contract_v4.template.json"
 GENERATOR_CONFIG_PATH = (
     REPO_ROOT
     / "configs/generation/coherent_public_n128.schema20.json"
@@ -30,7 +30,7 @@ GENERATOR_CONFIG_PATH = (
 PRODUCTION_RECIPE_CATALOG_PATH = REPO_ROOT / "configs/production_recipes.json"
 GENERATOR_GUARD_PATH = (
     REPO_ROOT
-    / "configs/guards/a1_generation_coherent_public_n128_adaptive256_forced_value_v3.json"
+    / "configs/guards/a1_generation_coherent_public_n128_adaptive256_forced_value_v4.json"
 )
 CANONICAL_PARENT_UPDATE_CONFIG_PATH = (
     REPO_ROOT / "configs/training/a1_parent_update_35m_b200.schema1.json"
@@ -44,9 +44,9 @@ ADAPTIVE_FIELDS = (
     "wide_roots_always_full",
 )
 POLICY_TARGET_BLEND_FALLBACK_V2 = "policy_target_fallback_v2"
-CURRENT_TEACHER_ENTITY_ADAPTER = "rust_entity_adapter_v5_meaningful_history_v2"
+CURRENT_TEACHER_ENTITY_ADAPTER = "rust_entity_adapter_v2_land_topology_ports_maritime"
 CURRENT_LEARNER_ENTITY_ADAPTER = (
-    "rust_entity_adapter_v5_meaningful_history_v2"
+    "rust_entity_adapter_v6_exact_actor_resources_initial_road_two_hop"
 )
 CURRENT_ARCHITECTURE_UPGRADE_FLAGS = (
     "structured_action_value,card_count_v2,meaningful_history,"
@@ -117,7 +117,7 @@ PRODUCTION_LEARNER_SIGNAL_CONTRACT = {
     "post_policy_dose_value_trunk_grad_scale": 0.0,
     # Reporting is part of production admission even though it does not alter
     # the optimizer trajectory. The full scratch dose must prove every
-    # commissioned v5 path received gradient and an actual update.
+    # commissioned v6 path received gradient and an actual update.
     "train_diagnostics_every_batches": 16,
     "objective_gradient_interference_every_batches": 16,
     "require_feature_learning_signal_modules": (
@@ -170,7 +170,7 @@ PRODUCTION_LEARNER_SIGNAL_CONTRACT = {
 PRODUCTION_LEARNER_INITIALIZATION_CONTRACT = {
     "mode": "from_scratch",
     "entity_feature_adapter_version": (
-        "rust_entity_adapter_v5_meaningful_history_v2"
+        "rust_entity_adapter_v6_exact_actor_resources_initial_road_two_hop"
     ),
     "checkpoint": None,
     "optimizer_state": "fresh",
@@ -210,7 +210,7 @@ PRODUCTION_LEARNER_MODEL_CONSTRUCTION_CONTRACT = {
     "event_history_limit": 64,
     "mask_hidden_info": True,
     "entity_feature_adapter_version": (
-        "rust_entity_adapter_v5_meaningful_history_v2"
+        "rust_entity_adapter_v6_exact_actor_resources_initial_road_two_hop"
     ),
     "require_35m_model": True,
     "min_parameter_count": 42_500_000,
@@ -248,7 +248,7 @@ PRODUCTION_LEARNER_SELECTION_CONTRACT = {
     "recipe": "a1-parent-update-35m-b200",
     "config_path": "configs/training/a1_parent_update_35m_b200.schema1.json",
     "config_canonical_sha256": (
-        "08923652c214c876d3ed6409da6caac67371ed0109f78d093b026eb54d3d1e7a"
+        "2dfcc1b95a37d7e292bc5f1bc182950523a791274461e4518bc71e28d45fbe75"
     ),
     "scratch_status": "research_only_unresolved_not_selected",
 }
@@ -443,7 +443,7 @@ def _load() -> dict[str, Any]:
     if learner_value.get("initialization") != PRODUCTION_LEARNER_INITIALIZATION_CONTRACT:
         raise ScienceContractError(
             "current coherent learner initialization must be native from-scratch "
-            "v5 with fresh optimizer state"
+            "v6 with fresh optimizer state"
         )
     if (
         learner_value.get("model_construction")

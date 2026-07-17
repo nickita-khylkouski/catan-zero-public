@@ -14,6 +14,7 @@ from catan_zero.rl.entity_feature_adapter import (
     RUST_ENTITY_ADAPTER_V3,
     RUST_ENTITY_ADAPTER_V4,
     RUST_ENTITY_ADAPTER_V5,
+    RUST_ENTITY_ADAPTER_V6,
     require_known_entity_feature_adapter,
 )
 from catan_zero.rl.meaningful_history import (
@@ -148,9 +149,51 @@ def mask_player_tokens_public(player_tokens: np.ndarray) -> np.ndarray:
     return arr[0] if single else arr
 
 
+def v6_actor_resource_identity_violations(
+    player_tokens: object,
+    *,
+    chunk_size: int = 65_536,
+) -> tuple[int, int]:
+    """Return ``(invalid_rows, checked_rows)`` for adapter-v6 card identity.
+
+    V6 stores an actor's public total on the physical 95-card scale and its
+    visible five-resource composition on the physical 19-card scale. Decoding
+    those integer counts must preserve ``total == sum(composition)``. Exactly
+    one actor and finite identity inputs are required per row. Chunking keeps
+    admission bounded for memmap corpora.
+
+    Invalid tensor shapes return ``(0, 0)`` so callers can report their own
+    schema-specific shape error before relying on the checked-row count.
+    """
+
+    shape = tuple(getattr(player_tokens, "shape", ()))
+    if len(shape) != 3 or shape[1] < 1 or shape[2] < PLAYER_FEATURE_SIZE:
+        return 0, 0
+    invalid_rows = 0
+    checked_rows = 0
+    for start in range(0, int(shape[0]), int(chunk_size)):
+        rows = np.asarray(
+            player_tokens[start : start + int(chunk_size)], dtype=np.float32
+        )
+        actor_mask = rows[..., PLAYER_ACTOR_FLAG_SLOT] > 0.5
+        one_actor = actor_mask.sum(axis=1) == 1
+        actor_indices = actor_mask.argmax(axis=1)
+        batch_indices = np.arange(rows.shape[0], dtype=np.int64)
+        actor_rows = rows[batch_indices, actor_indices]
+        totals = np.rint(actor_rows[:, 6] * 95.0)
+        composition = np.rint(actor_rows[:, 16:21] * 19.0).sum(axis=1)
+        finite = np.isfinite(rows).all(axis=(1, 2))
+        valid = one_actor & finite & (totals == composition)
+        invalid_rows += int(np.count_nonzero(~valid))
+        checked_rows += int(rows.shape[0])
+    return invalid_rows, checked_rows
+
+
 def public_card_count_features_from_entity_tokens(
     player_tokens: np.ndarray,
     global_tokens: np.ndarray,
+    *,
+    entity_feature_adapter_version: str = CURRENT_RUST_ENTITY_ADAPTER_VERSION,
 ) -> np.ndarray:
     """Deterministically backfill card-count features from public entity rows.
 
@@ -168,6 +211,15 @@ def public_card_count_features_from_entity_tokens(
     the matching ``(P,11)`` or ``(B,P,11)`` float32 tensor.
     """
 
+    adapter_version = require_known_entity_feature_adapter(
+        entity_feature_adapter_version
+    )
+    resource_composition_scale = (
+        19.0 if adapter_version == RUST_ENTITY_ADAPTER_V6 else 10.0
+    )
+    resource_total_scale = (
+        95.0 if adapter_version == RUST_ENTITY_ADAPTER_V6 else 20.0
+    )
     players = np.asarray(player_tokens)
     globals_ = np.asarray(global_tokens)
     single = players.ndim == 2
@@ -205,10 +257,12 @@ def public_card_count_features_from_entity_tokens(
     # Only the actor row's private composition is read. Multiplication by the
     # actor one-hot happens before reduction, so opponent hidden columns can be
     # arbitrary (or masked zeros) without influencing the result.
-    own_resources = np.rint(p[batch_index, actor_index, 16:21] * 10.0)
+    own_resources = np.rint(
+        p[batch_index, actor_index, 16:21] * resource_composition_scale
+    )
     bank_resources = np.rint(g[:, 0, 26:31] * 19.0)
     unseen_resources = np.clip(19.0 - bank_resources - own_resources, 0.0, 19.0)
-    resource_total = np.rint(p[..., 6] * 20.0)
+    resource_total = np.rint(p[..., 6] * resource_total_scale)
 
     two_player = present.sum(axis=1) == 2
     exact = (
@@ -336,13 +390,21 @@ def build_entity_token_features(
     )
     if effective_history_limit < 0:
         raise ValueError("history_limit must be >= 0")
-    player_tokens = _player_tokens(payload, actor_name)
+    player_tokens = _player_tokens(
+        payload,
+        actor_name,
+        entity_feature_adapter_version=adapter_version,
+    )
     global_tokens = _global_tokens(
         env,
         payload,
         actor_name,
         encode_actor_public_rule_state=adapter_version
-        in {RUST_ENTITY_ADAPTER_V4, RUST_ENTITY_ADAPTER_V5},
+        in {
+            RUST_ENTITY_ADAPTER_V4,
+            RUST_ENTITY_ADAPTER_V5,
+            RUST_ENTITY_ADAPTER_V6,
+        },
     )
     return {
         "schema": np.asarray(ENTITY_TOKEN_SCHEMA_VERSION),
@@ -358,7 +420,9 @@ def build_entity_token_features(
         # JSON contract remains available for auditing/future authenticated
         # schemas, but never silently changes this checkpoint's input measure.
         DEDUCTION_FEATURES_KEY: public_card_count_features_from_entity_tokens(
-            player_tokens, global_tokens
+            player_tokens,
+            global_tokens,
+            entity_feature_adapter_version=adapter_version,
         ),
         "global_tokens": global_tokens,
         "legal_action_tokens": _legal_action_tokens(
@@ -371,6 +435,7 @@ def build_entity_token_features(
                     RUST_ENTITY_ADAPTER_V3,
                     RUST_ENTITY_ADAPTER_V4,
                     RUST_ENTITY_ADAPTER_V5,
+                    RUST_ENTITY_ADAPTER_V6,
                 }
             ),
         ),
@@ -630,7 +695,19 @@ def _edge_tokens(
     return tokens
 
 
-def _player_tokens(payload: dict[str, Any], actor_name: str) -> np.ndarray:
+def _player_tokens(
+    payload: dict[str, Any],
+    actor_name: str,
+    *,
+    entity_feature_adapter_version: str = CURRENT_RUST_ENTITY_ADAPTER_VERSION,
+) -> np.ndarray:
+    adapter_version = require_known_entity_feature_adapter(
+        entity_feature_adapter_version
+    )
+    resource_composition_scale = (
+        19 if adapter_version == RUST_ENTITY_ADAPTER_V6 else 10
+    )
+    resource_total_scale = 95 if adapter_version == RUST_ENTITY_ADAPTER_V6 else 20
     tokens = np.zeros((4, PLAYER_FEATURE_SIZE), dtype=np.float16)
     players = payload.get("players") if isinstance(payload.get("players"), dict) else {}
     current = str(payload.get("current_player", ""))
@@ -648,7 +725,9 @@ def _player_tokens(payload: dict[str, Any], actor_name: str) -> np.ndarray:
         tokens[idx, 5] = (
             _scale(player.get("actual_victory_points"), 10) if has_actual else 0.0
         )
-        tokens[idx, 6] = _scale(player.get("resource_card_count"), 20)
+        tokens[idx, 6] = _scale(
+            player.get("resource_card_count"), resource_total_scale
+        )
         tokens[idx, 7] = _scale(player.get("development_card_count"), 10)
         tokens[idx, 8] = _scale(player.get("roads_left"), 15)
         tokens[idx, 9] = _scale(player.get("settlements_left"), 5)
@@ -664,7 +743,9 @@ def _player_tokens(payload: dict[str, Any], actor_name: str) -> np.ndarray:
         )
         tokens[idx, 15] = 1.0 if resources is not None else 0.0
         for offset, resource in enumerate(RESOURCES):
-            tokens[idx, 16 + offset] = _scale(_resource_count(resources, resource), 10)
+            tokens[idx, 16 + offset] = _scale(
+                _resource_count(resources, resource), resource_composition_scale
+            )
         dev_cards = (
             player.get("development_cards")
             if isinstance(player.get("development_cards"), dict)

@@ -6,11 +6,11 @@ PYTHON_BIN="${PYTHON_BIN:-python3.11}"
 OUT_DIR="${OUT_DIR:-$SOURCE_ROOT/dist}"
 SEALED_CANONICAL_BUILD_ROOT="/tmp/catan-zero-catanatron-rs-wheel-src"
 CANONICAL_BUILD_ROOT="${CATAN_RS_CANONICAL_BUILD_ROOT:-$SEALED_CANONICAL_BUILD_ROOT}"
-WHEEL_NAME="catanatron_rs-0.1.12-cp311-cp311-manylinux_2_34_x86_64.whl"
-RECEIPT_NAME="catanatron_rs-0.1.12-build-receipt.json"
+WHEEL_NAME="catanatron_rs-0.1.13-cp311-cp311-manylinux_2_34_x86_64.whl"
+RECEIPT_NAME="catanatron_rs-0.1.13-build-receipt.json"
 SEALED_SOURCE_DATE_EPOCH="1784160000"
 SEALED_RUSTFLAGS="--remap-path-prefix=/tmp/catan-zero-catanatron-rs-wheel-src=/src/catan-zero-public -C link-arg=-Wl,--build-id=none"
-SEALED_COMPILE_IDENTITY="catanatron-rs-0.1.12-dense-native-search-wheel-v1"
+SEALED_COMPILE_IDENTITY="catanatron-rs-0.1.13-dense-native-search-wheel-v1"
 
 die() {
   echo "build_catanatron_rs_wheel: $*" >&2
@@ -157,7 +157,7 @@ echo "$PYTHON_VERSION"
 echo "$STRIP_VERSION"
 
 mkdir -p "$OUT_DIR"
-rm -f "$OUT_DIR"/catanatron_rs-0.1.12-*.whl
+rm -f "$OUT_DIR"/catanatron_rs-0.1.13-*.whl
 rm -f "$OUT_DIR/$RECEIPT_NAME"
 
 # PyO3's Python-enabled Rust tests link libpython, unlike the final extension
@@ -207,6 +207,22 @@ cargo test \
   --manifest-path "$ROOT/native/catanatron-rs/Cargo.toml" \
   --features python \
   entity_player_tokens_preserve_public_awards_when_hidden_hands_are_masked \
+  --lib
+LD_LIBRARY_PATH="$PYTHON_TEST_LIBDIR" \
+RUSTFLAGS="$RUSTFLAGS -L native=$PYTHON_TEST_LIBDIR" \
+cargo test \
+  --locked \
+  --manifest-path "$ROOT/native/catanatron-rs/Cargo.toml" \
+  --features python \
+  entity_v6_preserves_exact_actor_resource_composition_and_total \
+  --lib
+LD_LIBRARY_PATH="$PYTHON_TEST_LIBDIR" \
+RUSTFLAGS="$RUSTFLAGS -L native=$PYTHON_TEST_LIBDIR" \
+cargo test \
+  --locked \
+  --manifest-path "$ROOT/native/catanatron-rs/Cargo.toml" \
+  --features python \
+  action_context_v6_initial_road_uses_legal_two_hop_settlement_sites \
   --lib
 LD_LIBRARY_PATH="$PYTHON_TEST_LIBDIR" \
 RUSTFLAGS="$RUSTFLAGS -L native=$PYTHON_TEST_LIBDIR" \
@@ -327,7 +343,7 @@ from importlib.metadata import version
 
 import catanatron_rs
 
-assert version("catanatron-rs") == "0.1.12"
+assert version("catanatron-rs") == "0.1.13"
 game = catanatron_rs.Game.simple(["RED", "BLUE"], seed=7)
 observer = game.current_color()
 public_cards = json.loads(game.public_card_deductions_json(observer))
@@ -349,6 +365,14 @@ required = {
     "forced_root_trajectory_only",
 }
 assert required <= capabilities, (required, capabilities)
+context_adapter_fn = getattr(
+    catanatron_rs, "supported_action_context_adapter_versions", None
+)
+assert callable(context_adapter_fn), "wheel lacks versioned action-context support"
+assert (
+    "rust_entity_adapter_v6_exact_actor_resources_initial_road_two_hop"
+    in set(context_adapter_fn())
+), "wheel lacks complete adapter-v6 native context support"
 PY
 
 WHEEL_SHA256="$(sha256sum "$WHEEL_PATH" | awk '{print $1}')"

@@ -28,6 +28,29 @@ def _is_candidate_architecture(architecture: str) -> bool:
     return architecture in {"candidate", "graph_history_candidate"}
 
 
+def _policy_action_context_feature_table(
+    policy: Any,
+    env: ColonistMultiAgentEnv,
+    info: dict[str, Any],
+) -> np.ndarray:
+    """Build context with an entity policy's checkpoint-bound adapter.
+
+    Non-entity policies have no adapter binding and retain the historical
+    default call exactly.  Entity policies must store the same context that
+    produced their behavior log-probability so PPO can recompute a ratio of
+    one before any learner update.
+    """
+
+    adapter_version = getattr(policy, "entity_feature_adapter_version", None)
+    if adapter_version is None:
+        return build_action_context_feature_table(env, info)
+    return build_action_context_feature_table(
+        env,
+        info,
+        entity_feature_adapter_version=str(adapter_version),
+    )
+
+
 def _resolve_device(device: str | None):
     import torch
 
@@ -861,7 +884,11 @@ def collect_ppo_episode(
                 break
             observation = np.asarray(observations[player], dtype=np.float64)
             valid_actions = tuple(int(action) for action in info["valid_actions"])
-            action_context_features = build_action_context_feature_table(env, info)
+            action_context_features = _policy_action_context_feature_table(
+                policy,
+                env,
+                info,
+            )
             if player in training_seats:
                 actor_color = env.current_player_color()
                 before_score = _finite_catanatron_score(
@@ -1055,7 +1082,11 @@ def _bootstrap_values(
                 valid_actions=valid_actions,
                 action=valid_actions[0],
                 player=current_player,
-                action_context_features=build_action_context_feature_table(env, info),
+                action_context_features=_policy_action_context_feature_table(
+                    policy,
+                    env,
+                    info,
+                ),
                 entity_features=entity_features,
                 phase=_phase_from_info(info),
             )
@@ -1084,7 +1115,7 @@ def _bootstrap_values(
             action=valid_actions[0],
             player=current_player,
             action_context_features=(
-                build_action_context_feature_table(env, info)
+                _policy_action_context_feature_table(policy, env, info)
                 if env is not None and info is not None
                 else None
             ),
@@ -1124,7 +1155,11 @@ def collect_dagger_episode(
             player = info["current_player"]
             observation = np.asarray(observations[player], dtype=np.float64)
             valid_actions = tuple(int(action) for action in info["valid_actions"])
-            action_context_features = build_action_context_feature_table(env, info)
+            action_context_features = _policy_action_context_feature_table(
+                policy,
+                env,
+                info,
+            )
             if player in training_seats:
                 teacher_action = teacher.select_action(
                     env,

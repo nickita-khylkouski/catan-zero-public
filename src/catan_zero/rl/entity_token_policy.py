@@ -27,6 +27,7 @@ from catan_zero.rl.entity_feature_adapter import (
     CURRENT_RUST_ENTITY_ADAPTER_VERSION,
     RUST_ENTITY_ADAPTER_V4,
     RUST_ENTITY_ADAPTER_V5,
+    RUST_ENTITY_ADAPTER_V6,
     checkpoint_entity_feature_adapter_metadata,
     require_known_entity_feature_adapter,
     resolve_checkpoint_entity_feature_adapter,
@@ -2332,11 +2333,12 @@ class EntityGraphPolicy:
                 == MEANINGFUL_PUBLIC_HISTORY_SCHEMA_V2
             )
             uses_adapter_v5 = (
-                self.entity_feature_adapter_version == RUST_ENTITY_ADAPTER_V5
+                self.entity_feature_adapter_version
+                in {RUST_ENTITY_ADAPTER_V5, RUST_ENTITY_ADAPTER_V6}
             )
             if uses_history_v2 != uses_adapter_v5:
                 raise ValueError(
-                    "meaningful public-history v2 and entity adapter v5 must be "
+                    "meaningful public-history v2 and entity adapter v5/v6 must be "
                     "enabled together; got schema "
                     f"{getattr(config, 'meaningful_public_history_schema', None)!r} "
                     f"and adapter {self.entity_feature_adapter_version!r}"
@@ -2344,10 +2346,14 @@ class EntityGraphPolicy:
         if (
             bool(getattr(config, "public_rule_state_features", False))
             and self.entity_feature_adapter_version
-            not in {RUST_ENTITY_ADAPTER_V4, RUST_ENTITY_ADAPTER_V5}
+            not in {
+                RUST_ENTITY_ADAPTER_V4,
+                RUST_ENTITY_ADAPTER_V5,
+                RUST_ENTITY_ADAPTER_V6,
+            }
         ):
             raise ValueError(
-                "public_rule_state_features requires entity adapter v4 or v5; got "
+                "public_rule_state_features requires entity adapter v4, v5, or v6; got "
                 f"{self.entity_feature_adapter_version!r}"
             )
         self.entity_feature_adapter_binding_source = "new_policy_runtime_binding"
@@ -2794,7 +2800,11 @@ class EntityGraphPolicy:
                 "entity legal-action token count does not match valid actions: "
                 f"{entity['legal_action_tokens'].shape[0]} != {len(valid_actions)}"
             )
-        context_table = build_action_context_feature_table(env, info)
+        context_table = build_action_context_feature_table(
+            env,
+            info,
+            entity_feature_adapter_version=self.entity_feature_adapter_version,
+        )
         legal_context = np.asarray(context_table, dtype=np.float32)[
             list(valid_actions), :
         ]
