@@ -1,15 +1,15 @@
 # A1 distributed H100 evaluation
 
 Training stays on the selected eight-GPU B200 host. Evaluation can run on the
-full 64-H100 fleet and is controlled directly from that B200; checkpoint and report traffic never
+full 48-H100 fleet and is controlled directly from that B200; checkpoint and report traffic never
 passes through an operator laptop.
 
 `tools/fleet/a1_h100_eval_fleet.py` provides a fail-closed SSH backend today and
 can render a Ray cluster specification without installing or starting Ray.
-Capacity is allocated per physical GPU: each of the four 8-GPU hosts receives
-twice the work of each 4-GPU host. New CLI plans use the coherent-public
-operator: one public-belief tree (no information-set/PIMC search), n128 with
-adaptive n256 from legal width 20, D6 averaging from width 20, one public
+Capacity is allocated per physical GPU across six identical 8-GPU hosts. New
+CLI plans use the coherent-public operator: one public-belief tree (no
+information-set/PIMC search), matched n128 for both roles, D6 averaging from
+width 20, one public
 belief state, `trajectory_only` forced roots, native MCTS, and native Rust
 featurization. `c_scale` is role-bound: the current v5
 candidate and incumbent identities both use 0.10. The 0.03 default remains
@@ -24,8 +24,9 @@ newly rendered plans.  Historical sealed plans retain their recorded worker
 count.  See
 [`EVAL_PACKING_B200_FULL_GAME_20260711.json`](evidence/EVAL_PACKING_B200_FULL_GAME_20260711.json).
 
-Copy `configs/a1_h100_eval_fleet.example.json` to the gitignored
-`configs/a1_h100_eval_fleet.json` on the B200 and fill private addresses. Then:
+The exact current authority is checked in at
+`configs/a1_h100_eval_fleet_8x6.json`. It is the only manifest accepted for new
+evaluation plans. Then:
 
 Use a separate immutable evaluation clone/worktree on the B200 and every H100;
 do not edit the sealed deployment at `/home/ubuntu/catan-zero-v1`. Point
@@ -35,9 +36,9 @@ The controller pins `PYTHONPATH` to the evaluation tree and proves the imported
 silently importing the older sealed source tree.
 
 ```bash
-PY=.venv/bin/python
+PY=/home/ubuntu/catan-zero-v1/.venv/bin/python
 CTL=tools/fleet/a1_h100_eval_fleet.py
-M=configs/a1_h100_eval_fleet.json
+M=configs/a1_h100_eval_fleet_8x6.json
 
 $PY "$CTL" --manifest "$M" plan \
   --candidate /immutable/a1/candidate.pt \
@@ -75,9 +76,9 @@ against an older checkpoint must explicitly use
 `--historical-comparison-reason ...`; such a plan is sealed
 `promotion_eligible=false` and promotion artifact construction rejects it.
 
-Before the full plan, use `--scope canary` with 24 internal pairs and 12
-external pairs. That exercises every GPU on `c1` (4 GPUs) and `h100-8a` (8
-GPUs), two pairs per internal lane and two matched pairs per external cohort.
+Before the full plan, use `--scope canary` with 16 internal pairs and 4
+external pairs. That exercises all eight GPUs on `h100-8a`, two pairs per
+internal lane and one matched pair per external cohort.
 It is a separate immutable plan with separate VAL-only ranges. After both
 canary phases collect cleanly, create the independent `--scope full` 600/500
 plan shown above; never extend or reinterpret the canary plan as the full gate.

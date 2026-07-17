@@ -159,7 +159,7 @@ def test_three_arm_trial_is_exactly_matched_and_diagnostic_only(
     assert result["diagnostic_only"] is True
     assert result["promotion_eligible"] is False
     assert result["micro_panel"] == {"internal_pairs": 112, "external_pairs": 56}
-    assert result["manifest"]["physical_gpus"] == 64
+    assert result["manifest"]["physical_gpus"] == 48
     plans = {
         label: json.loads((output / f"{label}.plan.json").read_text())
         for label in trial.ARM_SPECS
@@ -173,8 +173,8 @@ def test_three_arm_trial_is_exactly_matched_and_diagnostic_only(
         for plan in plans.values()
     )
     for plan in plans.values():
-        assert len([job for job in plan["jobs"] if job["phase"] == "internal"]) == 64
-        assert len([job for job in plan["jobs"] if job["phase"] == "external"]) == 64
+        assert len([job for job in plan["jobs"] if job["phase"] == "internal"]) == 48
+        assert len([job for job in plan["jobs"] if job["phase"] == "external"]) == 48
         for job in plan["jobs"]:
             argv = job["argv"]
             assert argv[argv.index("--n-full") + 1] == "128"

@@ -7,11 +7,10 @@ operation is gated by ``--go``.  A Ray cluster specification can be rendered
 for a later daemon-managed backend without installing or starting Ray.
 
 The unit of capacity is a physical GPU, never a host.  The current authority
-has eight four-GPU hosts plus four eight-GPU hosts, yielding sixty-four equal
-evaluator lanes. Historical manifests with six four-GPU plus two eight-GPU
-hosts remain replayable as forty-lane evidence, but are not the current fleet.
-Internal H2H uses one shard per lane. External candidate/incumbent panels pair
-adjacent lanes and assign both sides the exact same seed interval.
+has six eight-GPU hosts, yielding forty-eight equal evaluator lanes. Historical
+reports remain evidence, but the live controller accepts only the current exact
+authority. Internal H2H uses one shard per lane. External candidate/incumbent
+panels pair adjacent lanes and assign both sides the exact same seed interval.
 """
 
 from __future__ import annotations
@@ -54,38 +53,22 @@ MANIFEST_SCHEMA = "a1-h100-eval-fleet-manifest-v1"
 PLAN_SCHEMA = "a1-h100-eval-fleet-plan-v2"
 RAY_SCHEMA = "a1-h100-eval-ray-cluster-v1"
 EXPECTED_HOSTS = {
-    "c1": ("192.222.54.251", 4),
-    "c2": ("68.209.75.117", 4),
-    "c3": ("192.222.53.18", 4),
-    "c4": ("68.209.73.252", 4),
-    "c5": ("68.209.74.145", 4),
-    "c6": ("68.209.74.2", 4),
-    "h100-8a": ("192.222.53.119", 8),
-    "h100-8b": ("192.222.55.216", 8),
+    "h100-8a": ("192.222.53.175", 8),
+    "h100-8b": ("192.222.54.137", 8),
+    "h100-8c": ("209.20.158.117", 8),
+    "h100-8d": ("192.222.55.12", 8),
+    "h100-8e": ("209.20.156.201", 8),
+    "h100-8f": ("192.222.52.228", 8),
 }
-EXPANDED_EXPECTED_HOSTS = {
-    **EXPECTED_HOSTS,
-    "c7": ("68.209.74.24", 4),
-    "c8": ("68.209.72.159", 4),
-}
-FULL_EXPECTED_HOSTS = {
-    **EXPANDED_EXPECTED_HOSTS,
-    "h100-8c": ("192.222.54.141", 8),
-    "h100-8d": ("209.20.158.82", 8),
-}
-APPROVED_FLEET_HOSTS = (
-    EXPECTED_HOSTS,
-    EXPANDED_EXPECTED_HOSTS,
-    FULL_EXPECTED_HOSTS,
-)
+APPROVED_FLEET_HOSTS = (EXPECTED_HOSTS,)
 EXPECTED_SHAPES = {alias: host[1] for alias, host in EXPECTED_HOSTS.items()}
-EXPANDED_EXPECTED_SHAPES = {
-    alias: host[1] for alias, host in EXPANDED_EXPECTED_HOSTS.items()
-}
-FULL_EXPECTED_SHAPES = {
-    alias: host[1] for alias, host in FULL_EXPECTED_HOSTS.items()
-}
-CANARY_ALIASES = {"c1", "h100-8a"}
+# These names remain the public interface used by the experiment planners, but
+# they now resolve to the single current fleet authority. Historical mixed
+# 4-GPU/8-GPU layouts remain replayable from their issued plans; they are not
+# accepted for new evaluation plans.
+FULL_EXPECTED_HOSTS = EXPECTED_HOSTS
+FULL_EXPECTED_SHAPES = EXPECTED_SHAPES
+CANARY_ALIASES = {"h100-8a"}
 DEFAULT_WORKERS_PER_GPU = 16
 PRODUCTION_RUNTIME = runtime_contract.load_runtime_contract()
 NATIVE_WHEEL_VERSION = PRODUCTION_RUNTIME["catanatron_rs_version"]

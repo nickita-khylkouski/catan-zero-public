@@ -261,71 +261,50 @@ def test_manifest_requires_an_exact_approved_fleet_shape(
         fleet.load_manifest(path)
 
 
-def test_legacy_40_gpu_manifest_remains_hash_identical(tmp_path: Path) -> None:
-    # The default loader's backward-compatible topology dispatch must not alter
-    # the normalized payload or manifest hash of any existing sealed plan.
+def test_checked_in_eval_manifest_is_the_current_48_gpu_authority() -> None:
+    manifest = fleet.load_manifest(
+        fleet._REPO_ROOT / "configs/a1_h100_eval_fleet_8x6.json"  # noqa: SLF001
+    )
+    assert {
+        host["alias"]: (host["address"], host["gpu_count"])
+        for host in manifest["hosts"]
+    } == fleet.EXPECTED_HOSTS
+    assert len(fleet.gpu_slots(manifest)) == 48
+    assert manifest["remote_repo"] == "/home/ubuntu/catan-zero-fleet-v2"
+    assert manifest["remote_python"] == (
+        "/home/ubuntu/catan-zero-fleet-v2/.venv/bin/python"
+    )
+
+
+def test_current_48_gpu_manifest_remains_hash_identical(tmp_path: Path) -> None:
+    # Supplying the current shape explicitly must not alter the normalized
+    # payload or manifest hash.
     path = _manifest_file(tmp_path)
     default = fleet.load_manifest(path)
-    explicit_legacy = fleet.load_manifest(
+    explicit = fleet.load_manifest(
         path, expected_shapes=fleet.EXPECTED_SHAPES
     )
-    assert default == explicit_legacy
-    assert len(fleet.gpu_slots(default)) == 40
+    assert default == explicit
+    assert len(fleet.gpu_slots(default)) == 48
 
 
-def test_expanded_48_gpu_manifest_allocates_every_pair_exactly_once(
+def test_current_48_gpu_manifest_allocates_every_pair_exactly_once(
     tmp_path: Path,
 ) -> None:
-    manifest, plan = _plan(tmp_path, shapes=fleet.EXPANDED_EXPECTED_SHAPES)
+    manifest, plan = _plan(tmp_path)
     assert [host["alias"] for host in manifest["hosts"]] == [
-        "c1",
-        "c2",
-        "c3",
-        "c4",
-        "c5",
-        "c6",
-        "c7",
-        "c8",
         "h100-8a",
         "h100-8b",
+        "h100-8c",
+        "h100-8d",
+        "h100-8e",
+        "h100-8f",
     ]
     internal = [job for job in plan["jobs"] if job["phase"] == "internal"]
     assert len(internal) == 48
     assert sum(job["pairs"] for job in internal) == 600
     assert [job["pairs"] for job in internal].count(13) == 24
     assert [job["pairs"] for job in internal].count(12) == 24
-    intervals = sorted(
-        (job["base_seed"], job["base_seed"] + job["pairs"])
-        for job in internal
-    )
-    assert intervals[0][0] == 6_190_000_000
-    assert intervals[-1][1] == 6_190_000_600
-    assert all(left[1] == right[0] for left, right in zip(intervals, intervals[1:]))
-
-
-def test_full_64_gpu_manifest_allocates_every_pair_exactly_once(
-    tmp_path: Path,
-) -> None:
-    manifest, plan = _plan(tmp_path, shapes=fleet.FULL_EXPECTED_SHAPES)
-    assert [host["alias"] for host in manifest["hosts"]] == [
-        "c1",
-        "c2",
-        "c3",
-        "c4",
-        "c5",
-        "c6",
-        "c7",
-        "c8",
-        "h100-8a",
-        "h100-8b",
-        "h100-8c",
-        "h100-8d",
-    ]
-    internal = [job for job in plan["jobs"] if job["phase"] == "internal"]
-    assert len(internal) == 64
-    assert sum(job["pairs"] for job in internal) == 600
-    assert [job["pairs"] for job in internal].count(10) == 24
-    assert [job["pairs"] for job in internal].count(9) == 40
     intervals = sorted(
         (job["base_seed"], job["base_seed"] + job["pairs"])
         for job in internal
@@ -347,9 +326,9 @@ def test_manifest_rejects_address_substitution(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     "bad_aliases",
     [
-        ("c7",),
-        ("h100-8c", "h100-8d"),
-        ("c7", "c8", "h100-8c"),
+        ("c1",),
+        ("legacy-8a", "legacy-8b"),
+        ("c7", "c8", "legacy-8c"),
     ],
 )
 def test_partial_or_forbidden_expanded_topology_is_rejected(
@@ -358,7 +337,7 @@ def test_partial_or_forbidden_expanded_topology_is_rejected(
     value = json.loads(_manifest_file(tmp_path).read_text())
     for index, alias in enumerate(bad_aliases):
         value["hosts"].append(
-            {"alias": alias, "address": f"10.9.0.{index + 1}", "gpu_count": 4}
+            {"alias": alias, "address": f"10.9.0.{index + 1}", "gpu_count": 8}
         )
     path = tmp_path / "bad-expanded.json"
     path.write_text(json.dumps(value), encoding="utf-8")
@@ -371,15 +350,15 @@ def test_internal_plan_weights_by_physical_gpu_and_conserves_seed_interval(
 ) -> None:
     _manifest, plan = _plan(tmp_path)
     jobs = [job for job in plan["jobs"] if job["phase"] == "internal"]
-    assert len(jobs) == 40
+    assert len(jobs) == 48
     assert sum(job["pairs"] for job in jobs) == 600
-    assert {job["pairs"] for job in jobs} == {15}
+    assert {job["pairs"] for job in jobs} == {12, 13}
     by_host = {
         alias: sum(job["pairs"] for job in jobs if job["alias"] == alias)
         for alias in fleet.EXPECTED_SHAPES
     }
-    assert by_host["c1"] == 60
-    assert by_host["h100-8a"] == 120
+    assert by_host["h100-8a"] == 104
+    assert by_host["h100-8f"] == 96
     intervals = sorted(
         (job["base_seed"], job["base_seed"] + job["pairs"]) for job in jobs
     )
@@ -390,14 +369,14 @@ def test_internal_plan_weights_by_physical_gpu_and_conserves_seed_interval(
 
 def test_full_plan_can_seal_an_approved_host_subset(tmp_path: Path) -> None:
     manifest, template = _plan(tmp_path)
-    aliases = ["c2", "c3", "c4", "c5", "c6", "h100-8b"]
+    aliases = ["h100-8b", "h100-8c", "h100-8d"]
     plan = fleet.build_plan(
         manifest,
         candidate=Path(template["candidate"]["source"]),
         champion=Path(template["champion"]["source"]),
         **_binding_kwargs(template),
-        internal_pairs=280,
-        external_pairs=14,
+        internal_pairs=240,
+        external_pairs=12,
         internal_base_seed=6_195_600_000,
         external_base_seed=6_195_601_000,
         workers_per_gpu=16,
@@ -409,8 +388,8 @@ def test_full_plan_can_seal_an_approved_host_subset(tmp_path: Path) -> None:
 
     assert plan["host_aliases"] == aliases
     internal = [job for job in plan["jobs"] if job["phase"] == "internal"]
-    assert len(internal) == 28
-    assert sum(job["pairs"] for job in internal) == 280
+    assert len(internal) == 24
+    assert sum(job["pairs"] for job in internal) == 240
     assert {job["pairs"] for job in internal} == {10}
     assert {job["alias"] for job in internal} == set(aliases)
     fleet._validate_planned_jobs(plan, manifest)  # noqa: SLF001
@@ -424,15 +403,15 @@ def test_full_plan_can_seal_an_approved_host_subset(tmp_path: Path) -> None:
 def test_external_plan_uses_matched_candidate_champion_cohorts(tmp_path: Path) -> None:
     _manifest, plan = _plan(tmp_path)
     jobs = [job for job in plan["jobs"] if job["phase"] == "external"]
-    assert len(jobs) == 40
+    assert len(jobs) == 48
     cohorts: dict[str, list[dict]] = {}
     for job in jobs:
         cohorts.setdefault(job["cohort_id"], []).append(job)
-    assert len(cohorts) == 20
+    assert len(cohorts) == 24
     for cohort in cohorts.values():
         assert {job["role"] for job in cohort} == {"candidate", "champion"}
         assert len({(job["base_seed"], job["pairs"]) for job in cohort}) == 1
-        assert {job["pairs"] for job in cohort} == {25}
+        assert {job["pairs"] for job in cohort}.issubset({20, 21})
         assert len({job["slot_id"] for job in cohort}) == 2
         for job in cohort:
             argv = job["argv"]
@@ -622,7 +601,7 @@ def test_branch_challenge_plan_rejects_registry_drift_after_sealing(
         fleet.load_plan(plan_path, manifest)
 
 
-def test_canary_scope_uses_every_gpu_on_one_four_and_one_eight_gpu_host(
+def test_canary_scope_uses_every_gpu_on_first_eight_gpu_host(
     tmp_path: Path,
 ) -> None:
     manifest, full = _plan(tmp_path)
@@ -631,8 +610,8 @@ def test_canary_scope_uses_every_gpu_on_one_four_and_one_eight_gpu_host(
         candidate=Path(full["candidate"]["source"]),
         champion=Path(full["champion"]["source"]),
         **_binding_kwargs(full),
-        internal_pairs=24,
-        external_pairs=12,
+        internal_pairs=16,
+        external_pairs=4,
         internal_base_seed=6_192_000_000,
         external_base_seed=6_192_001_000,
         workers_per_gpu=2,
@@ -642,13 +621,12 @@ def test_canary_scope_uses_every_gpu_on_one_four_and_one_eight_gpu_host(
         tool_hashes=full["tool_hashes"],
     )
     assert canary["scope"] == "canary"
-    assert len(canary["jobs"]) == 24
+    assert len(canary["jobs"]) == 16
     for phase in ("internal", "external"):
         jobs = [job for job in canary["jobs"] if job["phase"] == phase]
-        assert len(jobs) == 12
-        assert {job["alias"] for job in jobs} == {"c1", "h100-8a"}
+        assert len(jobs) == 8
+        assert {job["alias"] for job in jobs} == {"h100-8a"}
         assert {(job["alias"], job["gpu"]) for job in jobs} == {
-            *(("c1", gpu) for gpu in range(4)),
             *(("h100-8a", gpu) for gpu in range(8)),
         }
 
@@ -697,7 +675,7 @@ def test_every_job_is_cuda_pinned_and_has_exact_n128_infoset_d6_recipe(
                 argv[argv.index("--max-player-trade-offers-per-turn") + 1] == "0"
             )
     rendered = fleet.dry_run_commands(manifest, plan, "internal")
-    assert len(rendered["hosts"]) == 8
+    assert len(rendered["hosts"]) == 6
     all_shell = "\n".join(row["ssh_command"][-1] for row in rendered["hosts"])
     for gpu in range(8):
         assert f"CUDA_VISIBLE_DEVICES={gpu}" in all_shell
@@ -1009,7 +987,7 @@ def test_same_checkpoint_adaptive_n256_s3_plan_is_exact_and_fail_closed(
             Path(default["evaluation_binding"]["registry"]["path"])
         ),
         internal_pairs=200,
-        external_pairs=20,
+        external_pairs=24,
         internal_base_seed=6_195_000_000,
         external_base_seed=6_195_001_000,
         candidate_c_scale=0.03,
@@ -1497,11 +1475,11 @@ def test_resume_selects_only_missing_failed_or_stale_jobs(tmp_path: Path) -> Non
     assert sum(row["jobs"] for row in rendered["hosts"]) == len(selected)
 
 
-def test_ray_spec_advertises_no_b200_gpu_and_all_40_h100_slots(tmp_path: Path) -> None:
+def test_ray_spec_advertises_no_b200_gpu_and_all_48_h100_slots(tmp_path: Path) -> None:
     manifest, plan = _plan(tmp_path)
     spec = fleet.ray_cluster_spec(manifest, plan)
     assert spec["head"]["num_gpus"] == 0
-    assert sum(worker["num_gpus"] for worker in spec["workers"]) == 40
+    assert sum(worker["num_gpus"] for worker in spec["workers"]) == 48
     assert spec["scheduler_contract"]["actor_resources"] == {
         "num_gpus": 1,
         "resources": {"H100": 1},

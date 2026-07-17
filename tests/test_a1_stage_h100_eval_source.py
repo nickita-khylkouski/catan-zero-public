@@ -184,7 +184,7 @@ def test_stage_fleet_is_parallel_deterministic_and_keeps_remote_python(
 def test_any_host_failure_prevents_derived_manifest(tmp_path: Path) -> None:
     manifest = eval_fleet.load_manifest(_manifest_path(tmp_path))
     out = tmp_path / "must-not-exist.json"
-    bad_address = eval_fleet.EXPECTED_HOSTS["c3"][0]
+    bad_address = eval_fleet.EXPECTED_HOSTS["h100-8c"][0]
 
     def runner(
         command: list[str], _program: str
