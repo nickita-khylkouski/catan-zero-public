@@ -1103,6 +1103,20 @@ def _server_main(
         str(readout)
         for readout in getattr(policy, "trained_value_readouts", ("scalar",))
     )
+    # The remote evaluator must make exactly the same value-readout decision as
+    # an in-process evaluator.  Head presence alone is insufficient: modern
+    # checkpoints may retain an architectural scalar/categorical head that was
+    # not optimized in this training run.  Send the small provenance surface
+    # consumed by ``_assert_value_readout_available`` rather than reconstructing
+    # it from module shape in the client proxy.
+    handshake["trained_value_readouts"] = trained_readouts
+    handshake["value_training_present"] = isinstance(
+        getattr(policy, "value_training", None), dict
+    )
+    handshake["value_training_provenance_errors"] = tuple(
+        str(error)
+        for error in getattr(policy, "_value_training_provenance_errors", ())
+    )
     handshake["value_categorical_bins"] = categorical_bins
     handshake["value_categorical_head_available"] = bool(
         categorical_bins >= 2
@@ -1608,6 +1622,20 @@ class EvalServer:
             "value_categorical_head_available": bool(
                 self._handshake["value_categorical_head_available"]
             ),
+            "trained_value_readouts": tuple(
+                str(readout)
+                for readout in self._handshake.get(
+                    "trained_value_readouts", ("scalar",)
+                )
+            ),
+            "value_training_present": bool(
+                self._handshake.get("value_training_present", False)
+            ),
+            "value_training_provenance_errors": tuple(
+                str(error)
+                for error in self._handshake.get(
+                    "value_training_provenance_errors", ())
+            ),
         }
 
     @property
@@ -1693,6 +1721,9 @@ class _RemoteForwardProxy:
         ),
         value_categorical_bins: int = 0,
         value_categorical_head_available: bool = False,
+        trained_value_readouts: tuple[str, ...] = ("scalar",),
+        value_training_present: bool = False,
+        value_training_provenance_errors: tuple[str, ...] = (),
     ) -> None:
         self._client = client
         self.action_size = int(action_size)
@@ -1719,10 +1750,15 @@ class _RemoteForwardProxy:
             )
         )
         self.entity_feature_adapter_binding_source = "eval_server_handshake"
-        self.trained_value_readouts = (
-            ("scalar", "categorical")
-            if value_categorical_head_available
-            else ("scalar",)
+        self.trained_value_readouts = tuple(
+            str(readout) for readout in trained_value_readouts
+        )
+        # The evaluator only needs to distinguish modern, provenance-bearing
+        # checkpoints from legacy checkpoints.  Do not send arbitrary metadata
+        # over IPC; this sentinel reproduces the local fail-closed branch.
+        self.value_training = {} if bool(value_training_present) else None
+        self._value_training_provenance_errors = tuple(
+            str(error) for error in value_training_provenance_errors
         )
         self.model = type(
             "_RemoteModelMetadata",
@@ -1777,6 +1813,9 @@ class RemoteEvalClient(EntityGraphRustEvaluator):
         event_token_limit: int | None = None,
         value_categorical_bins: int = 0,
         value_categorical_head_available: bool = False,
+        trained_value_readouts: tuple[str, ...] = ("scalar",),
+        value_training_present: bool = False,
+        value_training_provenance_errors: tuple[str, ...] = (),
         config: EntityGraphRustEvaluatorConfig | None = None,
         client_timeout_ms: float = 5000.0,
         fallback_checkpoint: str | None = None,
@@ -1793,6 +1832,9 @@ class RemoteEvalClient(EntityGraphRustEvaluator):
             meaningful_public_history_schema=meaningful_public_history_schema,
             value_categorical_bins=value_categorical_bins,
             value_categorical_head_available=value_categorical_head_available,
+            trained_value_readouts=trained_value_readouts,
+            value_training_present=value_training_present,
+            value_training_provenance_errors=value_training_provenance_errors,
         )
         super().__init__(proxy, config=config)
         self._request_queue = request_queue

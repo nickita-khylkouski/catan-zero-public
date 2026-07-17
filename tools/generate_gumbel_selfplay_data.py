@@ -1851,6 +1851,9 @@ def _server_worker_entry(
     event_token_limit: int | None,
     value_categorical_bins: int,
     value_categorical_head_available: bool,
+    trained_value_readouts: tuple[str, ...],
+    value_training_present: bool,
+    value_training_provenance_errors: tuple[str, ...],
     client_timeout_ms: float,
     allow_local_fallback: bool,
     result_queue: Any,
@@ -1888,6 +1891,11 @@ def _server_worker_entry(
             event_token_limit=event_token_limit,
             value_categorical_bins=int(value_categorical_bins),
             value_categorical_head_available=bool(value_categorical_head_available),
+            trained_value_readouts=tuple(str(x) for x in trained_value_readouts),
+            value_training_present=bool(value_training_present),
+            value_training_provenance_errors=tuple(
+                str(x) for x in value_training_provenance_errors
+            ),
             config=EntityGraphRustEvaluatorConfig(
                 value_scale=float(worker_args["value_scale"]),
                 prior_temperature=float(worker_args["prior_temperature"]),
@@ -2048,6 +2056,12 @@ def _run_eval_server_batch(
                     meta.get("event_token_limit"),
                     int(meta.get("value_categorical_bins", 0)),
                     bool(meta.get("value_categorical_head_available", False)),
+                    tuple(str(x) for x in meta.get("trained_value_readouts", ("scalar",))),
+                    bool(meta.get("value_training_present", False)),
+                    tuple(
+                        str(x)
+                        for x in meta.get("value_training_provenance_errors", ())
+                    ),
                     float(args.eval_server_timeout_ms),
                     bool(args.eval_server_local_fallback),
                     result_queue,

@@ -102,6 +102,9 @@ def _worker(
             needs_targets,
             needs_relational_topology,
             event_token_limit,
+            trained_value_readouts,
+            value_training_present,
+            value_training_provenance_errors,
         ) = server_args
         evaluator: Any = RemoteEvalClient(
             request_queue,
@@ -116,6 +119,11 @@ def _worker(
             needs_action_targets=needs_targets,
             needs_relational_topology=bool(needs_relational_topology),
             event_token_limit=event_token_limit,
+            trained_value_readouts=tuple(str(x) for x in trained_value_readouts),
+            value_training_present=bool(value_training_present),
+            value_training_provenance_errors=tuple(
+                str(x) for x in value_training_provenance_errors
+            ),
             config=eval_config,
             client_timeout_ms=float(a["client_timeout_ms"]),
         )
@@ -268,6 +276,12 @@ def _run_arm(mode: str, a: dict[str, Any]) -> dict[str, Any]:
                     bool(meta.get("needs_action_targets", True)),
                     bool(meta.get("needs_relational_topology", False)),
                     meta.get("event_token_limit"),
+                    tuple(str(x) for x in meta.get("trained_value_readouts", ("scalar",))),
+                    bool(meta.get("value_training_present", False)),
+                    tuple(
+                        str(x)
+                        for x in meta.get("value_training_provenance_errors", ())
+                    ),
                 )
 
         procs = []
@@ -473,6 +487,14 @@ def _parity(a: dict[str, Any]) -> dict[str, Any]:
                 meta.get("needs_relational_topology", False)
             ),
             event_token_limit=meta.get("event_token_limit"),
+            trained_value_readouts=tuple(
+                str(x) for x in meta.get("trained_value_readouts", ("scalar",))
+            ),
+            value_training_present=bool(meta.get("value_training_present", False)),
+            value_training_provenance_errors=tuple(
+                str(x)
+                for x in meta.get("value_training_provenance_errors", ())
+            ),
             config=cfg,
         )
         srv_res = [
