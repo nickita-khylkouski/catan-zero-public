@@ -790,16 +790,23 @@ def _align_native_legal_features(
             "native actor public-rule-state repair found Python/native action-id drift"
         )
     aligned = dict(native_entity)
-    for key in (
+    required_legal_tensors = (
         "legal_action_tokens",
         "legal_action_target_ids",
         "legal_action_mask",
-    ):
+    )
+    missing = [key for key in required_legal_tensors if key not in native_entity]
+    if missing:
+        raise RuntimeError(
+            "native actor public-rule-state repair received an incomplete native "
+            f"entity payload; missing required legal tensors: {missing}"
+        )
+    for key in required_legal_tensors:
         value = np.asarray(native_entity[key])
-        if value.shape[0] != len(native_legal):
+        if value.ndim < 1 or value.shape[0] != len(native_legal):
             raise RuntimeError(
                 "native actor public-rule-state repair found malformed legal tensor "
-                f"{key}: rows={value.shape[0]} expected={len(native_legal)}"
+                f"{key}: shape={value.shape} expected_rows={len(native_legal)}"
             )
         aligned[key] = value[permutation].copy()
     return aligned

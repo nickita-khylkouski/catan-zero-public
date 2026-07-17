@@ -63,7 +63,7 @@ def test_paired_root_output_contract_binds_preservation_semantics() -> None:
     assert preserved["atomic_pair_required"] is True
     assert preserved["authority"] == {
         "schema_version": alignment.current_science.SCHEMA_VERSION,
-        "contract_id": "a1-next-wave-coherent-public-v3",
+        "contract_id": "a1-next-wave-coherent-public-v4",
         "path": str(alignment.current_science.CONTRACT_PATH.resolve(strict=True)),
         "file_sha256": alignment._file_sha256(  # noqa: SLF001
             alignment.current_science.CONTRACT_PATH.resolve(strict=True)

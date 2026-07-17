@@ -2,10 +2,10 @@
 """Fail-closed, resumable harvest of the sealed A1 generation fleet.
 
 The tool is intentionally only a collector.  It never launches, stops, or
-otherwise mutates a fleet job.  Eight read-only tar streams are copied into a
-private staging directory, inspected member-by-member, hashed, and then
-published with one atomic rename.  The typed relocation map preserves the
-remote absolute name of every byte while giving post-wave consumers a safe
+otherwise mutates a fleet job.  One read-only tar stream per sealed host is
+copied into a private staging directory, inspected member-by-member, hashed,
+and then published with one atomic rename.  The typed relocation map preserves
+the remote absolute name of every byte while giving post-wave consumers a safe
 local name.
 """
 
@@ -93,7 +93,7 @@ def _contract_shape(lock: Mapping[str, Any]) -> dict[str, Any]:
         host_count: int | None = EXPECTED_HOSTS
     elif profile in {
         contract.CURRENT_GAME_CONTRACT_PROFILE,
-        contract.SCALE_64K_GAME_CONTRACT_PROFILE,
+        contract.PILOT_GAME_CONTRACT_PROFILE,
     }:
         jobs = lock.get("fleet", {}).get("jobs", [])
         host_count = len(

@@ -110,7 +110,7 @@ def _current_coherent_lock_job() -> tuple[dict, dict]:
             "guard_config": {
                 "path": (
                     "configs/guards/"
-                    "a1_generation_coherent_public_n128_adaptive256_forced_value_v3.json"
+                    "a1_generation_coherent_public_n128_adaptive256_forced_value_v4.json"
                 )
             }
         },
@@ -151,7 +151,7 @@ def test_current_coherent_render_accepts_disabled_adaptive_budget() -> None:
     assert "--n-full-wide-threshold" not in source
     assert "--no-wide-roots-always-full" in source
     assert "--record-automatic-transitions" in source
-    assert canary._flag_value(source, "--workers") == "128"
+    assert canary._flag_value(source, "--workers") == "24"
     assert "--eval-server" in source
     assert canary._flag_value(source, "--eval-server-max-batch") == "96"
     assert "--eval-server-request-collector" in source
@@ -198,7 +198,7 @@ def test_opponent_mix_local_mps_render_is_not_production_generation() -> None:
 
     guard_path = (
         canary.contract.REPO_ROOT
-        / "configs/guards/a1_generation_coherent_public_n128_adaptive256_forced_value_v3.json"
+        / "configs/guards/a1_generation_coherent_public_n128_adaptive256_forced_value_v4.json"
     )
     guard = json.loads(guard_path.read_text(encoding="utf-8"))
     lint = next(item["args"] for item in guard["guards"] if item["name"] == "cli_flag_lint")
@@ -210,7 +210,7 @@ def test_opponent_mix_local_mps_render_is_not_production_generation() -> None:
         parser=canary.contract.generation_cli.build_parser(),
     )
     assert not result.passed
-    assert "--workers=16 (expected 128)" in result.reason
+    assert "--workers=16 (expected 24)" in result.reason
     assert "--eval-server=False (expected True)" in result.reason
 
     provenance = canary.contract._expected_generate_config_provenance(  # noqa: SLF001

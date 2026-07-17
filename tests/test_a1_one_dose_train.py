@@ -1095,15 +1095,16 @@ def test_coherent_one_dose_renders_deployed_scalar_value_objective(
 
     assert _option(command, "--scalar-value-loss-readout") == "deployed_tanh"
     assert _option(command, "--scalar-value-loss-scale") == "1.0"
-    assert _option(command, "--data-loader-workers") == "4"
-    assert _option(command, "--data-loader-prefetch") == "4"
-    assert _option(command, "--base-sampler") == "weighted_replacement_v1"
+    assert _option(command, "--data-loader-workers") == "2"
+    assert _option(command, "--data-loader-prefetch") == "2"
+    assert _option(command, "--base-sampler") == "coverage_importance_v1"
+    assert "--minimum-initial-settlement-policy-mass-fraction" not in command
+    assert "--minimum-initial-road-policy-mass-fraction" not in command
+    assert _option(command, "--train-diagnostics-every-batches") == "16"
     assert (
-        _option(command, "--minimum-initial-settlement-policy-mass-fraction")
-        == "0.02"
+        _option(command, "--objective-gradient-interference-every-batches")
+        == "16"
     )
-    assert _option(command, "--minimum-initial-road-policy-mass-fraction") == "0.02"
-    assert _option(command, "--train-diagnostics-every-batches") == "6"
     assert (
         _option(command, "--minimum-feature-learning-signal-observations") == "2"
     )

@@ -273,17 +273,18 @@ def test_contract_shape_is_schema_bound_for_legacy_current_and_dual_arm(
     workers, _record = contract._canonical_workers_from_fleet_manifest(  # noqa: SLF001
         contract.CURRENT_FLEET_MANIFEST
     )
+    current_worker_count = len(workers)
     current_attempts = {
         category: games
-        + contract.CURRENT_WORKER_COUNT * contract.ATTEMPT_RESERVE_PER_JOB[category]
+        + current_worker_count * contract.ATTEMPT_RESERVE_PER_JOB[category]
         for category, games in contract.EXPECTED_GAMES.items()
     }
     current = {
         "schema_version": contract.LOCK_SCHEMA,
         "game_contract": {
             "profile": contract.CURRENT_GAME_CONTRACT_PROFILE,
-            "worker_count": 64,
-            "job_count": 192,
+            "worker_count": current_worker_count,
+            "job_count": current_worker_count * len(CATEGORIES),
             "total_complete_games": sum(contract.EXPECTED_GAMES.values()),
             "category_games": dict(contract.EXPECTED_GAMES),
             "total_attempts": sum(current_attempts.values()),
@@ -291,12 +292,40 @@ def test_contract_shape_is_schema_bound_for_legacy_current_and_dual_arm(
         },
         "fleet": {"jobs": _topology_jobs(workers)},
     }
-    assert harvest._contract_shape(current)["job_count"] == 192  # noqa: SLF001
-    assert harvest._contract_shape(current)["host_count"] == 12  # noqa: SLF001
-    scaled = json.loads(json.dumps(current))
-    scaled["game_contract"]["profile"] = contract.SCALE_64K_GAME_CONTRACT_PROFILE
-    assert harvest._contract_shape(scaled)["job_count"] == 192  # noqa: SLF001
-    assert harvest._contract_shape(scaled)["host_count"] == 12  # noqa: SLF001
+    current_shape = harvest._contract_shape(current)  # noqa: SLF001
+    assert current_shape["job_count"] == current_worker_count * len(CATEGORIES)
+    assert current_shape["host_count"] == len(
+        {str(worker["host_alias"]) for worker in workers}
+    )
+
+    pilot_workers = contract._workers_for_quota_policy(  # noqa: SLF001
+        workers, contract.PILOT_ONE_NODE_QUOTA_POLICY
+    )
+    pilot_games = contract._games_for_quota_policy(  # noqa: SLF001
+        contract.PILOT_ONE_NODE_QUOTA_POLICY,
+        worker_count=len(pilot_workers),
+    )
+    pilot_attempts = {
+        category: games
+        + len(pilot_workers) * contract.ATTEMPT_RESERVE_PER_JOB[category]
+        for category, games in pilot_games.items()
+    }
+    pilot = {
+        "schema_version": contract.LOCK_SCHEMA,
+        "game_contract": {
+            "profile": contract.PILOT_GAME_CONTRACT_PROFILE,
+            "worker_count": len(pilot_workers),
+            "job_count": len(pilot_workers) * len(CATEGORIES),
+            "total_complete_games": sum(pilot_games.values()),
+            "category_games": pilot_games,
+            "total_attempts": sum(pilot_attempts.values()),
+            "category_attempts": pilot_attempts,
+        },
+        "fleet": {"jobs": _topology_jobs(pilot_workers)},
+    }
+    pilot_shape = harvest._contract_shape(pilot)  # noqa: SLF001
+    assert pilot_shape["job_count"] == 24
+    assert pilot_shape["host_count"] == 1
 
     dual_workers = workers[:28]
     dual = {

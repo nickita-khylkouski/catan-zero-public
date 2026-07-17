@@ -5848,6 +5848,12 @@ def _build_direct_train_command(
                     str(recipe["minimum_initial_settlement_policy_mass_fraction"]),
                     "--minimum-initial-road-policy-mass-fraction",
                     str(recipe["minimum_initial_road_policy_mass_fraction"]),
+                ]
+                if "minimum_initial_settlement_policy_mass_fraction" in recipe
+                else []
+            ),
+            *(
+                [
                     "--train-diagnostics-every-batches",
                     str(recipe["train_diagnostics_every_batches"]),
                     "--objective-gradient-interference-every-batches",
@@ -5857,7 +5863,7 @@ def _build_direct_train_command(
                     "--minimum-feature-learning-signal-observations",
                     str(recipe["minimum_feature_learning_signal_observations"]),
                 ]
-                if "minimum_initial_settlement_policy_mass_fraction" in recipe
+                if "train_diagnostics_every_batches" in recipe
                 else []
             ),
             "--policy-loss-weight",

@@ -7,7 +7,10 @@ from catan_zero.rl.actor_public_rule_state_admission import (
     ActorPublicRuleStateAdmissionError,
     audit_actor_playable_development_cards,
 )
-from catan_zero.rl.entity_feature_adapter import RUST_ENTITY_ADAPTER_V5
+from catan_zero.rl.entity_feature_adapter import (
+    RUST_ENTITY_ADAPTER_V5,
+    RUST_ENTITY_ADAPTER_V6,
+)
 from catan_zero.rl import gumbel_self_play
 from tools import train_bc
 
@@ -158,6 +161,12 @@ def _mock_public_learner_feature_dependencies(
     python_global = np.zeros((1, 1, 43), dtype=np.float16)
     python_global[0, 0, 8] = np.float16(1.0)
     python_player = np.zeros((1, 4, 31), dtype=np.float16)
+    python_legal_tokens = np.zeros((1, 1, 50), dtype=np.float16)
+    python_legal_target_ids = np.full((1, 1, 4), -1, dtype=np.int16)
+    python_legal_mask = np.ones((1, 1), dtype=np.bool_)
+    native_legal_tokens = python_legal_tokens[0].copy()
+    native_legal_target_ids = python_legal_target_ids[0].copy()
+    native_legal_mask = python_legal_mask[0].copy()
     native_global = python_global[0].copy()
     native_global[0, 12] = np.float16(0.2)
     native_player = python_player[0].copy()
@@ -180,6 +189,9 @@ def _mock_public_learner_feature_dependencies(
         lambda *_args, **_kwargs: {
             "global_tokens": python_global.copy(),
             "player_tokens": python_player.copy(),
+            "legal_action_tokens": python_legal_tokens.copy(),
+            "legal_action_target_ids": python_legal_target_ids.copy(),
+            "legal_action_mask": python_legal_mask.copy(),
         },
     )
     monkeypatch.setattr(
@@ -198,6 +210,9 @@ def _mock_public_learner_feature_dependencies(
         lambda *_args, **_kwargs: {
             "global_tokens": native_global.copy(),
             "player_tokens": native_player.copy(),
+            "legal_action_tokens": native_legal_tokens.copy(),
+            "legal_action_target_ids": native_legal_target_ids.copy(),
+            "legal_action_mask": native_legal_mask.copy(),
         },
     )
     monkeypatch.setattr(
@@ -207,8 +222,13 @@ def _mock_public_learner_feature_dependencies(
     )
 
 
+@pytest.mark.parametrize(
+    "adapter_version",
+    [RUST_ENTITY_ADAPTER_V5, RUST_ENTITY_ADAPTER_V6],
+)
 def test_public_learner_v5_replaces_stale_json_zero_with_native_slot(
     monkeypatch: pytest.MonkeyPatch,
+    adapter_version: str,
 ) -> None:
     _mock_public_learner_feature_dependencies(monkeypatch)
 
@@ -220,7 +240,7 @@ def test_public_learner_v5_replaces_stale_json_zero_with_native_slot(
         actor="RED",
         snapshot={},
         action_by_id={7: ["RED", "PLAY_KNIGHT_CARD", None]},
-        entity_feature_adapter_version=RUST_ENTITY_ADAPTER_V5,
+        entity_feature_adapter_version=adapter_version,
     )
 
     assert mapped == (304,)
@@ -229,8 +249,13 @@ def test_public_learner_v5_replaces_stale_json_zero_with_native_slot(
     assert np.count_nonzero(features["global_tokens"][0, 13:16]) == 0
 
 
+@pytest.mark.parametrize(
+    "adapter_version",
+    [RUST_ENTITY_ADAPTER_V5, RUST_ENTITY_ADAPTER_V6],
+)
 def test_public_learner_v5_refuses_native_drift_outside_rule_slots(
     monkeypatch: pytest.MonkeyPatch,
+    adapter_version: str,
 ) -> None:
     _mock_public_learner_feature_dependencies(
         monkeypatch,
@@ -246,5 +271,19 @@ def test_public_learner_v5_refuses_native_drift_outside_rule_slots(
             actor="RED",
             snapshot={},
             action_by_id={7: ["RED", "PLAY_KNIGHT_CARD", None]},
-            entity_feature_adapter_version=RUST_ENTITY_ADAPTER_V5,
+            entity_feature_adapter_version=adapter_version,
+        )
+
+
+def test_native_rule_state_alignment_rejects_missing_legal_tensor_contract() -> None:
+    with pytest.raises(RuntimeError, match="missing required legal tensors"):
+        gumbel_self_play._align_native_legal_features(  # noqa: SLF001
+            {
+                "legal_action_target_ids": np.full((1, 4), -1, dtype=np.int16),
+                "legal_action_mask": np.ones((1,), dtype=np.bool_),
+            },
+            native_legal=(7,),
+            learner_legal=(7,),
+            native_mapped=(304,),
+            learner_mapped=(304,),
         )
