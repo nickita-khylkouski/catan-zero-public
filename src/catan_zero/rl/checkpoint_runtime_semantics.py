@@ -164,6 +164,14 @@ _REVIEWED_LEGACY_CHECKPOINTS = {
     "sha256:6817ab054506f962a758ebf48addce5cc7eb801bf451cf2d02b62fb91f5da39c": (
         "legacy-6817-current-compat-v1"
     ),
+    # The sealed gen4 hard-negative opponent is the same topology-disabled,
+    # adapter-v2 EntityGraphPolicy family.  It predates all runtime stamps and
+    # carries no optional relational or information-surface flags.  Production
+    # opponent mixing binds these exact bytes; the exception must not extend to
+    # any other metadata-free checkpoint.
+    "sha256:b0f939464c138d6d0dca5586585d7e71aacb7ed86183cccbc2131d95750fe1c5": (
+        "legacy-gen4-hard-negative-current-compat-v1"
+    ),
 }
 
 
