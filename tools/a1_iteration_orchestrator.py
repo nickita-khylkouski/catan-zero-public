@@ -624,7 +624,7 @@ def initialize_next(
         if current_science.is_coherent_search(search):
             learner_contract = current_science.learner()
             selection = learner_contract["production_selection"]
-            if topology != learner_contract["topology"]:
+            if topology != selection["execution_topology"]["name"]:
                 raise IterationError(
                     "current coherent-public turn must use the contract-bound "
                     "8xB200 topology"

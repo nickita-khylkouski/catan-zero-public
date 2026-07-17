@@ -19,6 +19,8 @@ import sys
 
 _SAFE_ALIAS = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*\Z")
 _SAFE_ADDRESS = re.compile(r"[A-Za-z0-9][A-Za-z0-9.:-]*\Z")
+_FLEET_SCHEMA = "a1-h100-generation-fleet-v1"
+_FLEET_AUTHORITY = "catan-h100-8x6-v1"
 
 
 def main() -> None:
@@ -29,8 +31,13 @@ def main() -> None:
         raise SystemExit("A1_SSH_FLEET_MANIFEST is required")
     manifest_path = Path(manifest_raw).expanduser().resolve(strict=True)
     payload = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if payload.get("schema_version") != "catan-gpu-fleet-v2":
-        raise SystemExit("unsupported fleet manifest schema")
+    if (
+        payload.get("schema_version") != _FLEET_SCHEMA
+        or payload.get("fleet_authority") != _FLEET_AUTHORITY
+    ):
+        raise SystemExit(
+            "fleet manifest is not the canonical six-node 8xH100 authority"
+        )
     alias = sys.argv[1]
     if _SAFE_ALIAS.fullmatch(alias) is None:
         raise SystemExit("unsafe fleet alias")

@@ -52,7 +52,7 @@ from typing import Any, Callable
 
 import numpy as np
 
-from catan_zero.deduction_tracker import DEDUCTION_FEATURES_KEY
+from catan_zero.deduction_tracker import DEDUCTION_FEATURES_KEY, RESOURCES
 from catan_zero.rl.actor_public_rule_state_admission import (
     audit_actor_playable_development_cards,
 )
@@ -210,6 +210,7 @@ BASE_KEYS = (
     "policy_weight_multiplier",
     "value_weight_multiplier",
     "adapter_version",
+    "actor_resource_counts",
 )
 
 ENTITY_KEYS = (
@@ -1182,6 +1183,44 @@ def _build_decision_row(
         "aux_robber_target": np.int16(-1),
         AUX_SUBGOAL_TARGET_VERSION_KEY: np.uint8(AUX_SUBGOAL_TARGET_VERSION),
     }
+    if entity_feature_adapter_version == RUST_ENTITY_ADAPTER_V6:
+        snapshot_colors = snapshot.get("colors")
+        if (
+            not isinstance(snapshot_colors, list)
+            or len(snapshot_colors) != len(snapshot.get("player_state", ()))
+            or acting_color not in snapshot_colors
+        ):
+            raise ValueError(
+                "adapter-v6 row requires snapshot colors aligned with player_state"
+            )
+        # ``player_state`` is indexed by the snapshot's own ``colors`` array.
+        # Do not rely on the caller's color tuple: seat-order bugs elsewhere in
+        # this pipeline have already shown that equivalent color sets need not
+        # imply equivalent positional indexing.
+        actor_index = snapshot_colors.index(acting_color)
+        player_states = snapshot.get("player_state")
+        if not isinstance(player_states, list) or actor_index >= len(player_states):
+            raise ValueError(
+                "adapter-v6 row requires authoritative player_state for the actor"
+            )
+        resources = player_states[actor_index].get("resources")
+        if not isinstance(resources, Mapping):
+            raise ValueError(
+                "adapter-v6 row requires authoritative actor resource counts"
+            )
+        actor_resource_counts = np.asarray(
+            [int(resources.get(resource, -1)) for resource in RESOURCES],
+            dtype=np.int16,
+        )
+        if np.any(actor_resource_counts < 0) or np.any(actor_resource_counts > 19):
+            raise ValueError(
+                "adapter-v6 authoritative actor resource counts must be in [0, 19]"
+            )
+        # Admission-only evidence. This is intentionally not part of ENTITY_KEYS
+        # and therefore never reaches the policy; it independently proves that
+        # the actor-visible resource composition encoded in player_tokens came
+        # from the authoritative pre-action state.
+        row["actor_resource_counts"] = actor_resource_counts
     if float(row["policy_weight_multiplier"]) > 0.0:
         # Private, opt-in evidence fields. The default writer filters these
         # out, preserving the historical shard schema byte-for-byte. Only

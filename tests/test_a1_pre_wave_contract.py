@@ -3280,6 +3280,7 @@ def test_v6_post_wave_feature_semantics_bind_history_and_structured_resources(
         event_mask=np.zeros((rows, 64), dtype=bool),
         event_target_ids=np.full((rows, 64, 4), -1, dtype=np.int16),
         player_tokens=player_tokens,
+        actor_resource_counts=np.asarray([[1, 0, 0, 0, 0]], dtype=np.int16),
     )
 
     with np.load(shard, allow_pickle=False) as payload:
@@ -3326,6 +3327,9 @@ def test_v6_post_wave_feature_semantics_reject_malformed_actor_resources(
         "event_mask": np.zeros((rows, 64), dtype=bool),
         "event_target_ids": np.full((rows, 64, 4), -1, dtype=np.int16),
         "player_tokens": player_tokens,
+        "actor_resource_counts": np.asarray(
+            [[1, 0, 0, 0, 0]], dtype=np.int16
+        ),
     }
 
     def require(payload: object) -> None:
@@ -3379,6 +3383,15 @@ def test_v6_post_wave_feature_semantics_reject_malformed_actor_resources(
     np.savez(shard, **drifted)
     with np.load(shard, allow_pickle=False) as payload:
         with pytest.raises(contract.ContractError, match="total slot 6"):
+            require(payload)
+
+    drifted = dict(arrays)
+    drifted["actor_resource_counts"] = np.asarray(
+        [[0, 1, 0, 0, 0]], dtype=np.int16
+    )
+    np.savez(shard, **drifted)
+    with np.load(shard, allow_pickle=False) as payload:
+        with pytest.raises(contract.ContractError, match="authoritative"):
             require(payload)
 
 

@@ -153,7 +153,17 @@ _REVIEWED_LEGACY_POLICY_SEMANTIC_TRANSLATIONS = {
 _REVIEWED_LEGACY_CHECKPOINTS = {
     "sha256:f7e93dfb8cdb713d647b3e142c949d59083de9f719b6688b6faa6c918ce3eed4": (
         "legacy-f7-current-compat-v1"
-    )
+    ),
+    # The exact recovered 6817 checkpoint records entity_token_policy source
+    # SHA a2e3514e9d1e1378ff59e5affbd3aa16d3c74dd44af26f45eb8f35c50e367921
+    # in its authenticated checkout binding. Those are exactly the full-file
+    # bytes at commit 9e5bc913bca9b1e68949c0dd97e90f949aba0a92. The checkpoint
+    # predates adapter metadata, so the loader resolves it only through the
+    # explicit missing-metadata mapping to legacy adapter v2; this review does
+    # not relabel it as a newer adapter or stamp it with today's source identity.
+    "sha256:6817ab054506f962a758ebf48addce5cc7eb801bf451cf2d02b62fb91f5da39c": (
+        "legacy-6817-current-compat-v1"
+    ),
 }
 
 

@@ -13,7 +13,7 @@ import pytest
 from tools import train_bc
 from tools.train_bc import (
     _resolve_value_objective_weights,
-    _train_xdim_batch,
+    _train_entity_batch,
     _value_training_metadata,
     _weighted_mean_loss,
     evaluate_bc_batches,
@@ -294,9 +294,9 @@ def _validation_fixture():
             super().__init__()
             self.marker = torch.nn.Parameter(torch.zeros(()))
 
-    class TinyXDimPolicy:
+    class TinyEntityPolicy:
         device = torch.device("cpu")
-        policy_type = "test_xdim"
+        policy_type = "test_entity"
 
         def __init__(self) -> None:
             self.model = TinyModel()
@@ -332,7 +332,7 @@ def _validation_fixture():
         "phase": np.asarray(["main"] * 4),
         "teacher_name": np.asarray(["teacher"] * 4),
     }
-    return TinyXDimPolicy(), data
+    return TinyEntityPolicy(), data
 
 
 def _evaluate(
@@ -391,7 +391,7 @@ def _evaluate(
     )
 
 
-def test_xdim_validation_memmap_prefetch_is_metric_identical() -> None:
+def test_entity_validation_memmap_prefetch_is_metric_identical() -> None:
     """Threaded validation changes scheduling, never rows, order, or metrics."""
     policy, data = _validation_fixture()
     corpus = object.__new__(train_bc.MemmapCorpus)
@@ -420,7 +420,7 @@ def test_xdim_validation_memmap_prefetch_is_metric_identical() -> None:
     assert prefetched == synchronous
 
 
-def test_xdim_validation_default_mse_objective_and_telemetry() -> None:
+def test_entity_validation_default_mse_objective_and_telemetry() -> None:
     policy, data = _validation_fixture()
     policy.model.train(True)
 
@@ -533,55 +533,7 @@ def test_common_uniform_clean_outcome_mse_is_unavailable_without_clean_rows() ->
     assert common["mse"] is None
 
 
-def test_candidate_and_xdim_common_uniform_contracts_match() -> None:
-    torch = pytest.importorskip("torch")
-    xdim, data = _validation_fixture()
-    with torch.no_grad():
-        xdim.model.marker.fill_(0.5)
-    xdim_metrics = _evaluate(
-        xdim,
-        data,
-        scalar_weight=1.0,
-        categorical_weight=0.0,
-    )
-
-    class CandidatePolicy:
-        device = torch.device("cpu")
-        action_size = 2
-        context_action_feature_size = 1
-
-        def __init__(self) -> None:
-            self.model = torch.nn.Linear(1, 1, bias=False)
-
-        def forward(self, obs, context):
-            del context
-            rows = len(obs)
-            return (
-                torch.zeros((rows, 2), dtype=torch.float32),
-                torch.full((rows,), 0.5, dtype=torch.float32),
-            )
-
-    candidate_data = {
-        **data,
-        "legal_action_ids": np.asarray(
-            [[0, 1, -1], [0, 1, -1], [0, 1, -1], [0, 1, -1]],
-            dtype=np.int16,
-        ),
-        "action_taken": np.asarray([0, 1, 0, 1], dtype=np.int16),
-    }
-    candidate_metrics = _evaluate(
-        CandidatePolicy(),
-        candidate_data,
-        scalar_weight=1.0,
-        categorical_weight=0.0,
-    )
-
-    assert candidate_metrics["common_uniform_clean_outcome_scalar_mse"] == (
-        xdim_metrics["common_uniform_clean_outcome_scalar_mse"]
-    )
-
-
-def test_xdim_validation_can_score_the_deployed_scalar_search_readout() -> None:
+def test_entity_validation_can_score_the_deployed_scalar_search_readout() -> None:
     torch = pytest.importorskip("torch")
     policy, data = _validation_fixture()
     with torch.no_grad():
@@ -703,7 +655,7 @@ def test_binary_win_bce_preserves_large_gradient_on_confidently_wrong_value() ->
     assert bce_gradient > 1_000.0 * mse_gradient
 
 
-def test_xdim_binary_win_bce_keeps_mse_as_a_separate_diagnostic() -> None:
+def test_entity_binary_win_bce_keeps_mse_as_a_separate_diagnostic() -> None:
     torch = pytest.importorskip("torch")
     policy, data = _validation_fixture()
     with torch.no_grad():
@@ -741,7 +693,7 @@ def test_xdim_binary_win_bce_keeps_mse_as_a_separate_diagnostic() -> None:
     )
 
 
-def test_xdim_validation_hlgauss_is_categorical_primary_not_double_weighted() -> None:
+def test_entity_validation_hlgauss_is_categorical_primary_not_double_weighted() -> None:
     policy, data = _validation_fixture()
 
     metrics = _evaluate(policy, data, scalar_weight=0.0, categorical_weight=0.25)
@@ -809,7 +761,7 @@ def test_hlgauss_weighted_telemetry_is_partition_invariant_and_splits_truncation
     )
 
 
-def test_xdim_validation_applies_same_root_value_lambda_convention_to_both_arms() -> (
+def test_entity_validation_applies_same_root_value_lambda_convention_to_both_arms() -> (
     None
 ):
     torch = pytest.importorskip("torch")
@@ -882,7 +834,7 @@ def test_legacy_direct_forward_root_overlay_is_quarantined() -> None:
     ("scalar_weight", "categorical_weight"),
     [(0.25, 0.0), (0.0, 0.25)],
 )
-def test_xdim_train_and_validation_compute_the_same_value_objective(
+def test_entity_train_and_validation_compute_the_same_value_objective(
     scalar_weight: float,
     categorical_weight: float,
 ) -> None:
@@ -893,7 +845,7 @@ def test_xdim_train_and_validation_compute_the_same_value_objective(
     batch = np.arange(n, dtype=np.int64)
     ones = np.ones(n, dtype=np.float32)
 
-    trained = _train_xdim_batch(
+    trained = _train_entity_batch(
         policy,
         optimizer,
         data,
@@ -932,7 +884,7 @@ def test_xdim_train_and_validation_compute_the_same_value_objective(
     )
 
 
-def test_xdim_train_and_validation_share_deployed_tanh_value_semantics() -> None:
+def test_entity_train_and_validation_share_deployed_tanh_value_semantics() -> None:
     torch = pytest.importorskip("torch")
     policy, data = _validation_fixture()
     with torch.no_grad():
@@ -941,7 +893,7 @@ def test_xdim_train_and_validation_share_deployed_tanh_value_semantics() -> None
     batch = np.arange(len(data["action_taken"]), dtype=np.int64)
     weights = np.ones(len(batch), dtype=np.float32)
 
-    trained = _train_xdim_batch(
+    trained = _train_entity_batch(
         policy,
         optimizer,
         data,
@@ -978,7 +930,7 @@ def test_xdim_train_and_validation_share_deployed_tanh_value_semantics() -> None
     assert trained["loss"] == pytest.approx(validated["loss"])
 
 
-def test_xdim_train_and_validation_share_binary_win_bce_semantics() -> None:
+def test_entity_train_and_validation_share_binary_win_bce_semantics() -> None:
     torch = pytest.importorskip("torch")
     policy, data = _validation_fixture()
     with torch.no_grad():
@@ -987,7 +939,7 @@ def test_xdim_train_and_validation_share_binary_win_bce_semantics() -> None:
     batch = np.arange(len(data["action_taken"]), dtype=np.int64)
     weights = np.ones(len(batch), dtype=np.float32)
 
-    trained = _train_xdim_batch(
+    trained = _train_entity_batch(
         policy,
         optimizer,
         data,

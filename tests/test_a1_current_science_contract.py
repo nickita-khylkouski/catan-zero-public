@@ -8,7 +8,7 @@ import pytest
 from tools import a1_current_science_contract as current_science
 
 
-def test_current_production_learner_binds_full_value_and_exact_dose() -> None:
+def test_current_learner_selects_parent_update_and_keeps_scratch_research_only() -> None:
     recipe = current_science.learner_training_recipe()
 
     assert recipe["scalar_value_objective"] == "binary_win_bce"
@@ -23,6 +23,17 @@ def test_current_production_learner_binds_full_value_and_exact_dose() -> None:
         current_science.learner_production_selection()
         == current_science.PRODUCTION_LEARNER_SELECTION_CONTRACT
     )
+    selection = current_science.learner_production_selection()
+    assert selection["initialization"]["mode"] == "parent_fresh_optimizer"
+    assert selection["initialization"]["optimizer_state"] == "fresh"
+    assert selection["execution_topology"]["world_size"] == 8
+    assert selection["execution_topology"]["global_batch_size"] == 512
+    assert selection["execution_topology"]["go_authorized"] is False
+    learner = current_science.learner()
+    assert "initialization" not in learner
+    assert "execution_topology" not in learner
+    assert "training_recipe" not in learner
+    assert learner["research_scratch_initialization"]["mode"] == "from_scratch"
     assert current_science.require_selected_parent_update(
         current_science.CANONICAL_PARENT_UPDATE_CONFIG_PATH
     ) == current_science.CANONICAL_PARENT_UPDATE_CONFIG_PATH.resolve()
@@ -131,7 +142,7 @@ def test_current_contract_rejects_non_scratch_v6_initialization(
     tmp_path, monkeypatch, field: str, bad_value
 ) -> None:
     contract = copy.deepcopy(current_science.load())
-    contract["learner"]["initialization"][field] = bad_value
+    contract["learner"]["research_scratch_initialization"][field] = bad_value
     path = tmp_path / "science.contract.json"
     path.write_text(json.dumps(contract), encoding="utf-8")
     monkeypatch.setattr(current_science, "CONTRACT_PATH", path)
@@ -146,12 +157,16 @@ def test_current_contract_rejects_non_scratch_v6_initialization(
 @pytest.mark.parametrize(
     ("section", "field", "bad_value"),
     (
-        ("model_construction", "static_action_residual", False),
-        ("model_construction", "action_target_gather", False),
-        ("model_construction", "max_parameter_count", 40_000_000),
-        ("model_construction", "entity_feature_adapter_version", "legacy"),
-        ("execution_topology", "world_size", 4),
-        ("execution_topology", "local_batch_size", 1024),
+        ("research_scratch_model_construction", "static_action_residual", False),
+        ("research_scratch_model_construction", "action_target_gather", False),
+        ("research_scratch_model_construction", "max_parameter_count", 40_000_000),
+        (
+            "research_scratch_model_construction",
+            "entity_feature_adapter_version",
+            "legacy",
+        ),
+        ("research_scratch_execution_topology", "world_size", 4),
+        ("research_scratch_execution_topology", "local_batch_size", 1024),
     ),
 )
 def test_current_contract_rejects_scratch_construction_or_topology_drift(
@@ -183,6 +198,24 @@ def test_current_contract_rejects_ambiguous_production_learner_selection(
     with pytest.raises(
         current_science.ScienceContractError,
         match="production learner selection drifted",
+    ):
+        current_science.load()
+
+
+def test_current_contract_rejects_parent_update_admission_becoming_implicit(
+    tmp_path, monkeypatch
+) -> None:
+    admission = json.loads(
+        current_science.TRAINING_SCIENCE_ADMISSION_PATH.read_text(encoding="utf-8")
+    )
+    admission["recipes"]["a1-parent-update-35m-b200"]["authorized"] = True
+    path = tmp_path / "training_science_admission.json"
+    path.write_text(json.dumps(admission), encoding="utf-8")
+    monkeypatch.setattr(current_science, "TRAINING_SCIENCE_ADMISSION_PATH", path)
+
+    with pytest.raises(
+        current_science.ScienceContractError,
+        match="must remain exact and fail-closed",
     ):
         current_science.load()
 
@@ -328,7 +361,7 @@ def test_current_contract_rejects_diagnostic_training_settings(
     tmp_path, monkeypatch, field: str, diagnostic_value
 ) -> None:
     contract = copy.deepcopy(current_science.load())
-    contract["learner"]["training_recipe"][field] = diagnostic_value
+    contract["learner"]["research_scratch_training_recipe"][field] = diagnostic_value
     path = tmp_path / "science.contract.json"
     path.write_text(json.dumps(contract), encoding="utf-8")
     monkeypatch.setattr(current_science, "CONTRACT_PATH", path)
@@ -344,8 +377,12 @@ def test_current_contract_rejects_diagnostic_policy_aux_leak(
     tmp_path, monkeypatch
 ) -> None:
     contract = copy.deepcopy(current_science.load())
-    contract["learner"]["training_recipe"]["policy_aux_active_batch_size"] = 128
-    contract["learner"]["training_recipe"]["policy_aux_loss_weight"] = 0.25
+    contract["learner"]["research_scratch_training_recipe"][
+        "policy_aux_active_batch_size"
+    ] = 128
+    contract["learner"]["research_scratch_training_recipe"][
+        "policy_aux_loss_weight"
+    ] = 0.25
     path = tmp_path / "science.contract.json"
     path.write_text(json.dumps(contract), encoding="utf-8")
     monkeypatch.setattr(current_science, "CONTRACT_PATH", path)
@@ -368,7 +405,7 @@ def test_current_contract_rejects_unsafe_target_quality_learner_drift(
     tmp_path, monkeypatch, field: str, bad_value
 ) -> None:
     contract = copy.deepcopy(current_science.load())
-    contract["learner"]["training_recipe"][field] = bad_value
+    contract["learner"]["research_scratch_training_recipe"][field] = bad_value
     path = tmp_path / "science.contract.json"
     path.write_text(json.dumps(contract), encoding="utf-8")
     monkeypatch.setattr(current_science, "CONTRACT_PATH", path)
@@ -393,7 +430,7 @@ def test_current_contract_rejects_unqualified_search_value_targets(
     tmp_path, monkeypatch, field: str, bad_value
 ) -> None:
     contract = copy.deepcopy(current_science.load())
-    contract["learner"]["training_recipe"][field] = bad_value
+    contract["learner"]["research_scratch_training_recipe"][field] = bad_value
     path = tmp_path / "science.contract.json"
     path.write_text(json.dumps(contract), encoding="utf-8")
     monkeypatch.setattr(current_science, "CONTRACT_PATH", path)

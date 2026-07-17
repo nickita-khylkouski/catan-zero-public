@@ -1207,6 +1207,7 @@ LOADER_KEYS: tuple[str, ...] = (
     "decision_index",
     "action_mask_version",
     "adapter_version",
+    "actor_resource_counts",
     "winner",
     "terminated",
     "truncated",

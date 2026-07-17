@@ -1,5 +1,5 @@
 {
-  "schema_version": "a1-current-science-contract-v2",
+  "schema_version": "a1-current-science-contract-v3",
   "contract_id": "a1-next-wave-coherent-public-v4",
   "operator_selection": {
     "status": "adopted_teacher_campaign",
@@ -120,7 +120,40 @@
       "recipe": "a1-parent-update-35m-b200",
       "config_path": "configs/training/a1_parent_update_35m_b200.schema1.json",
       "config_canonical_sha256": "2dfcc1b95a37d7e292bc5f1bc182950523a791274461e4518bc71e28d45fbe75",
-      "scratch_status": "research_only_unresolved_not_selected"
+      "initialization": {
+        "mode": "parent_fresh_optimizer",
+        "binding_schema": "a1-canonical-parent-initializer-v1",
+        "parent_checkpoint": "required_runtime_input",
+        "init_checkpoint": "required_runtime_input",
+        "architecture_upgrade_receipt": "required_if_checkpoint_bytes_differ",
+        "entity_feature_adapter_version": "rust_entity_adapter_v6_exact_actor_resources_initial_road_two_hop",
+        "optimizer_state": "fresh"
+      },
+      "execution_topology": {
+        "schema_version": "a1-canonical-parent-update-topology-v1",
+        "launcher": "tools/train.py",
+        "distributed_launcher": "torch.distributed.run",
+        "name": "b200-8gpu-ddp",
+        "required_accelerator_model": "NVIDIA B200",
+        "world_size": 8,
+        "physical_gpus": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7
+        ],
+        "local_batch_size": 64,
+        "grad_accum_steps": 1,
+        "global_batch_size": 512,
+        "go_authorized": false,
+        "authorization_authority": "configs/production/training_science_admission.json",
+        "authorization_reason": "commissioned_b12_invalidated_by_adapter_v5_information_aliasing"
+      },
+      "research_scratch_status": "research_only_unresolved_not_selected"
     },
     "value_objective": {
       "objective": "binary_win_bce",
@@ -128,7 +161,7 @@
       "value_categorical_bins": null,
       "hlgauss_sigma_ratio": null
     },
-    "initialization": {
+    "research_scratch_initialization": {
       "mode": "from_scratch",
       "entity_feature_adapter_version": "rust_entity_adapter_v6_exact_actor_resources_initial_road_two_hop",
       "checkpoint": null,
@@ -136,7 +169,7 @@
     },
     "architecture_upgrade_flags": "structured_action_value,card_count_v2,meaningful_history,history_target_gather,action_target_gather,legal_set_statistics,public_rule_state,topology,value_tower_split1",
     "architecture_upgrade_module": "entity_graph.topology_residual_adapter+action_target_gather+static_action_residual+legal_action_value_residual+legal_action_value_set_statistics+public_card_count_features+meaningful_public_history+meaningful_history_target_gather+actor_public_rule_state.v5+value_tower_split1",
-    "model_construction": {
+    "research_scratch_model_construction": {
       "arch": "entity_graph",
       "hidden_size": 640,
       "graph_tokens": null,
@@ -166,7 +199,7 @@
       "min_parameter_count": 42500000,
       "max_parameter_count": 43000000
     },
-    "execution_topology": {
+    "research_scratch_execution_topology": {
       "schema_version": "a1-scratch-training-topology-v1",
       "launcher": "torch.distributed.run",
       "name": "b200-8gpu-ddp",
@@ -181,8 +214,8 @@
       "go_authorized": false,
       "reviewed_optimizer_schedule_role": "candidate_horizon_pending_optimizer_and_value_routing_evidence_v1"
     },
-    "topology": "b200-8gpu-ddp",
-    "training_recipe": {
+    "research_scratch_topology": "b200-8gpu-ddp",
+    "research_scratch_training_recipe": {
       "track": "2p_no_trade",
       "vps_to_win": 10,
       "graph_history_features": true,

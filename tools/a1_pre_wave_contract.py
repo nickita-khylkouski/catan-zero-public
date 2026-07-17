@@ -10127,6 +10127,331 @@ def _require_v3_structured_action_resource_semantics(
     return scan
 
 
+_EVENT_ACTION_TYPE_OFFSET = 17
+_EVENT_TARGET_NAMESPACE_WIDTHS = np.asarray((19, 54, 72, 4), dtype=np.int64)
+_EVENT_SPATIAL_TARGET_COLUMN = {
+    "BUILD_SETTLEMENT": 1,
+    "BUILD_CITY": 1,
+    "BUILD_ROAD": 2,
+    "MOVE_ROBBER": 0,
+}
+
+
+def _require_meaningful_event_target_semantics(
+    event_tokens: np.ndarray,
+    event_mask: np.ndarray,
+    event_targets: np.ndarray,
+    *,
+    where: str,
+) -> dict[str, Any]:
+    """Authenticate meaningful-history target ids against encoded actions.
+
+    The target columns use four local namespaces: hex, vertex, edge, player.
+    Padding must contain only ``-1``.  Active spatial actions must carry the
+    target required by their public action type; non-spatial public actions
+    must not smuggle an unrelated entity id into the target-gather path.
+    """
+
+    invalid = (event_targets < -1) | (
+        event_targets >= _EVENT_TARGET_NAMESPACE_WIDTHS.reshape(1, 1, 4)
+    )
+    if np.any(invalid):
+        row, event, column = np.argwhere(invalid)[0]
+        raise ContractError(
+            f"{where}: event_target_ids contains an out-of-range local id: "
+            f"row={int(row)} event={int(event)} column={int(column)} "
+            f"value={int(event_targets[row, event, column])} "
+            f"namespace_width={int(_EVENT_TARGET_NAMESPACE_WIDTHS[column])}"
+        )
+    padded_has_target = (~event_mask)[..., None] & (event_targets != -1)
+    if np.any(padded_has_target):
+        row, event, column = np.argwhere(padded_has_target)[0]
+        raise ContractError(
+            f"{where}: padded public-history event carries a target id: "
+            f"row={int(row)} event={int(event)} column={int(column)}"
+        )
+
+    action_stop = _EVENT_ACTION_TYPE_OFFSET + len(ACTION_TYPES)
+    if event_tokens.shape[2] < action_stop:
+        raise ContractError(
+            f"{where}: meaningful event tokens are too narrow for the sealed "
+            f"action taxonomy: {event_tokens.shape[2]} < {action_stop}"
+        )
+    active_actions = event_tokens[
+        ..., _EVENT_ACTION_TYPE_OFFSET:action_stop
+    ][event_mask]
+    if active_actions.size and (
+        np.any((active_actions != 0.0) & (active_actions != 1.0))
+        or np.any(np.sum(active_actions, axis=1) != 1.0)
+    ):
+        raise ContractError(
+            f"{where}: active meaningful events must carry exactly one "
+            "one-hot action type"
+        )
+
+    action_type_counts: Counter[str] = Counter()
+    target_action_type_counts: Counter[str] = Counter()
+    for row, event in np.argwhere(event_mask):
+        action_index = int(
+            np.flatnonzero(
+                event_tokens[
+                    row,
+                    event,
+                    _EVENT_ACTION_TYPE_OFFSET:action_stop,
+                ]
+            )[0]
+        )
+        action_type = ACTION_TYPES[action_index]
+        action_type_counts[action_type] += 1
+        targets = event_targets[row, event]
+        expected_column = _EVENT_SPATIAL_TARGET_COLUMN.get(action_type)
+        if expected_column is None:
+            if np.any(targets != -1):
+                raise ContractError(
+                    f"{where}: non-spatial public-history action {action_type} "
+                    f"carries entity targets at row={int(row)} event={int(event)}"
+                )
+            continue
+        if int(targets[expected_column]) < 0:
+            raise ContractError(
+                f"{where}: public-history action {action_type} is missing its "
+                f"namespace-{expected_column} target at row={int(row)} "
+                f"event={int(event)}"
+            )
+        allowed_columns = {expected_column}
+        if action_type == "MOVE_ROBBER":
+            # A public robber move always binds the hex.  A victim is optional.
+            allowed_columns.add(3)
+        unexpected = [
+            column
+            for column in range(4)
+            if column not in allowed_columns and int(targets[column]) != -1
+        ]
+        if unexpected:
+            raise ContractError(
+                f"{where}: public-history action {action_type} carries targets "
+                f"in unexpected namespaces {unexpected} at row={int(row)} "
+                f"event={int(event)}"
+            )
+        target_action_type_counts[action_type] += 1
+
+        # Slot 14 is the historical public spatial-id scalar.  Bind it to the
+        # same local id so target gather and the legacy token cannot disagree.
+        expected_scalar = np.float16(
+            int(targets[expected_column])
+            / int(_EVENT_TARGET_NAMESPACE_WIDTHS[expected_column])
+        )
+        if event_tokens[row, event, 14].view(np.uint16) != expected_scalar.view(
+            np.uint16
+        ):
+            raise ContractError(
+                f"{where}: public-history spatial scalar disagrees with "
+                f"event_target_ids at row={int(row)} event={int(event)}"
+            )
+
+    scan = {
+        "schema": "training-meaningful-public-event-target-scan-v1",
+        "active_event_count": int(np.count_nonzero(event_mask)),
+        "target_bearing_event_count": int(sum(target_action_type_counts.values())),
+        "action_type_counts": dict(sorted(action_type_counts.items())),
+        "target_action_type_counts": dict(
+            sorted(target_action_type_counts.items())
+        ),
+        "invalid_target_count": 0,
+        "padded_target_count": 0,
+    }
+    scan["scan_sha256"] = _digest_value(scan)
+    return scan
+
+
+def _require_v6_initial_road_two_hop_semantics(
+    payload: Any,
+    *,
+    rows: int,
+    action_catalog: ActionCatalog,
+    where: str,
+) -> dict[str, Any]:
+    """Recompute v6 opening-road context slot 16 from shard board tensors."""
+
+    # ``phase`` is a base shard column and is independently required by the
+    # selected-row telemetry audit.  Keeping the zero-row path lightweight
+    # preserves direct feature-semantic fixtures that contain no game rows.
+    if "phase" not in payload.files:
+        scan = {
+            "schema": "training-v6-initial-road-two-hop-scan-v1",
+            "initial_road_row_count": 0,
+            "checked_action_count": 0,
+            "mismatch_count": 0,
+        }
+        scan["scan_sha256"] = _digest_value(scan)
+        return scan
+    phases = np.asarray(payload["phase"]).astype(str)
+    if phases.shape != (rows,):
+        raise ContractError(f"{where}: phase is not row-aligned")
+    initial_rows = np.flatnonzero(phases == "BUILD_INITIAL_ROAD")
+    if not initial_rows.size:
+        scan = {
+            "schema": "training-v6-initial-road-two-hop-scan-v1",
+            "initial_road_row_count": 0,
+            "checked_action_count": 0,
+            "mismatch_count": 0,
+        }
+        scan["scan_sha256"] = _digest_value(scan)
+        return scan
+
+    required = {
+        "legal_action_ids",
+        "legal_action_mask",
+        "legal_action_context",
+        "legal_action_target_ids",
+        "vertex_tokens",
+        "edge_tokens",
+        "edge_vertex_ids",
+    }
+    missing = sorted(required.difference(payload.files))
+    if missing:
+        raise ContractError(
+            f"{where}: adapter-v6 initial-road admission is missing columns {missing}"
+        )
+    legal_ids = np.asarray(payload["legal_action_ids"])
+    legal_mask = np.asarray(payload["legal_action_mask"])
+    context = np.asarray(payload["legal_action_context"])
+    target_ids = np.asarray(payload["legal_action_target_ids"])
+    vertex_tokens = np.asarray(payload["vertex_tokens"])
+    edge_tokens = np.asarray(payload["edge_tokens"])
+    edge_vertex_ids = np.asarray(payload["edge_vertex_ids"])
+    if (
+        legal_ids.ndim != 2
+        or legal_ids.shape[0] != rows
+        or legal_mask.shape != legal_ids.shape
+        or context.ndim != 3
+        or context.shape[:2] != legal_ids.shape
+        or context.shape[2] < 17
+        or target_ids.shape != (*legal_ids.shape, 4)
+        or vertex_tokens.shape[:2] != (rows, 54)
+        or vertex_tokens.ndim != 3
+        or vertex_tokens.shape[2] < 24
+        or edge_tokens.shape[:2] != (rows, 72)
+        or edge_tokens.ndim != 3
+        or edge_tokens.shape[2] < 8
+        or edge_vertex_ids.shape != (rows, 72, 2)
+    ):
+        raise ContractError(
+            f"{where}: adapter-v6 initial-road tensors are not shape-aligned"
+        )
+    if (
+        legal_ids.dtype.kind not in "iu"
+        or legal_mask.dtype.kind != "b"
+        or target_ids.dtype.kind not in "iu"
+        or edge_vertex_ids.dtype.kind not in "iu"
+        or context.dtype != np.dtype(np.float16)
+        or vertex_tokens.dtype != np.dtype(np.float16)
+        or edge_tokens.dtype != np.dtype(np.float16)
+        or np.any(~np.isfinite(context))
+        or np.any(~np.isfinite(vertex_tokens))
+        or np.any(~np.isfinite(edge_tokens))
+    ):
+        raise ContractError(
+            f"{where}: adapter-v6 initial-road tensors violate exact dtype/finite "
+            "requirements"
+        )
+
+    checked_actions = 0
+    for row in initial_rows.tolist():
+        vertices = vertex_tokens[row]
+        edges = edge_tokens[row]
+        topology_pairs = edge_vertex_ids[row]
+        pair_to_edge: dict[tuple[int, int], int] = {}
+        neighbors: dict[int, set[int]] = {node: set() for node in range(54)}
+        for edge_id, raw_pair in enumerate(topology_pairs):
+            first, second = (int(raw_pair[0]), int(raw_pair[1]))
+            if not (0 <= first < 54 and 0 <= second < 54 and first != second):
+                continue
+            pair = tuple(sorted((first, second)))
+            pair_to_edge[pair] = edge_id
+            neighbors[first].add(second)
+            neighbors[second].add(first)
+        occupied_nodes = set(
+            np.flatnonzero((vertices[:, 7] == 1.0) | (vertices[:, 8] == 1.0)).tolist()
+        )
+        occupied_edges = set(
+            np.flatnonzero(np.any(edges[:, 2:6] == 1.0, axis=1)).tolist()
+        )
+        for column in np.flatnonzero(legal_mask[row]).tolist():
+            action_id = int(legal_ids[row, column])
+            if not 0 <= action_id < action_catalog.size:
+                raise ContractError(
+                    f"{where}: initial-road legal action id {action_id} is outside "
+                    "the sealed action catalog"
+                )
+            descriptor = action_catalog.descriptor(action_id)
+            if descriptor.action_type != "BUILD_ROAD":
+                raise ContractError(
+                    f"{where}: BUILD_INITIAL_ROAD row carries non-road legal "
+                    f"action {descriptor.action_type}"
+                )
+            endpoints = tuple(int(node) for node in descriptor.value)
+            if len(endpoints) != 2:
+                raise ContractError(f"{where}: malformed initial-road edge descriptor")
+            pair = tuple(sorted(endpoints))
+            edge_id = int(target_ids[row, column, 2])
+            if (
+                edge_id < 0
+                or edge_id >= 72
+                or pair_to_edge.get(pair) != edge_id
+                or np.any(target_ids[row, column, (0, 1, 3)] != -1)
+            ):
+                raise ContractError(
+                    f"{where}: initial-road action target does not bind its sealed "
+                    f"edge at row={row} action={column}"
+                )
+            origins = [node for node in endpoints if vertices[node, 23] == 1.0]
+            if len(origins) != 1:
+                raise ContractError(
+                    f"{where}: initial-road edge must touch exactly one actor "
+                    f"settlement at row={row} action={column}"
+                )
+            origin = origins[0]
+            frontier = endpoints[1] if endpoints[0] == origin else endpoints[0]
+            scores: list[np.float16] = []
+            if frontier not in occupied_nodes:
+                for target in neighbors.get(frontier, set()):
+                    if target == origin or target in occupied_nodes:
+                        continue
+                    next_edge = pair_to_edge.get(tuple(sorted((frontier, target))))
+                    if next_edge is None or next_edge in occupied_edges:
+                        continue
+                    if any(
+                        neighbor in occupied_nodes
+                        for neighbor in neighbors.get(target, set())
+                    ):
+                        continue
+                    scores.append(np.float16(vertices[target, 9]))
+            expected = max(scores, default=np.float16(0.0))
+            observed = np.float16(context[row, column, 16])
+            if observed.view(np.uint16) != expected.view(np.uint16):
+                raise ContractError(
+                    f"{where}: adapter-v6 initial-road two-hop context drift at "
+                    f"row={row} action={column}; observed={float(observed)} "
+                    f"expected={float(expected)}"
+                )
+            if np.float16(context[row, column, 12]) != np.float16(1.0):
+                raise ContractError(
+                    f"{where}: BUILD_INITIAL_ROAD context lacks the initial-phase "
+                    f"marker at row={row} action={column}"
+                )
+            checked_actions += 1
+
+    scan = {
+        "schema": "training-v6-initial-road-two-hop-scan-v1",
+        "initial_road_row_count": int(initial_rows.size),
+        "checked_action_count": int(checked_actions),
+        "mismatch_count": 0,
+    }
+    scan["scan_sha256"] = _digest_value(scan)
+    return scan
+
+
 def _require_shard_feature_semantics(
     payload: Any,
     *,
@@ -10154,7 +10479,7 @@ def _require_shard_feature_semantics(
     expected_adapter = str(authority["entity_feature_adapter_version"])
     required = {"adapter_version", "event_tokens", "event_mask", "event_target_ids"}
     if expected_adapter == RUST_ENTITY_ADAPTER_V6:
-        required.add("player_tokens")
+        required.update({"player_tokens", "actor_resource_counts"})
     missing = sorted(required.difference(payload.files))
     if missing:
         raise ContractError(
@@ -10187,8 +10512,19 @@ def _require_shard_feature_semantics(
             raise ContractError(
                 f"{where}: adapter-v6 player_tokens contain non-finite values"
             )
+        actor_resource_counts = np.asarray(payload["actor_resource_counts"])
+        if actor_resource_counts.shape != (rows, 5):
+            raise ContractError(
+                f"{where}: adapter-v6 actor_resource_counts shape "
+                f"{actor_resource_counts.shape} differs from {(rows, 5)}"
+            )
+        if actor_resource_counts.dtype.kind not in "iu":
+            raise ContractError(
+                f"{where}: adapter-v6 actor_resource_counts must be integer"
+            )
         invalid_rows, checked_rows = v6_actor_resource_identity_violations(
-            player_tokens
+            player_tokens,
+            actor_resource_counts=actor_resource_counts,
         )
         if checked_rows != rows:
             raise ContractError(
@@ -10199,7 +10535,8 @@ def _require_shard_feature_semantics(
             raise ContractError(
                 f"{where}: adapter-v6 actor-resource identity failed after "
                 "physical-scale decoding: exactly one actor is required and "
-                "actor total slot 6 must equal sum slots 16:21; "
+                "actor total slot 6 must equal sum slots 16:21 and decoded "
+                "composition must match authoritative actor_resource_counts; "
                 f"invalid_rows={invalid_rows}/{checked_rows}"
             )
         actor_resource_scan = {
@@ -10222,6 +10559,16 @@ def _require_shard_feature_semantics(
             RUST_ENTITY_ADAPTER_V5,
             RUST_ENTITY_ADAPTER_V6,
         }
+        else None
+    )
+    initial_road_two_hop_scan = (
+        _require_v6_initial_road_two_hop_semantics(
+            payload,
+            rows=rows,
+            action_catalog=action_catalog,
+            where=where,
+        )
+        if expected_adapter == RUST_ENTITY_ADAPTER_V6
         else None
     )
 
@@ -10250,6 +10597,23 @@ def _require_shard_feature_semantics(
         raise ContractError(f"{where}: event tensor dtypes violate the entity schema")
     if np.any(~np.isfinite(event_tokens)):
         raise ContractError(f"{where}: event_tokens contain non-finite values")
+    invalid_event_targets = (event_targets < -1) | (
+        event_targets >= _EVENT_TARGET_NAMESPACE_WIDTHS.reshape(1, 1, 4)
+    )
+    if np.any(invalid_event_targets):
+        row, event, column = np.argwhere(invalid_event_targets)[0]
+        raise ContractError(
+            f"{where}: event_target_ids contains an out-of-range local id: "
+            f"row={int(row)} event={int(event)} column={int(column)}"
+        )
+    if np.any((~event_mask)[..., None] & (event_targets != -1)):
+        row, event, column = np.argwhere(
+            (~event_mask)[..., None] & (event_targets != -1)
+        )[0]
+        raise ContractError(
+            f"{where}: padded public-history event carries a target id: "
+            f"row={int(row)} event={int(event)} column={int(column)}"
+        )
     if meaningful_public_history:
         if int(event_history_limit) != int(authority["history_limit"]):
             raise ContractError(f"{where}: unreviewed event-history limit")
@@ -10263,6 +10627,12 @@ def _require_shard_feature_semantics(
             raise ContractError(
                 f"{where}: event token active markers disagree with event_mask"
             )
+        event_target_scan = _require_meaningful_event_target_semantics(
+            event_tokens,
+            event_mask,
+            event_targets,
+            where=where,
+        )
         scan = {
             "schema": "training-meaningful-public-event-mask-scan-v1",
             "row_count": rows,
@@ -10275,14 +10645,20 @@ def _require_shard_feature_semantics(
             "entity_feature_adapter_version": expected_adapter,
             "actor_resource_identity": actor_resource_scan,
             "structured_action_resources": structured_action_resource_scan,
+            "initial_road_two_hop": initial_road_two_hop_scan,
             "event_history": {
                 "authenticated_empty": False,
                 "semantic": authority["event_history_semantic"],
                 "event_mask_scan": scan,
+                "event_target_scan": event_target_scan,
             },
         }
     if np.any(event_mask):
         raise ContractError(f"{where}: authenticated-empty event_mask has live entries")
+    if np.any(event_targets != -1):
+        raise ContractError(
+            f"{where}: authenticated-empty event history carries target ids"
+        )
     empty_scan = {
         "schema": "training-empty-event-mask-scan-v1",
         "row_count": rows,
@@ -10295,6 +10671,7 @@ def _require_shard_feature_semantics(
         "entity_feature_adapter_version": expected_adapter,
         "actor_resource_identity": actor_resource_scan,
         "structured_action_resources": structured_action_resource_scan,
+        "initial_road_two_hop": initial_road_two_hop_scan,
         "event_history": {
             "authenticated_empty": True,
             "empty_event_mask_scan": empty_scan,
@@ -11128,6 +11505,10 @@ def audit_outputs(
     active_legal_action_count = 0
     event_history_width_counts: Counter[int] = Counter()
     event_history_nonzero_mask_count = 0
+    event_target_action_type_counts: Counter[str] = Counter()
+    event_target_bearing_count = 0
+    initial_road_row_count = 0
+    initial_road_checked_action_count = 0
     actor_playable_card_counts: dict[str, Counter[str]] = {}
     public_award_generation_manifests = 0
     public_award_worker_manifests = 0
@@ -11538,7 +11919,10 @@ def audit_outputs(
                         expected_adapter_version=expected_learner_adapter,
                     )
                     actor_playable_scan: dict[str, Any] | None = None
-                    if expected_learner_adapter == RUST_ENTITY_ADAPTER_V5:
+                    if expected_learner_adapter in {
+                        RUST_ENTITY_ADAPTER_V5,
+                        RUST_ENTITY_ADAPTER_V6,
+                    }:
                         try:
                             actor_playable_scan = (
                                 audit_actor_playable_development_cards(
@@ -11592,6 +11976,24 @@ def audit_outputs(
                     event_history_nonzero_mask_count += int(
                         event_scan["nonzero_event_mask_count"]
                     )
+                    if meaningful_public_history:
+                        target_scan = feature_semantics["event_history"][
+                            "event_target_scan"
+                        ]
+                        event_target_bearing_count += int(
+                            target_scan["target_bearing_event_count"]
+                        )
+                        event_target_action_type_counts.update(
+                            target_scan["target_action_type_counts"]
+                        )
+                    initial_road_scan = feature_semantics["initial_road_two_hop"]
+                    if initial_road_scan is not None:
+                        initial_road_row_count += int(
+                            initial_road_scan["initial_road_row_count"]
+                        )
+                        initial_road_checked_action_count += int(
+                            initial_road_scan["checked_action_count"]
+                        )
                     data_shard_record["feature_semantics_sha256"] = _digest_value(
                         feature_semantics
                     )
@@ -12092,7 +12494,10 @@ def audit_outputs(
         aggregate_structured_resource_scan
     )
     aggregate_actor_playable_scan: dict[str, Any] | None = None
-    if expected_learner_adapter == RUST_ENTITY_ADAPTER_V5:
+    if expected_learner_adapter in {
+        RUST_ENTITY_ADAPTER_V5,
+        RUST_ENTITY_ADAPTER_V6,
+    }:
         aggregate_actor_playable_scan = {
             "schema_version": (
                 "actor-playable-development-card-wave-admission-v1"
@@ -12115,6 +12520,31 @@ def audit_outputs(
         aggregate_actor_playable_scan["scan_sha256"] = _digest_value(
             aggregate_actor_playable_scan
         )
+    aggregate_event_target_scan: dict[str, Any] | None = None
+    if meaningful_public_history:
+        aggregate_event_target_scan = {
+            "schema": "training-meaningful-public-event-target-aggregate-v1",
+            "target_bearing_event_count": event_target_bearing_count,
+            "target_action_type_counts": dict(
+                sorted(event_target_action_type_counts.items())
+            ),
+            "invalid_target_count": 0,
+            "padded_target_count": 0,
+        }
+        aggregate_event_target_scan["scan_sha256"] = _digest_value(
+            aggregate_event_target_scan
+        )
+    aggregate_initial_road_scan: dict[str, Any] | None = None
+    if expected_learner_adapter == RUST_ENTITY_ADAPTER_V6:
+        aggregate_initial_road_scan = {
+            "schema": "training-v6-initial-road-two-hop-aggregate-v1",
+            "initial_road_row_count": initial_road_row_count,
+            "checked_action_count": initial_road_checked_action_count,
+            "mismatch_count": 0,
+        }
+        aggregate_initial_road_scan["scan_sha256"] = _digest_value(
+            aggregate_initial_road_scan
+        )
     feature_semantics_report: dict[str, Any] = {
         "public_award_feature_provenance": {
             "expected": expected_public_award_provenance,
@@ -12132,6 +12562,7 @@ def audit_outputs(
         },
         "structured_action_resources": aggregate_structured_resource_scan,
         "actor_playable_development_cards": aggregate_actor_playable_scan,
+        "initial_road_two_hop": aggregate_initial_road_scan,
         "event_history": {
             **event_authority,
             "authenticated_empty": not meaningful_public_history,
@@ -12150,6 +12581,7 @@ def audit_outputs(
                 if meaningful_public_history
                 else "empty_event_mask_scan"
             ): aggregate_event_scan,
+            "event_target_scan": aggregate_event_target_scan,
         },
     }
     feature_semantics_report["feature_semantics_sha256"] = _digest_value(

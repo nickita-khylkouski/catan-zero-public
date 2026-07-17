@@ -151,9 +151,16 @@ def test_v6_training_batch_binds_decoder_and_admission_identity(monkeypatch):
     train_bc._entity_batch(data, np.asarray([0], dtype=np.int64))
     assert observed["adapter"] == RUST_ENTITY_ADAPTER_V6
 
+    authoritative = np.asarray([[11, 10, 0, 0, 0]], dtype=np.int16)
     assert train_bc.v6_actor_resource_identity_violations(
-        data["player_tokens"]
+        data["player_tokens"], actor_resource_counts=authoritative
     ) == (0, 1)
+    wrong_authoritative = authoritative.copy()
+    wrong_authoritative[0, 0] -= 1
+    wrong_authoritative[0, 2] += 1
+    assert train_bc.v6_actor_resource_identity_violations(
+        data["player_tokens"], actor_resource_counts=wrong_authoritative
+    ) == (1, 1)
     broken = data["player_tokens"].copy()
     broken[0, 0, 6] = np.float16(20.0 / 95.0)
     assert train_bc.v6_actor_resource_identity_violations(broken) == (1, 1)

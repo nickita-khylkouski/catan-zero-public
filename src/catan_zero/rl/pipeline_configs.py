@@ -202,15 +202,17 @@ class PipelineConfig:
 class TrainConfig(PipelineConfig):
     """Science-critical training knobs from ``tools/train_bc.py``.
 
-    Defaults mirror the argparse defaults in ``build_arg_parser``/``main`` as of
-    CAT-66. ``hidden_size`` defaults to ``None`` here because train_bc resolves
-    it from ``--arch`` after parsing; ``from_namespace`` is called after that
-    resolution so the recorded value is the effective width.
+    Defaults mirror the internal engine defaults. The supported learner starts
+    from the canonical entity-token architecture and streamed memmap corpus;
+    legacy architectures and the whole-corpus NPZ loader require an explicit
+    non-production recipe. ``hidden_size`` defaults to ``None`` here because
+    train_bc resolves it from ``--arch`` after parsing; ``from_namespace`` is
+    called after that resolution so the recorded value is the effective width.
     """
 
     PIPELINE: ClassVar[str] = "train"
 
-    arch: str = "candidate"
+    arch: str = "entity_graph"
     # Input identities belong in the science hash: changing the corpus or the
     # warm-start source changes the experiment even when every optimizer flag is
     # identical. Output checkpoint/report paths are intentionally excluded.
@@ -221,7 +223,7 @@ class TrainConfig(PipelineConfig):
     grow_from_checkpoint: str = ""
     grow_from_checkpoint_sha256: str = ""
     resume_optimizer: bool = False
-    data_format: str = "npz"
+    data_format: str = "memmap"
     # Distributed execution can change the optimizer trajectory.  Keep these in
     # the typed identity in addition to train_bc's resume-only topology fields so
     # standalone config hashes never collapse distinct learner geometries.

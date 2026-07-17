@@ -324,7 +324,9 @@ def test_current_v3_requires_selected_parent_update_in_one_dose_orchestrator(
         lambda _search: True,
     )
     learner = iteration.current_science.learner()
-    learner["topology"] = iteration.one_dose.LEGACY_SINGLE_GPU_TOPOLOGY
+    learner["production_selection"]["execution_topology"]["name"] = (
+        iteration.one_dose.LEGACY_SINGLE_GPU_TOPOLOGY
+    )
     monkeypatch.setattr(iteration.current_science, "learner", lambda: learner)
 
     with pytest.raises(

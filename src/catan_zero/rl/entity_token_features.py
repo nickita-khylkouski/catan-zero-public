@@ -152,15 +152,18 @@ def mask_player_tokens_public(player_tokens: np.ndarray) -> np.ndarray:
 def v6_actor_resource_identity_violations(
     player_tokens: object,
     *,
+    actor_resource_counts: object | None = None,
     chunk_size: int = 65_536,
 ) -> tuple[int, int]:
     """Return ``(invalid_rows, checked_rows)`` for adapter-v6 card identity.
 
     V6 stores an actor's public total on the physical 95-card scale and its
     visible five-resource composition on the physical 19-card scale. Decoding
-    those integer counts must preserve ``total == sum(composition)``. Exactly
-    one actor and finite identity inputs are required per row. Chunking keeps
-    admission bounded for memmap corpora.
+    those integer counts must preserve ``total == sum(composition)``. When the
+    independent authoritative ``actor_resource_counts`` witness is supplied,
+    the decoded composition must also match it exactly. Exactly one actor and
+    finite identity inputs are required per row. Chunking keeps admission
+    bounded for memmap corpora.
 
     Invalid tensor shapes return ``(0, 0)`` so callers can report their own
     schema-specific shape error before relying on the checked-row count.
@@ -168,6 +171,9 @@ def v6_actor_resource_identity_violations(
 
     shape = tuple(getattr(player_tokens, "shape", ()))
     if len(shape) != 3 or shape[1] < 1 or shape[2] < PLAYER_FEATURE_SIZE:
+        return 0, 0
+    witness_shape = tuple(getattr(actor_resource_counts, "shape", ()))
+    if actor_resource_counts is not None and witness_shape != (shape[0], 5):
         return 0, 0
     invalid_rows = 0
     checked_rows = 0
@@ -184,6 +190,23 @@ def v6_actor_resource_identity_violations(
         composition = np.rint(actor_rows[:, 16:21] * 19.0).sum(axis=1)
         finite = np.isfinite(rows).all(axis=(1, 2))
         valid = one_actor & finite & (totals == composition)
+        if actor_resource_counts is not None:
+            witness_raw = np.asarray(
+                actor_resource_counts[start : start + int(chunk_size)]
+            )
+            if witness_raw.dtype.kind not in "iuf":
+                witness = np.zeros(witness_raw.shape, dtype=np.int64)
+                witness_valid = np.zeros(witness_raw.shape[0], dtype=np.bool_)
+            else:
+                witness = witness_raw.astype(np.int64, copy=False)
+                witness_valid = (
+                    np.isfinite(witness_raw).all(axis=1)
+                    & (witness_raw == witness).all(axis=1)
+                    & (witness >= 0).all(axis=1)
+                    & (witness <= 19).all(axis=1)
+                )
+            decoded = np.rint(actor_rows[:, 16:21] * 19.0).astype(np.int64)
+            valid &= witness_valid & (decoded == witness).all(axis=1)
         invalid_rows += int(np.count_nonzero(~valid))
         checked_rows += int(rows.shape[0])
     return invalid_rows, checked_rows

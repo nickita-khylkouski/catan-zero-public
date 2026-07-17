@@ -35,7 +35,10 @@ GENERATOR_GUARD_PATH = (
 CANONICAL_PARENT_UPDATE_CONFIG_PATH = (
     REPO_ROOT / "configs/training/a1_parent_update_35m_b200.schema1.json"
 )
-SCHEMA_VERSION = "a1-current-science-contract-v2"
+TRAINING_SCIENCE_ADMISSION_PATH = (
+    REPO_ROOT / "configs/production/training_science_admission.json"
+)
+SCHEMA_VERSION = "a1-current-science-contract-v3"
 TEACHER_REPORT_SCHEMA = "teacher-operator-causal-report-v1"
 ADOPTION_RECEIPT_SCHEMA = "a1-teacher-operator-adoption-v1"
 ADAPTIVE_FIELDS = (
@@ -250,7 +253,37 @@ PRODUCTION_LEARNER_SELECTION_CONTRACT = {
     "config_canonical_sha256": (
         "2dfcc1b95a37d7e292bc5f1bc182950523a791274461e4518bc71e28d45fbe75"
     ),
-    "scratch_status": "research_only_unresolved_not_selected",
+    "initialization": {
+        "mode": "parent_fresh_optimizer",
+        "binding_schema": "a1-canonical-parent-initializer-v1",
+        "parent_checkpoint": "required_runtime_input",
+        "init_checkpoint": "required_runtime_input",
+        "architecture_upgrade_receipt": "required_if_checkpoint_bytes_differ",
+        "entity_feature_adapter_version": (
+            "rust_entity_adapter_v6_exact_actor_resources_initial_road_two_hop"
+        ),
+        "optimizer_state": "fresh",
+    },
+    "execution_topology": {
+        "schema_version": "a1-canonical-parent-update-topology-v1",
+        "launcher": "tools/train.py",
+        "distributed_launcher": "torch.distributed.run",
+        "name": "b200-8gpu-ddp",
+        "required_accelerator_model": "NVIDIA B200",
+        "world_size": 8,
+        "physical_gpus": list(range(8)),
+        "local_batch_size": 64,
+        "grad_accum_steps": 1,
+        "global_batch_size": 512,
+        "go_authorized": False,
+        "authorization_authority": (
+            "configs/production/training_science_admission.json"
+        ),
+        "authorization_reason": (
+            "commissioned_b12_invalidated_by_adapter_v5_information_aliasing"
+        ),
+    },
+    "research_scratch_status": "research_only_unresolved_not_selected",
 }
 PRODUCTION_LEARNER_VALUE_OBJECTIVE_CONTRACT = {
     "objective": "binary_win_bce",
@@ -413,14 +446,14 @@ def _load() -> dict[str, Any]:
     if set(learner_value) != {
         "production_selection",
         "value_objective",
-        "initialization",
+        "research_scratch_initialization",
         "architecture_upgrade_flags",
         "architecture_upgrade_module",
-        "model_construction",
-        "execution_topology",
-        "topology",
-        "training_recipe",
-    } or not isinstance(learner_value["training_recipe"], dict):
+        "research_scratch_model_construction",
+        "research_scratch_execution_topology",
+        "research_scratch_topology",
+        "research_scratch_training_recipe",
+    } or not isinstance(learner_value["research_scratch_training_recipe"], dict):
         raise ScienceContractError("current learner contract shape drifted")
     if (
         learner_value.get("production_selection")
@@ -440,25 +473,79 @@ def _load() -> dict[str, Any]:
         raise ScienceContractError(
             "selected canonical parent-update config content drifted"
         )
-    if learner_value.get("initialization") != PRODUCTION_LEARNER_INITIALIZATION_CONTRACT:
+    selected_engine = selected_config.get("engine_settings")
+    selected_train_envelope = selected_config.get("train_config")
+    selected_train = (
+        selected_train_envelope.get("fields")
+        if isinstance(selected_train_envelope, dict)
+        else None
+    )
+    selected_initialization = PRODUCTION_LEARNER_SELECTION_CONTRACT["initialization"]
+    selected_topology = PRODUCTION_LEARNER_SELECTION_CONTRACT["execution_topology"]
+    if (
+        not isinstance(selected_engine, dict)
+        or not isinstance(selected_train, dict)
+        or selected_engine.get("initialization_mode")
+        != selected_initialization["mode"]
+        or selected_engine.get("entity_feature_adapter_version")
+        != selected_initialization["entity_feature_adapter_version"]
+        or selected_train.get("resume_optimizer") is not False
+        or selected_initialization.get("optimizer_state") != "fresh"
+        or selected_train.get("batch_size")
+        != selected_topology["local_batch_size"]
+        or selected_train.get("grad_accum_steps")
+        != selected_topology["grad_accum_steps"]
+        or selected_topology["world_size"]
+        * selected_topology["local_batch_size"]
+        * selected_topology["grad_accum_steps"]
+        != selected_topology["global_batch_size"]
+    ):
         raise ScienceContractError(
-            "current coherent learner initialization must be native from-scratch "
-            "v6 with fresh optimizer state"
+            "selected parent-update initialization/topology contradicts its config"
+        )
+    admission = _read_object(TRAINING_SCIENCE_ADMISSION_PATH)
+    admission_recipes = admission.get("recipes")
+    admission_recipe = (
+        admission_recipes.get(PRODUCTION_LEARNER_SELECTION_CONTRACT["recipe"])
+        if isinstance(admission_recipes, dict)
+        else None
+    )
+    if (
+        admission.get("schema_version")
+        != "catan-zero-training-science-admission-v1"
+        or not isinstance(admission_recipe, dict)
+        or admission_recipe.get("recipe_canonical_sha256")
+        != PRODUCTION_LEARNER_SELECTION_CONTRACT["config_canonical_sha256"]
+        or admission_recipe.get("authorized") is not False
+        or selected_topology.get("go_authorized") is not False
+        or admission_recipe.get("reason")
+        != selected_topology["authorization_reason"]
+    ):
+        raise ScienceContractError(
+            "selected parent-update admission must remain exact and fail-closed"
         )
     if (
-        learner_value.get("model_construction")
+        learner_value.get("research_scratch_initialization")
+        != PRODUCTION_LEARNER_INITIALIZATION_CONTRACT
+    ):
+        raise ScienceContractError(
+            "research-only scratch initialization must remain native from-scratch v6 with "
+            "fresh optimizer state"
+        )
+    if (
+        learner_value.get("research_scratch_model_construction")
         != PRODUCTION_LEARNER_MODEL_CONSTRUCTION_CONTRACT
     ):
-        raise ScienceContractError("current scratch model construction drifted")
+        raise ScienceContractError("research-only scratch model construction drifted")
     if (
-        learner_value.get("execution_topology")
+        learner_value.get("research_scratch_execution_topology")
         != PRODUCTION_LEARNER_EXECUTION_TOPOLOGY_CONTRACT
-        or learner_value.get("topology")
+        or learner_value.get("research_scratch_topology")
         != PRODUCTION_LEARNER_EXECUTION_TOPOLOGY_CONTRACT["name"]
     ):
-        raise ScienceContractError("current scratch execution topology drifted")
-    recipe = learner_value["training_recipe"]
-    execution = learner_value["execution_topology"]
+        raise ScienceContractError("research-only scratch execution topology drifted")
+    recipe = learner_value["research_scratch_training_recipe"]
+    execution = learner_value["research_scratch_execution_topology"]
     if (
         execution["world_size"]
         * execution["local_batch_size"]
@@ -633,19 +720,31 @@ def require_selected_parent_update(config_path: str | Path) -> Path:
 
 
 def learner_training_recipe() -> dict[str, Any]:
-    return copy.deepcopy(_load()["learner"]["training_recipe"])
+    """Return the unresolved research-only scratch recipe."""
+
+    return copy.deepcopy(_load()["learner"]["research_scratch_training_recipe"])
 
 
 def learner_initialization() -> dict[str, Any]:
-    return copy.deepcopy(_load()["learner"]["initialization"])
+    """Return the unresolved research-only scratch initializer."""
+
+    return copy.deepcopy(_load()["learner"]["research_scratch_initialization"])
 
 
 def learner_model_construction() -> dict[str, Any]:
-    return copy.deepcopy(_load()["learner"]["model_construction"])
+    """Return the unresolved research-only scratch model construction."""
+
+    return copy.deepcopy(
+        _load()["learner"]["research_scratch_model_construction"]
+    )
 
 
 def learner_execution_topology() -> dict[str, Any]:
-    return copy.deepcopy(_load()["learner"]["execution_topology"])
+    """Return the unresolved research-only scratch execution topology."""
+
+    return copy.deepcopy(
+        _load()["learner"]["research_scratch_execution_topology"]
+    )
 
 
 def target_information_regime() -> str:

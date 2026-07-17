@@ -15,7 +15,7 @@ from tools.train_bc import (
     _lr_warmup_multiplier,
     _resolve_entity_graph_freeze_groups,
     _set_entity_graph_modules_trainable,
-    _train_xdim_batch,
+    _train_entity_batch,
     load_teacher_data,
 )
 
@@ -458,7 +458,7 @@ def _write_and_load_shard(tmp_path: Path, samples):
     return load_teacher_data(out)
 
 
-def test_policy_loss_weight_scales_the_policy_term_in_train_xdim_batch(
+def test_policy_loss_weight_scales_the_policy_term_in_train_entity_batch(
     tmp_path,
 ) -> None:
     import torch
@@ -473,7 +473,7 @@ def test_policy_loss_weight_scales_the_policy_term_in_train_xdim_batch(
     def run(policy_loss_weight: float, value_loss_weight: float):
         policy = _make_entity_policy()
         optimizer = torch.optim.Adam(policy.model.parameters(), lr=1e-3)
-        return _train_xdim_batch(
+        return _train_entity_batch(
             policy,
             optimizer,
             data,
@@ -536,7 +536,7 @@ def test_train_diagnostics_do_not_implicitly_run_two_extra_gradient_traversals(
     ) -> dict:
         policy = _make_entity_policy()
         optimizer = torch.optim.SGD(policy.model.parameters(), lr=0.0)
-        return _train_xdim_batch(
+        return _train_entity_batch(
             policy,
             optimizer,
             data,
@@ -616,7 +616,7 @@ def test_zero_weight_final_vp_head_is_not_executed_by_entity_training(tmp_path) 
     hook = policy.model.final_vp_head.register_forward_hook(count_call)
     try:
         optimizer = torch.optim.SGD(policy.model.parameters(), lr=0.0)
-        metrics = _train_xdim_batch(
+        metrics = _train_entity_batch(
             policy,
             optimizer,
             data,
@@ -663,7 +663,7 @@ def test_all_zero_objective_mass_does_not_advance_adamw_or_decay_parameters(
         policy.model.parameters(), lr=1e-3, weight_decay=0.1
     )
 
-    metrics = _train_xdim_batch(
+    metrics = _train_entity_batch(
         policy,
         optimizer,
         data,
@@ -730,7 +730,7 @@ def test_zero_objective_last_microbatch_applies_accumulated_nonzero_gradient(
         "grad_accum_steps": 2,
     }
 
-    first = _train_xdim_batch(
+    first = _train_entity_batch(
         policy,
         optimizer,
         data,
@@ -741,7 +741,7 @@ def test_zero_objective_last_microbatch_applies_accumulated_nonzero_gradient(
         accum_do_step=False,
         **common,
     )
-    second = _train_xdim_batch(
+    second = _train_entity_batch(
         policy,
         optimizer,
         data,
@@ -796,7 +796,7 @@ def test_policy_dose_boundary_preserves_pending_accumulated_policy_gradient(
         "grad_accum_steps": 2,
     }
 
-    first = _train_xdim_batch(
+    first = _train_entity_batch(
         policy,
         optimizer,
         data,
@@ -837,7 +837,7 @@ def test_policy_dose_boundary_preserves_pending_accumulated_policy_gradient(
         realized_policy_loss_weight=boundary_weight,
         pending_policy_lr_area_weight=pending_weight,
     )
-    second = _train_xdim_batch(
+    second = _train_entity_batch(
         policy,
         optimizer,
         data,
@@ -1021,7 +1021,7 @@ def test_nonfinite_gradient_norm_aborts_before_optimizer_step(
     )
 
     with pytest.raises(FloatingPointError, match="non-finite BC gradient norm"):
-        _train_xdim_batch(
+        _train_entity_batch(
             policy,
             optimizer,
             data,
@@ -1048,7 +1048,7 @@ def test_nonfinite_gradient_norm_aborts_before_optimizer_step(
     assert steps == 0
 
 
-def test_train_xdim_reports_soft_targets_conditioned_on_policy_active_rows(
+def test_train_entity_reports_soft_targets_conditioned_on_policy_active_rows(
     tmp_path, monkeypatch
 ) -> None:
     import torch
@@ -1084,7 +1084,7 @@ def test_train_xdim_reports_soft_targets_conditioned_on_policy_active_rows(
     policy = _make_entity_policy()
     optimizer = torch.optim.SGD(policy.model.parameters(), lr=0.0)
 
-    metrics = _train_xdim_batch(
+    metrics = _train_entity_batch(
         policy,
         optimizer,
         data,
@@ -1131,7 +1131,7 @@ def test_policy_aux_batch_combines_parts_and_adds_no_value_gradient(tmp_path) ->
         policy.model.load_state_dict(initial)
         policy.model.eval()  # make the duplicated-forward equality exact (no dropout)
         optimizer = torch.optim.SGD(policy.model.parameters(), lr=0.0)
-        metrics = _train_xdim_batch(
+        metrics = _train_entity_batch(
             policy,
             optimizer,
             data,
@@ -1315,7 +1315,7 @@ def test_policy_stream_metrics_preserve_unequal_base_aux_sufficient_stats(
         policy.model.load_state_dict(initial)
         policy.model.eval()
         optimizer = torch.optim.SGD(policy.model.parameters(), lr=0.0)
-        return _train_xdim_batch(
+        return _train_entity_batch(
             policy,
             optimizer,
             data,
@@ -1392,7 +1392,7 @@ def test_policy_stream_metrics_preserve_unequal_base_aux_sufficient_stats(
     assert zero_base["policy_aux_phase_stats"]["AUX_PHASE"]["count"] == 4
 
 
-def test_candidate_main_builds_base_only_policy_report_with_unforced_phases(
+def test_entity_main_builds_base_only_policy_report_with_unforced_phases(
     tmp_path, monkeypatch, capsys
 ) -> None:
     import json
@@ -1403,7 +1403,7 @@ def test_candidate_main_builds_base_only_policy_report_with_unforced_phases(
     data = _write_and_load_shard(tmp_path, _collect_real_samples(6))
     data["phase"] = np.asarray(["OPEN"] * 6, dtype=object)
     data["phase"][0] = "FORCED"
-    data["teacher_name"] = np.asarray(["candidate_teacher"] * 6, dtype=object)
+    data["teacher_name"] = np.asarray(["entity_teacher"] * 6, dtype=object)
     data["policy_weight_multiplier"] = np.ones(6, dtype=np.float32)
     data["policy_weight_multiplier"][-1] = 0.0
     winner = str(np.asarray(data["player"]).astype(str)[0])
@@ -1434,17 +1434,19 @@ def test_candidate_main_builds_base_only_policy_report_with_unforced_phases(
         "_env_config_for_teacher_data",
         lambda _args, _data, _ddp: make_env_config(vps_to_win=3),
     )
-    report_path = tmp_path / "candidate-report.json"
+    report_path = tmp_path / "entity-report.json"
     train_bc.main(
         [
             "--data",
             str(tmp_path / "shard"),
+            "--data-format",
+            "npz",
             "--checkpoint",
-            str(tmp_path / "candidate.pt"),
+            str(tmp_path / "entity.pt"),
             "--report",
             str(report_path),
             "--arch",
-            "candidate",
+            "entity_graph",
             "--device",
             "cpu",
             "--hidden-size",
@@ -1514,12 +1516,14 @@ def test_exact_max_steps_continues_past_configured_epoch_limit(
         [
             "--data",
             str(tmp_path / "shard"),
+            "--data-format",
+            "npz",
             "--checkpoint",
             str(tmp_path / "exact-dose.pt"),
             "--report",
             str(report_path),
             "--arch",
-            "candidate",
+            "entity_graph",
             "--device",
             "cpu",
             "--hidden-size",

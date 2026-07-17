@@ -1,9 +1,4 @@
-"""OPT-4: bit-identical vectorizations of the per-batch masking helpers.
-
-_valid_lists: numpy mask + tolist (was: per-element double int() + Python filter).
-_masked_logits: one advanced-index scatter (was: B per-row scatters).
-Both must produce output identical to the old paths.
-"""
+"""OPT-4: bit-identical vectorization of the active masked-logits helper."""
 from __future__ import annotations
 
 import sys
@@ -17,12 +12,7 @@ if str(_TOOLS_DIR) not in sys.path:
 
 import torch
 
-from train_bc import _valid_lists  # type: ignore  # noqa: E402
 from catan_zero.rl.torch_ppo import _masked_logits  # noqa: E402
-
-
-def _ref_valid_lists(values):
-    return [tuple(int(a) for a in row if int(a) >= 0) for row in values]
 
 
 def _ref_masked_logits(logits, valid_actions):
@@ -43,19 +33,12 @@ def _random_legal(rng, batch, max_legal, action_size):
     return out
 
 
-def test_valid_lists_bit_identical():
-    rng = np.random.default_rng(1)
-    for _ in range(20):
-        vals = _random_legal(rng, 130, 12, action_size=54)
-        assert _valid_lists(vals) == _ref_valid_lists(vals)
-
-
 def test_masked_logits_bit_identical():
     rng = np.random.default_rng(2)
     action_size = 54
     for _ in range(20):
         legal = _random_legal(rng, 130, 12, action_size)
-        valid = _valid_lists(legal)
+        valid = [tuple(int(a) for a in row if int(a) >= 0) for row in legal]
         logits = torch.randn(130, action_size, dtype=torch.float32)
         got = _masked_logits(logits, valid, action_size)
         ref = _ref_masked_logits(logits, valid)

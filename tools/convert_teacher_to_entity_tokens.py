@@ -12,9 +12,14 @@ from typing import Any
 
 import numpy as np
 
-from catan_zero.deduction_tracker import DEDUCTION_FEATURE_SIZE, DeductionTracker
+from catan_zero.deduction_tracker import (
+    DEDUCTION_FEATURE_SIZE,
+    RESOURCES,
+    DeductionTracker,
+)
 from catan_zero.rl.entity_feature_adapter import (
     CURRENT_RUST_ENTITY_ADAPTER_VERSION,
+    RUST_ENTITY_ADAPTER_V6,
 )
 from catan_zero.rl.entity_token_features import (
     ENTITY_TOKEN_SCHEMA_VERSION,
@@ -78,6 +83,7 @@ BASE_KEYS = (
     "policy_weight_multiplier",
     "value_weight_multiplier",
     "adapter_version",
+    "actor_resource_counts",
 )
 
 ENTITY_KEYS = (
@@ -421,6 +427,75 @@ def _convert_seed(
                 mismatches.append(_mismatch(seed, decision, "valid_actions", row, valid[:20]))
                 break
             features = build_entity_token_features(env, player)
+            actor_resource_counts: np.ndarray | None = None
+            if CURRENT_RUST_ENTITY_ADAPTER_VERSION == RUST_ENTITY_ADAPTER_V6:
+                # `observation_payload(player)` exposes exact resources only
+                # for that same acting player. It is therefore authoritative
+                # own-private evidence, not an opponent hidden-state leak.
+                actor_payload = env.observation_payload(
+                    player, include_event_log=False
+                ).get("players", {}).get(player, {})
+                actor_resources = actor_payload.get("resources")
+                if not isinstance(actor_resources, dict):
+                    mismatches.append(
+                        _mismatch(
+                            seed,
+                            decision,
+                            "authoritative_actor_resource_counts_missing",
+                            row,
+                            actor_resources,
+                        )
+                    )
+                    break
+                actor_resource_counts = np.asarray(
+                    [
+                        int(actor_resources.get(resource, -1))
+                        for resource in RESOURCES
+                    ],
+                    dtype=np.int16,
+                )
+                if np.any(actor_resource_counts < 0) or np.any(
+                    actor_resource_counts > 19
+                ):
+                    mismatches.append(
+                        _mismatch(
+                            seed,
+                            decision,
+                            "authoritative_actor_resource_counts_invalid",
+                            row,
+                            actor_resource_counts,
+                        )
+                    )
+                    break
+                # `rows` contains only duplicates of this exact decision, not
+                # earlier/later decisions from the game.
+                stale_witness = None
+                for candidate in rows:
+                    if "actor_resource_counts" not in candidate:
+                        continue
+                    candidate_witness = np.asarray(
+                        candidate["actor_resource_counts"]
+                    )
+                    if (
+                        candidate_witness.shape != (5,)
+                        or candidate_witness.dtype.kind not in {"i", "u"}
+                        or not np.array_equal(
+                            candidate_witness, actor_resource_counts
+                        )
+                    ):
+                        stale_witness = candidate_witness
+                        break
+                if stale_witness is not None:
+                    mismatches.append(
+                        _mismatch(
+                            seed,
+                            decision,
+                            "actor_resource_counts_replay_mismatch",
+                            row,
+                            actor_resource_counts,
+                        )
+                    )
+                    break
             if emit_deduction_features:
                 if player not in trackers:
                     opponents = tuple(name for name in env.player_names if name != player)
@@ -454,11 +529,19 @@ def _convert_seed(
                 )
                 break
             for duplicate_row in rows:
+                converted_row = {
+                    **duplicate_row,
+                    "adapter_version": CURRENT_RUST_ENTITY_ADAPTER_VERSION,
+                }
+                if actor_resource_counts is None:
+                    # The current converter still emits adapter v3. Do not
+                    # preserve an input v6 witness beside downgraded v3 token
+                    # semantics; the pair would be internally contradictory.
+                    converted_row.pop("actor_resource_counts", None)
+                else:
+                    converted_row["actor_resource_counts"] = actor_resource_counts
                 writer.add(
-                    {
-                        **duplicate_row,
-                        "adapter_version": CURRENT_RUST_ENTITY_ADAPTER_VERSION,
-                    },
+                    converted_row,
                     features,
                 )
             _, _, terminated, truncated, info = env.step(action)

@@ -12,7 +12,7 @@ import torch
 # The reviewed-canonical SW-0 convention is CAT-39's `--value-target-lambda`:
 #   target = lambda * z + (1 - lambda) * V_search
 #   default lambda = 1.0 (pure z), keyed off the root_value / root_value_mask
-#   columns, applied in `_train_xdim_batch` (scalar space for the MSE arm,
+#   columns, applied in `_train_entity_batch` (scalar space for the MSE arm,
 #   distribution space for the HL-Gauss head).
 # The two are genuinely incompatible (opposite blend direction, opposite
 # default, different value source, different call site), so the f94 convention

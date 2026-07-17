@@ -55,18 +55,13 @@ from catan_zero.rl.actor_public_rule_state_admission import (
 )
 from catan_zero.rl.pipeline_configs import TrainConfig
 from tools import a1_current_science_contract as current_science
-from catan_zero.rl.torch_ppo import build_action_feature_table, create_ppo_policy
-from catan_zero.rl.xdim_lite_policy import (
-    XDimGraphPolicy,
-    XDimLitePolicy,
-    _array_sha256,
-    normalize_observations,
-)
+from catan_zero.rl.torch_ppo import build_action_feature_table
 from catan_zero.rl.entity_token_policy import (
     EntityGraphPolicy,
     PLAYER_LONGEST_ROAD_SLOT,
     PUBLIC_AWARD_FEATURE_CONTRACT_AUTHORITATIVE,
     PUBLIC_AWARD_FEATURE_CONTRACT_LEGACY_ZERO,
+    _array_sha256,
     _apply_public_award_feature_contract,
     _validate_public_award_feature_contract,
 )
@@ -343,7 +338,6 @@ A1_REQUIRED_LEARNER_CODE_SUFFIXES = {
     "src/catan_zero/rl/multiagent_env.py",
     "src/catan_zero/rl/optim_state.py",
     "src/catan_zero/rl/torch_ppo.py",
-    "src/catan_zero/rl/xdim_lite_policy.py",
 }
 A1_REQUIRED_RUNTIME_CODE_SUFFIXES = (
     A1_REQUIRED_LEARNER_CODE_SUFFIXES
@@ -469,21 +463,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train behavior cloning from teacher shards.")
     parser.add_argument(
         "--arch",
-        choices=("candidate", "xdim_lite", "xdim_graph", "entity_graph"),
-        default="candidate",
+        choices=("entity_graph",),
+        default="entity_graph",
     )
     parser.add_argument("--data", required=True)
     parser.add_argument(
         "--data-format",
         choices=("npz", "memmap"),
-        default="npz",
+        default="memmap",
         help=(
-            "npz (default): load and pad the whole corpus in host RAM via "
-            "load_teacher_data. memmap: stream a flat corpus built by "
+            "memmap (default): stream a flat corpus built by "
             "tools/build_memmap_corpus.py, materialising only per-batch rows "
             "for the large token/obs columns (removes the half-host-RAM ceiling "
             "on very large corpora). --data must point at the converted corpus "
-            "directory (with corpus_meta.json)."
+            "directory (with corpus_meta.json). npz retains the legacy whole-corpus "
+            "host-RAM loader for migration tools only."
         ),
     )
     parser.add_argument(
@@ -803,8 +797,7 @@ def build_parser() -> argparse.ArgumentParser:
             "all-reduced once per optimizer step, not once per micro-batch. "
             "--max-steps and the LR schedule count OPTIMIZER steps, not micro-batches. "
             "N=1 (default) is byte-identical to the pre-C1 single-step-per-batch path. "
-            "Only supported for --arch entity_graph/xdim_graph (the _train_xdim_batch "
-            "trainer); other archs must use N=1."
+            "Supported by the entity_graph trainer."
         ),
     )
     parser.add_argument("--batch-size", type=int, default=65536)
@@ -871,34 +864,31 @@ def build_parser() -> argparse.ArgumentParser:
         "--hidden-size",
         type=int,
         default=None,
-        help=(
-            "Model width. Defaults to 768 for xdim_graph (~33.5M params with "
-            "4 graph layers) and 512 for other architectures."
-        ),
+        help="EntityGraph model width. Defaults to 640.",
     )
     parser.add_argument(
         "--graph-tokens",
         type=int,
         default=32,
-        help="Observation token count for --arch xdim_graph.",
+        help="Retained config-identity field; unused by entity_graph.",
     )
     parser.add_argument(
         "--graph-layers",
         type=int,
         default=4,
-        help="Token message-passing layers for --arch xdim_graph/entity_graph.",
+        help="EntityGraph state-transformer layers.",
     )
     parser.add_argument(
         "--attention-heads",
         type=int,
         default=8,
-        help="Attention heads for --arch xdim_graph/entity_graph.",
+        help="EntityGraph attention heads.",
     )
     parser.add_argument(
         "--graph-dropout",
         type=float,
         default=0.05,
-        help="Dropout probability for --arch xdim_graph/entity_graph blocks.",
+        help="Dropout probability for EntityGraph blocks.",
     )
     parser.add_argument(
         "--entity-state-trunk",
@@ -1036,8 +1026,8 @@ def build_parser() -> argparse.ArgumentParser:
             "training run before this flag existed. CAT-12/roadmap R6 (MuZero-"
             "Reanalyse-style value-head LR decoupling, value-head LR ~=0.3x torso): "
             "pass 0.3 to reproduce it. --lr-warmup-steps/--lr-schedule still apply, "
-            "scaled per group. Requires --arch entity_graph/xdim_lite/xdim_graph (the "
-            "model must expose at least one of value_head/final_vp_head/"
+            "scaled per group. The entity_graph model must expose at least one of "
+            "value_head/final_vp_head/"
             "value_uncertainty_head as a named submodule) -- SystemExit otherwise."
         ),
     )
@@ -1184,7 +1174,7 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=False,
         help=(
-            "Opt in to independent PyTorch training RNG streams across DDP/FSDP "
+            "Opt in to independent PyTorch training RNG streams across DDP "
             "ranks. After every rank has constructed/loaded the same initial model, "
             "reseed torch with --seed + global rank before the first training "
             "forward. This diversifies dropout masks without changing initial "
@@ -1742,7 +1732,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--allow-legacy-action-mask-upgrade",
         action="store_true",
         help=(
-            "Allow an old XDim checkpoint with missing action_mask_version to be "
+            "Allow an old EntityGraph checkpoint with missing action_mask_version to be "
             "stamped with the current environment version. Keep this off for "
             "production unless an action-ID replay smoke has passed."
         ),
@@ -2052,7 +2042,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--init-checkpoint",
         default="",
-        help="Optional checkpoint to continue XDim-lite BC training from.",
+        help="Optional EntityGraph checkpoint to continue BC training from.",
     )
     parser.add_argument(
         "--resume-optimizer",
@@ -2132,7 +2122,7 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=False,
         help=(
-            "Enable DDP unused-parameter discovery. The 35M xdim_graph BC path "
+            "Enable DDP unused-parameter discovery. The EntityGraph BC path "
             "turns this on automatically when optional auxiliary heads are not "
             "part of the current loss."
         ),
@@ -2142,7 +2132,7 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("none", "bf16"),
         default="none",
         help=(
-            "Mixed precision mode for XDim BC forward/loss. Use bf16 on B200/A100 "
+            "Mixed precision mode for EntityGraph BC forward/loss. Use bf16 on B200/A100 "
             "to reduce activation memory and use tensor cores; reductions and "
             "reported metrics stay in float32."
         ),
@@ -2191,7 +2181,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--require-35m-model",
         action="store_true",
         help=(
-            "Fail unless --arch xdim_graph/entity_graph has a TOTAL serialized "
+            "Fail unless the entity_graph model has a TOTAL serialized "
             "checkpoint parameter count in the expected 35M range. This "
             "compatibility contract intentionally includes frozen or "
             "forward-skipped heads; trainable and forward-active counts are "
@@ -2228,17 +2218,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--fsdp",
         action="store_true",
-        help=(
-            "C1: shard model params/grads/optimizer state across ranks with "
-            "FullyShardedDataParallel instead of replicating them with DDP. Use "
-            "only when a net is too big to fit a DDP replica + optimizer state on "
-            "one GPU; DDP is the workhorse for the 70-150M entity_graph configs on "
-            "80GB H100s (they fit a replica with room to spare). Transformer blocks "
-            "are auto-wrapped by module type; the final checkpoint is gathered to a "
-            "full (unsharded) state_dict on rank 0 so it loads exactly like a "
-            "DDP/single-GPU checkpoint. Requires torchrun (WORLD_SIZE>1) and "
-            "--arch entity_graph/xdim_graph."
-        ),
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--grow-from-checkpoint",
@@ -13518,13 +13498,7 @@ def main(
     # a command-construction error and must fail in seconds, not after hashing
     # hundreds of gigabytes.
     if args.hidden_size is None:
-        args.hidden_size = (
-            640
-            if args.arch == "entity_graph"
-            else 768
-            if args.arch == "xdim_graph"
-            else 512
-        )
+        args.hidden_size = 640
     if args.grow_from_checkpoint and args.init_checkpoint:
         raise SystemExit(
             "--grow-from-checkpoint and --init-checkpoint are mutually exclusive: "
@@ -13747,7 +13721,7 @@ def main(
         )
 
     if args.hidden_size is None:
-        args.hidden_size = 640 if args.arch == "entity_graph" else 768 if args.arch == "xdim_graph" else 512
+        args.hidden_size = 640
     if args.require_production_35m_teacher:
         args.require_35m_model = True
     if args.require_35m_model and not args.skip_teacher_quality_gate:
@@ -13776,7 +13750,7 @@ def main(
             "curated memmap corpus use --skip-teacher-quality-gate "
             "--trust-curated-data-quality instead."
         )
-    # C1 grad-accum / grow / FSDP validation (kept next to the other early
+    # Gradient-accumulation validation (kept next to the other early
     # argument-consistency checks so a misconfigured launch fails before any
     # data load or GPU allocation).
     if int(args.grad_accum_steps) < 1:
@@ -13809,10 +13783,6 @@ def main(
     ) <= 0.0:
         raise SystemExit("--policy-aux-loss-weight must be finite and > 0")
     if int(args.policy_aux_active_batch_size) > 0:
-        if args.arch not in {"xdim_graph", "entity_graph"}:
-            raise SystemExit(
-                "--policy-aux-active-batch-size requires --arch entity_graph/xdim_graph"
-            )
         if int(args.grad_accum_steps) != 1:
             raise SystemExit(
                 "--policy-aux-active-batch-size requires --grad-accum-steps 1"
@@ -13833,12 +13803,6 @@ def main(
         raise SystemExit(
             "--policy-aux-sampling-mode is inert unless "
             "--policy-aux-active-batch-size is positive"
-        )
-    if int(args.grad_accum_steps) > 1 and args.arch not in {"xdim_graph", "entity_graph"}:
-        raise SystemExit(
-            "--grad-accum-steps > 1 is only supported for --arch entity_graph/"
-            "xdim_graph (the _train_xdim_batch trainer); other archs must use "
-            "--grad-accum-steps 1"
         )
     args.policy_target_reanalysis = None
     if str(args.data_format) != "memmap":
@@ -13890,16 +13854,11 @@ def main(
 
     import torch
 
-    if ddp["enabled"] and args.arch not in {"xdim_lite", "xdim_graph", "entity_graph"}:
-        raise SystemExit("DDP behavior cloning currently supports XDim/entity architectures")
     if bool(args.fsdp):
-        if not ddp["enabled"]:
-            raise SystemExit(
-                "--fsdp requires a multi-rank launch (torchrun --nproc_per_node>1); "
-                "WORLD_SIZE==1 has nothing to shard"
-            )
-        if args.arch not in {"xdim_graph", "entity_graph"}:
-            raise SystemExit("--fsdp currently supports --arch entity_graph/xdim_graph only")
+        raise SystemExit(
+            "FSDP support was removed; the canonical learner uses one EntityGraph "
+            "replica per rank under 8-GPU DDP"
+        )
     if ddp["enabled"]:
         import torch.distributed as dist
 
@@ -14415,98 +14374,50 @@ def main(
         )
     public_award_feature_training: dict[str, object]
     model_parameter_accounting: dict[str, object] | None = None
-    if args.arch == "candidate":
-        policy = create_ppo_policy(
-            config=env_config,
-            seed=args.seed,
-            hidden_size=args.hidden_size,
-            architecture="candidate",
-            device=args.device,
-        )
-        if float(args.value_lr_mult) != 1.0:
-            raise SystemExit(
-                "--value-lr-mult is only supported for --arch entity_graph/xdim_lite/"
-                "xdim_graph (it needs a named value_head/final_vp_head/"
-                "value_uncertainty_head submodule to split into its own param group), "
-                "not --arch candidate"
-            )
-        if float(args.trunk_lr_mult) != 1.0:
-            raise SystemExit(
-                "--trunk-lr-mult is supported only for --arch entity_graph, not "
-                "--arch candidate"
-            )
-        if float(args.shared_action_lr_mult) != 1.0:
-            raise SystemExit(
-                "--shared-action-lr-mult is supported only for "
-                "--arch entity_graph, not --arch candidate"
-            )
-        if float(args.public_card_lr_mult) != 1.0:
-            raise SystemExit(
-                "--public-card-lr-mult is supported only for --arch entity_graph"
-            )
-        params = []
-        for name in ("model", "actor", "action_encoder", "action_id_embedding", "action_bias"):
-            module = getattr(policy, name, None)
-            if module is not None:
-                params.extend(module.parameters())
-        optimizer = _make_optimizer(params, args, getattr(policy, "device", args.device))
-        model_parameter_accounting = _parameter_accounting(policy)
-        train_fn = _train_candidate_batch
-        public_award_feature_training = _configure_public_award_feature_training(
-            policy, data, args
-        )
-        _PUBLIC_AWARD_FEATURE_CONTRACT = str(
-            public_award_feature_training["effective_contract"]
-        )
+    if args.arch != "entity_graph":
+        raise SystemExit("the production learner supports only --arch entity_graph")
     else:
         if args.init_checkpoint:
-            if args.arch == "entity_graph":
-                policy = EntityGraphPolicy.load(
-                    checkpoint_load_path,
-                    device=args.device,
-                    strict_metadata=not bool(args.allow_legacy_action_mask_upgrade),
+            policy = EntityGraphPolicy.load(
+                checkpoint_load_path,
+                device=args.device,
+                strict_metadata=not bool(args.allow_legacy_action_mask_upgrade),
+            )
+            loaded_adapter = policy_entity_feature_adapter_version(policy)
+            requested_adapter = getattr(
+                args, "entity_feature_adapter_version", None
+            )
+            if requested_adapter is not None and require_known_entity_feature_adapter(
+                requested_adapter
+            ) != loaded_adapter:
+                raise SystemExit(
+                    "--entity-feature-adapter-version does not match the "
+                    f"init checkpoint: requested={requested_adapter!r} "
+                    f"checkpoint={loaded_adapter!r}"
                 )
-                loaded_adapter = policy_entity_feature_adapter_version(policy)
-                requested_adapter = getattr(
-                    args, "entity_feature_adapter_version", None
-                )
-                if requested_adapter is not None and require_known_entity_feature_adapter(
-                    requested_adapter
-                ) != loaded_adapter:
-                    raise SystemExit(
-                        "--entity-feature-adapter-version does not match the "
-                        f"init checkpoint: requested={requested_adapter!r} "
-                        f"checkpoint={loaded_adapter!r}"
-                    )
-                policy.config = dataclasses.replace(
-                    policy.config,
-                    meaningful_public_history=bool(
-                        args.meaningful_public_history
-                    ),
-                    meaningful_public_history_schema=(
-                        _history_schema_for_entity_adapter(loaded_adapter)
-                    ),
-                    event_history_limit=int(args.event_history_limit),
-                    meaningful_public_history_pooling=str(
-                        args.meaningful_public_history_pooling
-                    ),
-                    meaningful_public_history_target_gather=bool(
-                        args.meaningful_public_history_target_gather
-                    ),
-                    public_rule_state_features=bool(
-                        args.public_rule_state_features
-                    ),
-                    public_rule_state_feature_schema=(
-                        PUBLIC_RULE_STATE_FEATURE_SCHEMA_VERSION
-                    ),
-                )
-                policy.model.config = policy.config
-            else:
-                policy = XDimLitePolicy.load(
-                    checkpoint_load_path,
-                    device=args.device,
-                    strict_metadata=not bool(args.allow_legacy_action_mask_upgrade),
-                )
+            policy.config = dataclasses.replace(
+                policy.config,
+                meaningful_public_history=bool(
+                    args.meaningful_public_history
+                ),
+                meaningful_public_history_schema=(
+                    _history_schema_for_entity_adapter(loaded_adapter)
+                ),
+                event_history_limit=int(args.event_history_limit),
+                meaningful_public_history_pooling=str(
+                    args.meaningful_public_history_pooling
+                ),
+                meaningful_public_history_target_gather=bool(
+                    args.meaningful_public_history_target_gather
+                ),
+                public_rule_state_features=bool(
+                    args.public_rule_state_features
+                ),
+                public_rule_state_feature_schema=(
+                    PUBLIC_RULE_STATE_FEATURE_SCHEMA_VERSION
+                ),
+            )
+            policy.model.config = policy.config
             if getattr(policy, "policy_type", None) != args.arch:
                 raise SystemExit(
                     f"--arch {args.arch} does not match init checkpoint policy_type "
@@ -14514,9 +14425,8 @@ def main(
                 )
             _assert_init_config_matches(policy, args)
         else:
-            if args.arch == "entity_graph":
-                training_adapter = _resolved_training_entity_adapter(args)
-                policy = EntityGraphPolicy.create(
+            training_adapter = _resolved_training_entity_adapter(args)
+            policy = EntityGraphPolicy.create(
                     env_config=env_config,
                     hidden_size=args.hidden_size,
                     state_layers=args.graph_layers,
@@ -14582,25 +14492,7 @@ def main(
                     moe_routed_experts=int(args.moe_routed_experts),
                     moe_top_k=int(args.moe_top_k),
                     moe_expert_ff_size=int(args.moe_expert_ff_size),
-                )
-            elif args.arch == "xdim_graph":
-                policy = XDimGraphPolicy.create(
-                    env_config=env_config,
-                    hidden_size=args.hidden_size,
-                    seed=args.seed,
-                    device=args.device,
-                    token_count=args.graph_tokens,
-                    board_layers=args.graph_layers,
-                    attention_heads=args.attention_heads,
-                    dropout=args.graph_dropout,
-                )
-            else:
-                policy = XDimLitePolicy.create(
-                    env_config=env_config,
-                    hidden_size=args.hidden_size,
-                    seed=args.seed,
-                    device=args.device,
-                )
+            )
         _ensure_policy_action_mask_version(
             policy,
             env_config,
@@ -14609,8 +14501,6 @@ def main(
         )
         _TRAINING_ENTITY_FEATURE_ADAPTER_VERSION = (
             policy_entity_feature_adapter_version(policy)
-            if args.arch == "entity_graph"
-            else CURRENT_RUST_ENTITY_ADAPTER_VERSION
         )
         if args.grow_from_checkpoint:
             grow_report = _warm_start_grow(
@@ -14620,19 +14510,9 @@ def main(
                 json.dumps({"progress": "warm_start_grow", **grow_report}, sort_keys=True),
                 ddp,
             )
-        scratch_history_initialization = (
-            _initialize_scratch_meaningful_history_path(
-                policy,
-                scratch=not bool(args.init_checkpoint or args.grow_from_checkpoint),
-            )
-            if args.arch == "entity_graph"
-            else {
-                "enabled": False,
-                "scratch": not bool(
-                    args.init_checkpoint or args.grow_from_checkpoint
-                ),
-                "masked_mean_gate_initialization": "not_applicable",
-            }
+        scratch_history_initialization = _initialize_scratch_meaningful_history_path(
+            policy,
+            scratch=not bool(args.init_checkpoint or args.grow_from_checkpoint),
         )
         training_information_surface = {
             **(training_information_surface or {}),
@@ -14740,7 +14620,7 @@ def main(
             inactive_head_freeze["frozen_submodules"]
         )
         if float(args.q_loss_weight) == 0.0:
-            _set_xdim_q_branch_trainable(policy.model, False)
+            _set_entity_q_branch_trainable(policy.model, False)
             unwrapped_model = getattr(policy.model, "module", policy.model)
             forward_inactive_module_names.update(
                 name
@@ -14863,16 +14743,13 @@ def main(
                 ),
                 ddp,
             )
-        # Bind observability to the actual training forward before DDP/FSDP can
-        # flatten or shard parameter storage. Frozen-but-executed modules remain
+        # Bind observability to the actual training forward before DDP wrapping.
+        # Frozen-but-executed modules remain
         # forward-active; only branches that this learner explicitly omits are
         # excluded. The plain attribute survives wrappers and is absent from
         # state_dict/checkpoint serialization.
         unwrapped_model = getattr(policy.model, "module", policy.model)
-        # FSDP ``use_orig_params=True`` can expose an original parameter through
-        # its one-dimensional local shard outside forward. Preserve the true
-        # pre-wrap rank so AdamW decay classification does not mistake every
-        # sharded matrix for a bias/normalization vector.
+        # Preserve the original rank used by AdamW decay classification.
         for parameter in unwrapped_model.parameters():
             parameter._optimizer_original_ndim = int(parameter.ndim)
         unwrapped_model._forward_inactive_parameter_modules = frozenset(
@@ -14893,69 +14770,7 @@ def main(
             ),
             ddp,
         )
-        if bool(args.fsdp):
-            # C1 minimal FSDP: FULL_SHARD across ranks, transformer blocks
-            # auto-wrapped by module type. use_orig_params=True so
-            # named_parameters()/named_modules() keep their original names -- the
-            # value/final-vp/uncertainty param-group split in
-            # _build_optimizer_param_groups and the module-freeze helpers keep
-            # working unchanged. Mixed precision is left to the existing
-            # _amp_context autocast (same as the DDP path): FSDP shards params in
-            # fp32 and compute autocasts to bf16, so we do NOT also pass an FSDP
-            # MixedPrecision policy (that would double-cast). Grad clipping under
-            # FSDP must go through FSDP.clip_grad_norm_ (a collective) -- handled
-            # in _train_xdim_batch -- and the checkpoint is gathered to a full
-            # rank-0 state_dict in _save_policy.
-            from torch.distributed.fsdp import (
-                FullyShardedDataParallel as FSDP,
-                ShardingStrategy,
-            )
-            from torch.distributed.fsdp.wrap import ModuleWrapPolicy
-
-            block_types: set = set()
-            if hasattr(policy.model, "blocks"):
-                for _block in policy.model.blocks:
-                    block_types.add(type(_block))
-            if getattr(policy.model, "action_cross_attention_layers", 0) and hasattr(
-                policy.model, "action_cross_blocks"
-            ):
-                for _block in policy.model.action_cross_blocks:
-                    block_types.add(type(_block))
-            wrap_policy = ModuleWrapPolicy(block_types) if block_types else None
-            # FSDP cannot flatten 0-dim (scalar) parameters (e.g. the entity_graph
-            # net's logit_scale). Keep any scalar params OUT of FSDP via
-            # ignored_states -- they stay replicated (unsharded) on every rank, a
-            # negligible cost. FSDP will not all-reduce their gradients, so
-            # _clip_grad_norm averages them across ranks before the step to keep
-            # ranks in lockstep (see policy._fsdp_ignored_params).
-            ignored_scalar_params = [
-                p for p in policy.model.parameters() if p.dim() == 0
-            ]
-            _rank0_print(
-                json.dumps(
-                    {
-                        "progress": "fsdp_wrap",
-                        "sharding": "FULL_SHARD",
-                        "wrapped_block_types": sorted(t.__name__ for t in block_types),
-                        "ignored_scalar_params": int(len(ignored_scalar_params)),
-                        "amp": str(args.amp),
-                    },
-                    sort_keys=True,
-                ),
-                ddp,
-            )
-            policy.model = FSDP(
-                policy.model,
-                auto_wrap_policy=wrap_policy,
-                sharding_strategy=ShardingStrategy.FULL_SHARD,
-                device_id=ddp["local_rank"],
-                use_orig_params=True,
-                ignored_states=ignored_scalar_params or None,
-            )
-            # Same Parameter objects survive the wrap (ignored -> unsharded), so
-            # keep references for the manual gradient all-reduce at step time.
-            policy._fsdp_ignored_params = ignored_scalar_params
-        elif ddp["enabled"]:
+        if ddp["enabled"]:
             _rank0_print(
                 json.dumps(
                     {
@@ -15032,7 +14847,7 @@ def main(
                 args,
                 getattr(policy, "device", args.device),
             )
-        train_fn = _train_xdim_batch
+        train_fn = _train_entity_batch
 
     _rank0_authoritative_call(
         ddp,
@@ -15043,8 +14858,8 @@ def main(
     # CAT-128 patch #8: resume optimizer (Adam) moment state from the --init-checkpoint's
     # sidecar so a stop/crash continues with warm moments + correct LR position rather
     # than restarting Adam from zero (the fresh-Adam catastrophic-forgetting risk called
-    # out by the --lr-warmup-steps guard). Called on ALL ranks (FSDP restore is a
-    # collective) BEFORE the training loop, after the optimizer is built. An explicit
+    # out by the --lr-warmup-steps guard). Called on all DDP ranks before the
+    # training loop, after the optimizer is built. An explicit
     # resume request is an exact-continuation contract: missing sidecars fail closed.
     # Model-only warm starts remain available through --no-resume-optimizer.
     _validate_optimizer_resume_request(
@@ -16403,7 +16218,7 @@ def main(
                     train_indices[local_positions[start_index:stop_index]],
                     dtype=np.int64,
                 )
-                measured = _train_xdim_batch(
+                measured = _train_entity_batch(
                     policy,
                     None,
                     data,
@@ -17165,11 +16980,9 @@ def main(
         accumulation_group_size = accum
         policy_group_objective_fraction = 0.0
         policy_group_lr_area_weight = 0.0
-        # The policy-KL anchor and value-uncertainty auxiliary loss are entity_graph
-        # (_train_xdim_batch) features -- the legacy dense _train_candidate_batch path
-        # does not accept them, so only forward them when the xdim trainer is active.
+        # Optional EntityGraph objective arguments.
         train_fn_extra_kwargs: dict[str, object] = {}
-        if train_fn is _train_xdim_batch:
+        if train_fn is _train_entity_batch:
             train_fn_extra_kwargs = {
                 "policy_kl_anchor_weight": (
                     float(args.policy_kl_anchor_weight)
@@ -17284,7 +17097,7 @@ def main(
             # micro-batch sees the same LR. The final batch of the epoch always
             # closes its group with a synced optimizer step -- this both flushes
             # the trailing partial group and, crucially, guarantees that last
-            # backward runs WITH DDP/FSDP gradient sync (non-stepping micro-batches
+            # backward runs with DDP gradient sync (non-stepping micro-batches
             # run under no_sync, so a step on unsynced grads would diverge ranks).
             # The last epoch batch is never empty (the final order slice has >=1
             # row), so no pending gradient can survive the loop.
@@ -17304,7 +17117,7 @@ def main(
                 )
             accum_do_step = (micro_in_group >= accum) or bool(_is_last_batch)
             accum_kwargs: dict = {}
-            if train_fn is _train_xdim_batch:
+            if train_fn is _train_entity_batch:
                 accum_kwargs = {
                     "grad_accum_steps": accumulation_group_size,
                     "accum_do_zero_grad": accum_do_zero_grad,
@@ -17390,7 +17203,7 @@ def main(
                     "effective_value_trunk_grad_scale"
                 ]
             )
-            if train_fn is _train_xdim_batch:
+            if train_fn is _train_entity_batch:
                 train_fn_extra_kwargs["policy_kl_anchor_weight"] = (
                     batch_policy_kl_coefficient
                 )
@@ -17398,13 +17211,13 @@ def main(
                     batch_value_trunk_grad_scale
                 )
             # DDP documents that no_sync() must wrap the forward pass as well as
-            # backward().  Applying it only inside _train_xdim_batch after the
+            # backward(). Applying it only inside _train_entity_batch after the
             # forward leaves reducer hooks armed and silently synchronizes every
             # micro-batch, defeating gradient accumulation's communication win.
             with _gradient_sync_context(policy.model, accum_do_step=accum_do_step):
                 objective_interference_kwargs: dict[str, object] = {}
                 symmetry_kwargs: dict[str, object] = {}
-                if train_fn is _train_xdim_batch:
+                if train_fn is _train_entity_batch:
                     interference_cadence = int(
                         args.objective_gradient_interference_every_batches
                     )
@@ -19431,8 +19244,7 @@ def main(
             ddp,
         )
         if args.save_each_epoch:
-            # Called on every rank: _save_policy writes on rank 0 for DDP/single
-            # and runs the collective full-state-dict gather (all ranks) for FSDP.
+            # Called on every rank; _save_policy writes on rank 0 for DDP/single.
             epoch_path = _epoch_checkpoint_path(args.checkpoint, epoch + 1)
             checkpoint_model = getattr(policy.model, "module", policy.model)
             # Re-audit after training so lazily imported modules are covered too.
@@ -19486,7 +19298,7 @@ def main(
                 ),
             )
             # CAT-128 patch #8: persist optimizer (Adam) state as <ckpt>.optimizer.pt.
-            # Called on ALL ranks (the FSDP gather is a collective); rank-0 writes.
+            # Called on all DDP ranks; rank zero writes.
             optimizer_saved = _save_optimizer_sidecar(
                 str(epoch_path), policy, optimizer, ddp
             )
@@ -19520,10 +19332,8 @@ def main(
         applied_steps=int(global_step),
         epoch_limit=int(effective_epoch_limit),
     )
-    # Called on every rank (see _save_policy): rank-0 write for DDP/single, and a
-    # collective full-state-dict gather for FSDP (C1). MUST stay unconditional --
-    # the FSDP gather is collective, so wrapping in `if rank==0` would deadlock/skip
-    # it. OPT-8 soft_target_source provenance kwarg threaded in (recorded in metadata).
+    # Called on every rank; rank zero writes. OPT-8 soft_target_source provenance
+    # is threaded into checkpoint metadata.
     if saved_checkpoint_steps != set(checkpoint_steps):
         raise RuntimeError(
             "training ended before every requested intermediate checkpoint was saved: "
@@ -20570,10 +20380,10 @@ def main(
         "validation_fraction": args.validation_fraction,
         "validation_max_samples": args.validation_max_samples,
         "validation_seed": args.validation_seed,
-        "graph_tokens": args.graph_tokens if args.arch == "xdim_graph" else None,
-        "graph_layers": args.graph_layers if args.arch in ("xdim_graph", "entity_graph") else None,
-        "attention_heads": args.attention_heads if args.arch in ("xdim_graph", "entity_graph") else None,
-        "graph_dropout": args.graph_dropout if args.arch in ("xdim_graph", "entity_graph") else None,
+        "graph_tokens": None,
+        "graph_layers": args.graph_layers,
+        "attention_heads": args.attention_heads,
+        "graph_dropout": args.graph_dropout,
         "progress_every_batches": args.progress_every_batches,
         "train_diagnostics_every_batches": args.train_diagnostics_every_batches,
         "objective_gradient_interference_every_batches": (
@@ -20748,344 +20558,6 @@ def main(
         dist.destroy_process_group()
 
 
-def _train_candidate_batch(
-    policy,
-    optimizer,
-    data: dict,
-    batch: np.ndarray,
-    policy_sample_weights: np.ndarray,
-    value_sample_weights: np.ndarray,
-    soft_target_temperature: float,
-    soft_target_weight: float,
-    soft_target_source: str,
-    soft_target_min_legal_coverage: float,
-    policy_loss_weight: float,
-    value_loss_weight: float,
-    final_vp_loss_weight: float,
-    q_loss_weight: float,
-    q_skip_teacher_prefixes: tuple[str, ...],
-    vps_to_win: int,
-    advantage_policy_weighting: str,
-    advantage_temperature: float,
-    advantage_weight_cap: float,
-    advantage_weight_floor: float,
-    amp: str = "none",
-    *,
-    policy_target_blend_semantics: str = POLICY_TARGET_BLEND_LEGACY_V1,
-    max_grad_norm: float = 1.0,
-    diagnostics: bool = True,
-    truncated_vp_margin_value_weight: float = 0.0,
-    scalar_value_objective: str = "mse",
-    scalar_value_loss_readout: str = "raw",
-    scalar_value_loss_scale: float = 1.0,
-) -> dict:
-    del q_skip_teacher_prefixes, amp
-    del advantage_policy_weighting, advantage_temperature, advantage_weight_cap, advantage_weight_floor
-    import torch
-    from torch import nn
-
-    obs = torch.as_tensor(
-        normalize_observations(data["obs"][batch]),
-        dtype=torch.float32,
-        device=policy.device,
-    )
-    context = _dense_context(data, batch, policy.action_size, policy.context_action_feature_size)
-    context_t = torch.as_tensor(context, dtype=torch.float32, device=policy.device)
-    actions = torch.as_tensor(data["action_taken"][batch].astype(np.int64), device=policy.device)
-    valid = _valid_lists(data["legal_action_ids"][batch])
-    logits, raw_values = policy.forward(obs, context_t)
-    masked = _torch_ppo_masked_logits(logits, valid, policy.action_size)
-    policy_weights = torch.as_tensor(
-        policy_sample_weights[batch],
-        dtype=torch.float32,
-        device=policy.device,
-    )
-    value_weights = torch.as_tensor(
-        value_sample_weights[batch],
-        dtype=torch.float32,
-        device=policy.device,
-    )
-    hard_loss = nn.functional.cross_entropy(masked, actions, reduction="none")
-    soft_targets, has_soft, soft_support = _soft_targets_full(
-        data,
-        batch,
-        policy.action_size,
-        policy.device,
-        soft_target_temperature,
-        soft_target_source,
-        soft_target_min_legal_coverage,
-    )
-    _require_stage_c_soft_targets(
-        data,
-        batch,
-        has_soft,
-        source=soft_target_source,
-    )
-    if soft_targets is not None:
-        log_probs = _support_log_softmax(masked, soft_support)
-        soft_loss = -(soft_targets * log_probs).sum(dim=-1)
-        per_sample_loss = _policy_target_per_sample_loss(
-            hard_loss,
-            soft_loss,
-            has_soft,
-            soft_target_weight=soft_target_weight,
-            blend_semantics=policy_target_blend_semantics,
-        )
-    else:
-        per_sample_loss = hard_loss
-    policy_loss = _weighted_mean_loss(per_sample_loss, policy_weights)
-    policy_loss_sum, policy_loss_denominator = _weighted_loss_parts(per_sample_loss, policy_weights)
-    _, _, _, _, outcome_targets, has_outcome, outcome_confidence = _value_targets(
-        data,
-        batch,
-        policy.device,
-        vps_to_win,
-        truncated_vp_margin_value_weight=truncated_vp_margin_value_weight,
-    )
-    value_loss = torch.tensor(0.0, dtype=torch.float32, device=policy.device)
-    scalar_value_mse_diagnostic = torch.tensor(
-        0.0, dtype=torch.float32, device=policy.device
-    )
-    value_active_mask = torch.zeros(
-        len(batch), dtype=torch.bool, device=policy.device
-    )
-    if outcome_targets is not None:
-        (
-            value_error,
-            scalar_value_mse_error,
-            _value_prediction,
-        ) = _scalar_value_objective_errors(
-            raw_values,
-            outcome_targets,
-            objective=scalar_value_objective,
-            readout=scalar_value_loss_readout,
-            scale=scalar_value_loss_scale,
-        )
-        value_loss = _weighted_mean_loss(
-            value_error,
-            value_weights * outcome_confidence,
-            mask=has_outcome,
-        )
-        value_loss_sum, value_loss_denominator = _weighted_loss_parts(
-            value_error,
-            value_weights * outcome_confidence,
-            mask=has_outcome,
-        )
-        scalar_value_mse_diagnostic = _weighted_mean_loss(
-            scalar_value_mse_error,
-            value_weights * outcome_confidence,
-            mask=has_outcome,
-        )
-        (
-            scalar_value_mse_diagnostic_sum,
-            scalar_value_mse_diagnostic_denominator,
-        ) = _weighted_loss_parts(
-            scalar_value_mse_error,
-            value_weights * outcome_confidence,
-            mask=has_outcome,
-        )
-        value_active_mask = has_outcome & (
-            (value_weights * outcome_confidence) > 0.0
-        )
-        value_active_count = int(value_active_mask.sum().item())
-    else:
-        value_loss_sum, value_loss_denominator = _zero_loss_parts(policy.device)
-        (
-            scalar_value_mse_diagnostic_sum,
-            scalar_value_mse_diagnostic_denominator,
-        ) = _zero_loss_parts(policy.device)
-        value_active_count = 0
-    loss = float(policy_loss_weight) * policy_loss + float(value_loss_weight) * value_loss
-    if not torch.isfinite(loss):
-        raise FloatingPointError(f"non-finite BC loss: {float(loss.detach().cpu())}")
-    optimizer.zero_grad(set_to_none=True)
-    loss.backward()
-    (
-        pre_clip_total_grad_norm,
-        optimizer_step_applied,
-        zero_objective_step_skipped,
-    ) = _step_optimizer_fail_closed(
-        policy,
-        optimizer,
-        loss=loss,
-        max_grad_norm=max_grad_norm,
-    )
-    optimizer_observability = _optimizer_clip_observability(
-        pre_clip_total_grad_norm,
-        max_grad_norm=max_grad_norm,
-    )
-    optimizer_observability["optimizer_step_applied"] = optimizer_step_applied
-    optimizer_observability["zero_objective_step_skipped"] = (
-        zero_objective_step_skipped
-    )
-    predictions = torch.argmax(masked, dim=-1)
-    active = policy_weights > 0.0
-    active_count = int(active.sum().item())
-    policy_base_correct_count = int(((predictions == actions) & active).sum().item())
-    policy_base_top3_correct_count = int(
-        round(
-            float(_topk_full_accuracy(masked, actions, k=3, mask=active).item())
-            * active_count
-        )
-    )
-    policy_base_accuracy = policy_base_correct_count / max(active_count, 1)
-    policy_base_top3_accuracy = policy_base_top3_correct_count / max(
-        active_count, 1
-    )
-    policy_base_soft_rows = (
-        int(has_soft.sum().item()) if soft_targets is not None else 0
-    )
-    policy_base_soft_active_rows = (
-        int((has_soft & active).sum().item()) if soft_targets is not None else 0
-    )
-    policy_target_distribution_stats = _policy_target_distribution_stats(
-        data,
-        batch,
-        masked,
-        soft_targets,
-        has_soft,
-        active,
-        soft_support,
-    )
-    active_np = active.detach().cpu().numpy().astype(bool)
-    if diagnostics:
-        predictions_np = predictions.detach().cpu().numpy()
-        actions_np = actions.detach().cpu().numpy()
-        logits_np = masked.detach().cpu().numpy()
-        phase_stats = _field_stats(
-            data,
-            batch[active_np],
-            predictions_np[active_np],
-            actions_np[active_np],
-            logits_np[active_np],
-            field="phase",
-        )
-        teacher_stats = _field_stats(
-            data,
-            batch[active_np],
-            predictions_np[active_np],
-            actions_np[active_np],
-            logits_np[active_np],
-            field="teacher_name",
-        )
-        phase_stats_unforced = _field_stats_unforced(
-            data,
-            batch[active_np],
-            predictions_np[active_np],
-            actions_np[active_np],
-            logits_np[active_np],
-            field="phase",
-        )
-    else:
-        phase_stats = {}
-        teacher_stats = {}
-        phase_stats_unforced = {}
-    return {
-        "loss": float(loss.item()),
-        "policy_loss": float(policy_loss.item()),
-        "value_loss": float(value_loss.item()),
-        "primary_value_loss": float(value_loss.item()),
-        "primary_value_loss_kind": _scalar_value_primary_loss_kind(
-            scalar_value_objective
-        ),
-        "scalar_value_mse_diagnostic": float(
-            scalar_value_mse_diagnostic.item()
-        ),
-        "final_vp_loss": 0.0,
-        "q_loss": 0.0,
-        "policy_loss_weighted_sum": float(policy_loss_sum.item()),
-        "policy_loss_weight_sum": float(policy_loss_denominator.item()),
-        "policy_base_loss": float(policy_loss.item()),
-        "policy_base_loss_weighted_sum": float(policy_loss_sum.item()),
-        "policy_base_loss_weight_sum": float(policy_loss_denominator.item()),
-        "policy_aux_loss": 0.0,
-        "policy_aux_loss_weighted_sum": 0.0,
-        "policy_aux_loss_weight_sum": 0.0,
-        "value_loss_weighted_sum": float(value_loss_sum.item()),
-        "value_loss_weight_sum": float(value_loss_denominator.item()),
-        "scalar_value_mse_diagnostic_weighted_sum": float(
-            scalar_value_mse_diagnostic_sum.item()
-        ),
-        "scalar_value_mse_diagnostic_weight_sum": float(
-            scalar_value_mse_diagnostic_denominator.item()
-        ),
-        "final_vp_loss_weighted_sum": 0.0,
-        "final_vp_loss_weight_sum": 0.0,
-        "q_loss_weighted_sum": 0.0,
-        "q_loss_weight_sum": 0.0,
-        "q_score_rows_ge2": 0,
-        # Candidate has no additive policy stream, but it must expose the same
-        # sufficient-stat schema as the xdim/entity path. Epoch aggregation is
-        # architecture-independent and fails closed when these counts drift.
-        "policy_metric_semantics": {
-            "schema_version": "train-policy-stream-metrics-v2",
-            "headline_scope": "base_plus_aux_count_weighted",
-            "base_scope": "positive_policy_weight_rows_in_base_forward",
-            "aux_scope": "all_rows_in_policy_aux_forward",
-            "sampled_action_accuracy_weighting": "uniform_active_row_count",
-            "sampled_action_accuracy_deprecated": True,
-            "teacher_distribution_metric": (
-                "policy_target_distribution_stats"
-            ),
-            "teacher_distribution_weighting": (
-                "uniform_soft_target_policy_active_rows"
-            ),
-            "loss_weighting_unchanged": True,
-        },
-        "policy_base_row_count": int(len(batch)),
-        "policy_aux_row_count": 0,
-        "policy_total_row_count": int(len(batch)),
-        "policy_base_active_count": int(active_count),
-        "policy_aux_active_count": 0,
-        "policy_total_active_count": int(active_count),
-        "policy_base_correct_count": int(policy_base_correct_count),
-        "policy_aux_correct_count": 0,
-        "policy_total_correct_count": int(policy_base_correct_count),
-        "policy_base_top3_correct_count": int(policy_base_top3_correct_count),
-        "policy_aux_top3_correct_count": 0,
-        "policy_total_top3_correct_count": int(policy_base_top3_correct_count),
-        "soft_distillation_base_rows": int(policy_base_soft_rows),
-        "soft_distillation_aux_rows": 0,
-        "soft_distillation_total_rows": int(policy_base_soft_rows),
-        "soft_distillation_rows": int(policy_base_soft_rows),
-        "soft_distillation_base_active_rows": int(
-            policy_base_soft_active_rows
-        ),
-        "soft_distillation_aux_active_rows": 0,
-        "soft_distillation_total_active_rows": int(
-            policy_base_soft_active_rows
-        ),
-        "soft_distillation_active_rows": int(policy_base_soft_active_rows),
-        "policy_target_distribution_stats": (
-            policy_target_distribution_stats
-        ),
-        "active_count": active_count,
-        "value_active_count": int(value_active_count),
-        "_value_active_row_mask": (
-            value_active_mask.detach().cpu().numpy().astype(np.bool_, copy=False)
-        ),
-        "policy_base_accuracy": float(policy_base_accuracy),
-        "policy_aux_accuracy": 0.0,
-        "policy_total_accuracy": float(policy_base_accuracy),
-        "accuracy": float(policy_base_accuracy),
-        "policy_base_top3_accuracy": float(policy_base_top3_accuracy),
-        "policy_aux_top3_accuracy": 0.0,
-        "policy_total_top3_accuracy": float(policy_base_top3_accuracy),
-        "top3_accuracy": float(policy_base_top3_accuracy),
-        "policy_base_phase_stats": phase_stats,
-        "policy_aux_phase_stats": {},
-        "policy_total_phase_stats": phase_stats,
-        "phase_stats": phase_stats,
-        "policy_base_teacher_stats": teacher_stats,
-        "policy_aux_teacher_stats": {},
-        "policy_total_teacher_stats": teacher_stats,
-        "teacher_stats": teacher_stats,
-        "policy_base_phase_stats_unforced": phase_stats_unforced,
-        "policy_aux_phase_stats_unforced": {},
-        "policy_total_phase_stats_unforced": phase_stats_unforced,
-        "phase_stats_unforced": phase_stats_unforced,
-        "optimizer_observability": optimizer_observability,
-    }
 
 
 def _public_award_authoritative_row_mask(
@@ -21810,7 +21282,7 @@ def _belief_resource_coverage(data, *, chunk_rows: int = 262_144) -> dict:
     }
 
 
-def _train_xdim_batch(
+def _train_entity_batch(
     policy,
     optimizer,
     data: dict,
@@ -21899,9 +21371,8 @@ def _train_xdim_batch(
             return_q=float(q_loss_weight) != 0.0,
             # EntityGraph's final-VP head is an auxiliary readout.  Multiplying
             # its loss by zero still builds and traverses the head's autograd
-            # graph (and consumes its dropout RNG).  Omit it when the objective
-            # is exactly off; XDim legacy policies retain their historical
-            # always-emitted head because their forward API has no selector.
+            # graph (and consumes its dropout RNG). Omit it when the objective
+            # is exactly off.
             return_final_vp=float(final_vp_loss_weight) != 0.0,
             return_aux_subgoals=float(aux_subgoal_loss_weight) != 0.0,
             value_trunk_grad_scale=value_trunk_grad_scale,
@@ -24999,32 +24470,24 @@ def evaluate_bc_batches(
         ] = {}
         common_uniform_clean_outcome_squared_error_sum = 0.0
         common_uniform_clean_outcome_eligible_rows = 0
-        eval_fn = _eval_xdim_batch if hasattr(policy, "forward_legal_np") else _eval_candidate_batch
-        eval_fn_extra_kwargs: dict[str, object] = {}
-        if eval_fn is _eval_xdim_batch:
-            eval_fn_extra_kwargs = {
-                "policy_kl_anchor_weight": float(policy_kl_anchor_weight),
-                "policy_kl_anchor_direction": str(policy_kl_anchor_direction),
-                "policy_kl_use_policy_weights": bool(
-                    policy_kl_use_policy_weights
-                ),
-                "value_uncertainty_loss_weight": float(value_uncertainty_loss_weight),
-                "aux_subgoal_loss_weight": float(aux_subgoal_loss_weight),
-                "belief_resource_loss_weight": float(
-                    belief_resource_loss_weight
-                ),
-                "moe_balance_loss_weight": float(moe_balance_loss_weight),
-                "value_categorical_loss_weight": float(value_categorical_loss_weight),
-                "value_hlgauss_sigma_ratio": float(value_hlgauss_sigma_ratio),
-                "value_target_lambda": float(value_target_lambda),
-                "value_root_blend_phases": tuple(value_root_blend_phases),
-                "value_root_blend_global_compat": bool(
-                    value_root_blend_global_compat
-                ),
-                "value_validation_action_types_by_id": (
-                    value_validation_action_types_by_id
-                ),
-            }
+        eval_fn = _eval_entity_batch
+        eval_fn_extra_kwargs: dict[str, object] = {
+            "policy_kl_anchor_weight": float(policy_kl_anchor_weight),
+            "policy_kl_anchor_direction": str(policy_kl_anchor_direction),
+            "policy_kl_use_policy_weights": bool(policy_kl_use_policy_weights),
+            "value_uncertainty_loss_weight": float(value_uncertainty_loss_weight),
+            "aux_subgoal_loss_weight": float(aux_subgoal_loss_weight),
+            "belief_resource_loss_weight": float(belief_resource_loss_weight),
+            "moe_balance_loss_weight": float(moe_balance_loss_weight),
+            "value_categorical_loss_weight": float(value_categorical_loss_weight),
+            "value_hlgauss_sigma_ratio": float(value_hlgauss_sigma_ratio),
+            "value_target_lambda": float(value_target_lambda),
+            "value_root_blend_phases": tuple(value_root_blend_phases),
+            "value_root_blend_global_compat": bool(value_root_blend_global_compat),
+            "value_validation_action_types_by_id": (
+                value_validation_action_types_by_id
+            ),
+        }
         # Validation used to bypass the streaming loader and synchronously
         # reconstruct every ragged memmap batch on the rank's main thread. On a
         # large validation sentinel that leaves the GPU idle while one CPU is
@@ -25521,255 +24984,9 @@ def _run_teacher_quality_gate(
         )
 
 
-def _eval_candidate_batch(
-    policy,
-    data: dict,
-    batch: np.ndarray,
-    policy_sample_weights: np.ndarray,
-    value_sample_weights: np.ndarray,
-    soft_target_temperature: float,
-    soft_target_weight: float,
-    soft_target_source: str,
-    soft_target_min_legal_coverage: float,
-    policy_loss_weight: float,
-    value_loss_weight: float,
-    final_vp_loss_weight: float,
-    q_loss_weight: float,
-    q_skip_teacher_prefixes: tuple[str, ...],
-    vps_to_win: int,
-    advantage_policy_weighting: str,
-    advantage_temperature: float,
-    advantage_weight_cap: float,
-    advantage_weight_floor: float,
-    amp: str = "none",
-    *,
-    policy_target_blend_semantics: str = POLICY_TARGET_BLEND_LEGACY_V1,
-    truncated_vp_margin_value_weight: float = 0.0,
-    scalar_value_objective: str = "mse",
-    scalar_value_loss_readout: str = "raw",
-    scalar_value_loss_scale: float = 1.0,
-) -> dict:
-    del final_vp_loss_weight, q_loss_weight, amp
-    del q_skip_teacher_prefixes
-    del advantage_policy_weighting, advantage_temperature, advantage_weight_cap, advantage_weight_floor
-    import torch
-    from torch import nn
-
-    with torch.no_grad():
-        obs = torch.as_tensor(
-            normalize_observations(data["obs"][batch]),
-            dtype=torch.float32,
-            device=policy.device,
-        )
-        context = _dense_context(data, batch, policy.action_size, policy.context_action_feature_size)
-        context_t = torch.as_tensor(context, dtype=torch.float32, device=policy.device)
-        actions = torch.as_tensor(data["action_taken"][batch].astype(np.int64), device=policy.device)
-        valid = _valid_lists(data["legal_action_ids"][batch])
-        logits, raw_values = policy.forward(obs, context_t)
-        masked = _torch_ppo_masked_logits(logits, valid, policy.action_size)
-        policy_weights = torch.as_tensor(
-            policy_sample_weights[batch],
-            dtype=torch.float32,
-            device=policy.device,
-        )
-        value_weights = torch.as_tensor(
-            value_sample_weights[batch],
-            dtype=torch.float32,
-            device=policy.device,
-        )
-        hard_loss = nn.functional.cross_entropy(masked, actions, reduction="none")
-        soft_targets, has_soft, soft_support = _soft_targets_full(
-            data,
-            batch,
-            policy.action_size,
-            policy.device,
-            soft_target_temperature,
-            soft_target_source,
-            soft_target_min_legal_coverage,
-        )
-        if soft_targets is not None:
-            log_probs = _support_log_softmax(masked, soft_support)
-            soft_loss = -(soft_targets * log_probs).sum(dim=-1)
-            per_sample_loss = _policy_target_per_sample_loss(
-                hard_loss,
-                soft_loss,
-                has_soft,
-                soft_target_weight=soft_target_weight,
-                blend_semantics=policy_target_blend_semantics,
-            )
-        else:
-            per_sample_loss = hard_loss
-        policy_loss_sum, policy_loss_denominator = _weighted_loss_parts(per_sample_loss, policy_weights)
-        policy_loss = policy_loss_sum / torch.clamp(policy_loss_denominator, min=1e-6)
-        (
-            clean_outcome_targets,
-            _,
-            clean_has_outcome,
-            _,
-            outcome_targets,
-            has_outcome,
-            outcome_confidence,
-        ) = _value_targets(
-            data,
-            batch,
-            policy.device,
-            vps_to_win,
-            truncated_vp_margin_value_weight=truncated_vp_margin_value_weight,
-        )
-        value_loss = torch.tensor(0.0, dtype=torch.float32, device=policy.device)
-        scalar_value_mse_diagnostic = torch.tensor(
-            0.0, dtype=torch.float32, device=policy.device
-        )
-        if outcome_targets is not None:
-            (
-                value_error,
-                scalar_value_mse_error,
-                value_prediction,
-            ) = _scalar_value_objective_errors(
-                raw_values,
-                outcome_targets,
-                objective=scalar_value_objective,
-                readout=scalar_value_loss_readout,
-                scale=scalar_value_loss_scale,
-            )
-            value_loss_sum, value_loss_denominator = _weighted_loss_parts(
-                value_error,
-                value_weights * outcome_confidence,
-                mask=has_outcome,
-            )
-            value_loss = value_loss_sum / torch.clamp(value_loss_denominator, min=1e-6)
-            (
-                scalar_value_mse_diagnostic_sum,
-                scalar_value_mse_diagnostic_denominator,
-            ) = _weighted_loss_parts(
-                scalar_value_mse_error,
-                value_weights * outcome_confidence,
-                mask=has_outcome,
-            )
-            scalar_value_mse_diagnostic = (
-                scalar_value_mse_diagnostic_sum
-                / torch.clamp(
-                    scalar_value_mse_diagnostic_denominator, min=1e-6
-                )
-            )
-            common_uniform_clean_outcome_error = (
-                value_prediction - clean_outcome_targets
-            ) ** 2
-            (
-                common_uniform_clean_outcome_squared_error_sum,
-                common_uniform_clean_outcome_eligible_rows,
-            ) = _weighted_loss_parts(
-                common_uniform_clean_outcome_error,
-                torch.ones_like(common_uniform_clean_outcome_error),
-                mask=clean_has_outcome,
-            )
-        else:
-            value_loss_sum, value_loss_denominator = _zero_loss_parts(policy.device)
-            (
-                scalar_value_mse_diagnostic_sum,
-                scalar_value_mse_diagnostic_denominator,
-            ) = _zero_loss_parts(policy.device)
-            (
-                common_uniform_clean_outcome_squared_error_sum,
-                common_uniform_clean_outcome_eligible_rows,
-            ) = _zero_loss_parts(policy.device)
-        loss = float(policy_loss_weight) * policy_loss + float(value_loss_weight) * value_loss
-        predictions = torch.argmax(masked, dim=-1)
-        active = policy_weights > 0.0
-        active_count = int(active.sum().item())
-        accuracy = _masked_metric_mean((predictions == actions).float(), active)
-        top3_accuracy = _topk_full_accuracy(masked, actions, k=3, mask=active)
-        predictions_np = predictions.detach().cpu().numpy()
-        targets_np = actions.detach().cpu().numpy()
-        logits_np = masked.detach().cpu().numpy()
-        active_np = active.detach().cpu().numpy().astype(bool)
-        policy_target_distribution_stats = (
-            _policy_target_distribution_stats(
-                data,
-                batch,
-                masked,
-                soft_targets,
-                has_soft,
-                active,
-                soft_support,
-            )
-        )
-        return {
-            "loss": float(loss.item()),
-            "policy_loss": float(policy_loss.item()),
-            "value_loss": float(value_loss.item()),
-            "primary_value_loss": float(value_loss.item()),
-            "primary_value_loss_kind": _scalar_value_primary_loss_kind(
-                scalar_value_objective
-            ),
-            "scalar_value_mse_diagnostic": float(
-                scalar_value_mse_diagnostic.item()
-            ),
-            "final_vp_loss": 0.0,
-            "q_loss": 0.0,
-            "policy_loss_weighted_sum": float(policy_loss_sum.item()),
-            "policy_loss_weight_sum": float(policy_loss_denominator.item()),
-            "value_loss_weighted_sum": float(value_loss_sum.item()),
-            "value_loss_weight_sum": float(value_loss_denominator.item()),
-            "scalar_value_mse_diagnostic_weighted_sum": float(
-                scalar_value_mse_diagnostic_sum.item()
-            ),
-            "scalar_value_mse_diagnostic_weight_sum": float(
-                scalar_value_mse_diagnostic_denominator.item()
-            ),
-            "_common_uniform_clean_outcome_scalar_squared_error_sum": float(
-                common_uniform_clean_outcome_squared_error_sum.item()
-            ),
-            "_common_uniform_clean_outcome_scalar_eligible_rows": int(
-                common_uniform_clean_outcome_eligible_rows.item()
-            ),
-            "final_vp_loss_weighted_sum": 0.0,
-            "final_vp_loss_weight_sum": 0.0,
-            "q_loss_weighted_sum": 0.0,
-            "q_loss_weight_sum": 0.0,
-            "q_score_rows_ge2": 0,
-            "soft_distillation_rows": int(has_soft.sum().item()) if soft_targets is not None else 0,
-            "soft_distillation_active_rows": (
-                int((has_soft & active).sum().item()) if soft_targets is not None else 0
-            ),
-            "active_count": active_count,
-            "sampled_action_top1_accuracy": float(accuracy.item()),
-            "sampled_action_top3_accuracy": float(top3_accuracy.item()),
-            "policy_target_distribution_stats": (
-                policy_target_distribution_stats
-            ),
-            # Batch-local compatibility aliases. Serialized reports rename
-            # these so sampled behavior cannot be mistaken for teacher fit.
-            "accuracy": float(accuracy.item()),
-            "top3_accuracy": float(top3_accuracy.item()),
-            "phase_stats": _field_stats(
-                data,
-                batch[active_np],
-                predictions_np[active_np],
-                targets_np[active_np],
-                logits_np[active_np],
-                field="phase",
-            ),
-            "phase_stats_unforced": _field_stats_unforced(
-                data,
-                batch[active_np],
-                predictions_np[active_np],
-                targets_np[active_np],
-                logits_np[active_np],
-                field="phase",
-            ),
-            "teacher_stats": _field_stats(
-                data,
-                batch[active_np],
-                predictions_np[active_np],
-                targets_np[active_np],
-                logits_np[active_np],
-                field="teacher_name",
-            ),
-        }
 
 
-def _eval_xdim_batch(
+def _eval_entity_batch(
     policy,
     data: dict,
     batch: np.ndarray,
@@ -26967,6 +26184,7 @@ def load_teacher_data(
         "decision_index",
         "action_mask_version",
         "adapter_version",
+        "actor_resource_counts",
         "winner",
         "terminated",
         "truncated",
@@ -27992,6 +27210,33 @@ def _normalize_teacher_shard(
         width=legal_width,
     ).astype(np.bool_, copy=False)
 
+    # Keep the v6 admission witness exact.  Casting first would turn malformed
+    # floating-point evidence such as ``1.9`` into an apparently valid integer
+    # count and could let a corrupt shard authenticate itself accidentally.
+    if "actor_resource_counts" in shard:
+        raw_actor_resource_counts = np.asarray(shard["actor_resource_counts"])
+        if raw_actor_resource_counts.shape != (n, 5):
+            raise SystemExit(
+                f"{path} has invalid actor_resource_counts shape: "
+                f"{raw_actor_resource_counts.shape}; expected {(n, 5)}"
+            )
+        if raw_actor_resource_counts.dtype.kind not in {"i", "u"}:
+            raise SystemExit(
+                f"{path} actor_resource_counts must use an integral dtype, got "
+                f"{raw_actor_resource_counts.dtype}"
+            )
+        if np.any(raw_actor_resource_counts < 0) or np.any(
+            raw_actor_resource_counts > 19
+        ):
+            raise SystemExit(
+                f"{path} actor_resource_counts must be physical counts in [0, 19]"
+            )
+        actor_resource_counts = raw_actor_resource_counts.astype(
+            np.int16, copy=False
+        )
+    else:
+        actor_resource_counts = np.full((n, 5), -1, dtype=np.int16)
+
     result: dict[str, np.ndarray] = {
         "obs": obs,
         "legal_action_ids": legal,
@@ -28084,6 +27329,7 @@ def _normalize_teacher_shard(
             path,
             leading=n,
         ).astype(str),
+        "actor_resource_counts": actor_resource_counts,
         "winner": _field_or_default(
             shard,
             "winner",
@@ -29101,21 +28347,36 @@ def validate_teacher_data_schema(policy, data: dict, data_quality: dict, env_con
         )
     if len(nonempty_adapters) > 1:
         problems.append(f"mixed adapter_version values: {nonempty_adapters}")
-    if nonempty_adapters == [RUST_ENTITY_ADAPTER_V6] and "player_tokens" in data:
-        invalid_resource_rows, checked_resource_rows = (
-            v6_actor_resource_identity_violations(data["player_tokens"])
-        )
-        if checked_resource_rows != len(actions):
+    if nonempty_adapters == [RUST_ENTITY_ADAPTER_V6]:
+        if "player_tokens" not in data:
             problems.append(
-                "adapter-v6 actor-resource admission could not inspect every row: "
-                f"checked={checked_resource_rows} expected={len(actions)}"
+                "adapter-v6 dataset is missing player_tokens required for "
+                "actor-resource admission"
             )
-        elif invalid_resource_rows:
+        elif "actor_resource_counts" not in data:
             problems.append(
-                "adapter-v6 actor-resource identity failed after physical-scale "
-                "decoding: actor total slot 6 must equal sum slots 16:21; "
-                f"invalid_rows={invalid_resource_rows}/{checked_resource_rows}"
+                "adapter-v6 dataset is missing authoritative actor_resource_counts; "
+                "regenerate current-v6 rows instead of trusting a circular feature-only check"
             )
+        else:
+            invalid_resource_rows, checked_resource_rows = (
+                v6_actor_resource_identity_violations(
+                    data["player_tokens"],
+                    actor_resource_counts=data["actor_resource_counts"],
+                )
+            )
+            if checked_resource_rows != len(actions):
+                problems.append(
+                    "adapter-v6 actor-resource admission could not inspect every row: "
+                    f"checked={checked_resource_rows} expected={len(actions)}"
+                )
+            elif invalid_resource_rows:
+                problems.append(
+                    "adapter-v6 actor-resource identity failed after physical-scale "
+                    "decoding: actor total slot 6 must equal sum slots 16:21 and "
+                    "match authoritative actor_resource_counts; "
+                    f"invalid_rows={invalid_resource_rows}/{checked_resource_rows}"
+                )
     checkpoint_adapter_version = (
         policy_entity_feature_adapter_version(policy)
         if getattr(policy, "policy_type", "") == "entity_graph"
@@ -29555,22 +28816,8 @@ def _load_npz(path: Path):
     return np.load(path, allow_pickle=False)
 
 
-def _dense_context(data: dict, batch: np.ndarray, action_size: int, context_size: int) -> np.ndarray:
-    dense = np.zeros((len(batch), action_size, context_size), dtype=np.float32)
-    valid = data["legal_action_ids"][batch]
-    context = data["legal_action_context"][batch]
-    for row in range(len(batch)):
-        actions = valid[row]
-        keep = actions >= 0
-        dense[row, actions[keep].astype(np.int64), :] = context[row, keep, :context_size]
-    return dense
 
 
-def _valid_lists(values: np.ndarray) -> list[tuple[int, ...]]:
-    # OPT-4: numpy boolean mask + tolist avoids the per-element double int()
-    # cast and the Python filter loop. Output is identical -- non-negative
-    # action ids in original order as a tuple of Python ints, per row.
-    return [tuple(row[row >= 0].tolist()) for row in np.asarray(values)]
 
 
 def _target_columns(legal_action_ids: np.ndarray, actions: np.ndarray) -> np.ndarray:
@@ -30091,7 +29338,7 @@ def _prior_kl_telemetry(
     the identical quantity.
 
     `logits` must already be in the SAME per-row legal-action ordering as
-    data["target_policy"]/data["prior_policy"] (true for _eval_xdim_batch's
+    data["target_policy"]/data["prior_policy"] (true for _eval_entity_batch's
     outputs["logits"], which _soft_targets_legal already relies on for the
     same reason -- see _support_log_softmax above).
     """
@@ -32456,10 +31703,7 @@ def _finalize_phase_stats(stats: dict[str, dict[str, int]]) -> dict[str, dict[st
 
 
 def _params(policy):
-    for name in ("model", "actor", "action_encoder", "action_id_embedding", "action_bias"):
-        module = getattr(policy, name, None)
-        if module is not None:
-            yield from module.parameters()
+    yield from policy.model.parameters()
 
 
 def _optimizer_observability_module_name(parameter_name: str) -> str:
@@ -32558,27 +31802,14 @@ def _objective_gradient_interference(
     therefore measures what reaches shared layers, unlike ``--value-lr-mult``,
     which only changes named value-head parameter groups.
 
-    FSDP flattens logical parameters, so it cannot provide a faithful block-level
-    decomposition here. Report that limitation instead of plausible false data;
-    run this high-information diagnostic on one GPU or DDP. ``autograd.grad``
-    does not trigger DDP's reducer, so DDP gradients are manually all-reduced and
-    world-averaged before any norms or cosines are computed. This reconstructs
-    the gradient that the optimizer actually applies.
+    ``autograd.grad`` does not trigger DDP's reducer, so DDP gradients are
+    manually all-reduced and world-averaged before any norms or cosines are
+    computed. This reconstructs the gradient that the optimizer actually applies.
     """
     import torch
     import torch.distributed as dist
 
     model = policy.model
-    is_fsdp = "FullyShardedDataParallel" in type(model).__name__ or (
-        callable(getattr(model, "clip_grad_norm_", None))
-        and not isinstance(model, torch.nn.parallel.DistributedDataParallel)
-    )
-    if is_fsdp:
-        return {
-            "available": False,
-            "reason": "fsdp_logical_parameters_are_flattened",
-            "recommended_probe": "single_gpu_or_ddp",
-        }
     named = _shared_trunk_named_parameters(policy)
     if not named:
         return {"available": False, "reason": "no_trainable_shared_trunk_parameters"}
@@ -32918,16 +32149,6 @@ def _aux_shared_trunk_gradient_geometry(
     import torch
     import torch.distributed as dist
 
-    model = policy.model
-    is_fsdp = "FullyShardedDataParallel" in type(model).__name__ or (
-        callable(getattr(model, "clip_grad_norm_", None))
-        and not isinstance(model, torch.nn.parallel.DistributedDataParallel)
-    )
-    if is_fsdp:
-        raise RuntimeError(
-            "AUX gradient geometry requires logical DDP parameters; FSDP flattens "
-            "the authenticated inherited-trunk surface"
-        )
     named = _shared_trunk_named_parameters(policy)
     if not named:
         raise RuntimeError("AUX gradient geometry found no inherited trunk parameters")
@@ -33285,9 +32506,7 @@ def _capture_optimizer_observability(policy) -> dict:
     This helper is called only at the existing opt-in train-diagnostics cadence.
     The normal/default path therefore performs no parameter clones, device
     synchronizations, or extra reductions. Under DDP the gradients and parameters
-    are already replicated and synchronized. Under FSDP these per-module values are
-    explicitly rank-local shard diagnostics; the total norm returned by
-    ``_clip_grad_norm`` remains FSDP's authoritative global norm.
+    are already replicated and synchronized.
     """
     model = policy.model
     module = getattr(model, "module", model)
@@ -33495,81 +32714,14 @@ def _optimizer_clip_observability(
     }
 
 
-def _synchronize_fsdp_ignored_gradients(policy) -> None:
-    """Average replicated ignored-parameter gradients in FSDP's process group.
-
-    ``ignored_states`` remain visible to ``FSDP.clip_grad_norm_`` as non-sharded
-    parameters, but FSDP does not synchronize their gradients during backward.
-    Every rank must enter the same collectives even when a locally unused
-    ignored parameter has ``grad is None``.
-    """
-    import torch
-    import torch.distributed as dist
-
-    model = policy.model
-    process_group = getattr(model, "process_group", None)
-    ignored_params = []
-    ignored_param_ids: set[int] = set()
-    for param in getattr(policy, "_fsdp_ignored_params", []) or []:
-        if param.requires_grad and id(param) not in ignored_param_ids:
-            ignored_params.append(param)
-            ignored_param_ids.add(id(param))
-    if not ignored_params:
-        return
-
-    presence_counts = torch.tensor(
-        [int(param.grad is not None) for param in ignored_params],
-        dtype=torch.int32,
-        device=ignored_params[0].device,
-    )
-    dist.all_reduce(
-        presence_counts,
-        op=dist.ReduceOp.SUM,
-        group=process_group,
-    )
-    globally_active = [int(count) > 0 for count in presence_counts.tolist()]
-    world_size = int(dist.get_world_size(group=process_group))
-    for param, active in zip(ignored_params, globally_active, strict=True):
-        if not active:
-            continue
-        grad = param.grad
-        if grad is None:
-            grad = torch.zeros_like(param)
-        dist.all_reduce(
-            grad,
-            op=dist.ReduceOp.SUM,
-            group=process_group,
-        )
-        grad.div_(float(world_size))
-        if param.grad is None:
-            param.grad = grad
 
 
 def _clip_grad_norm(policy, max_norm: float = 1.0):
-    """Clip the gradient norm of ``policy.model``, correct under DDP, FSDP, and
-    single-GPU. FSDP shards parameters, so ``torch.nn.utils.clip_grad_norm_`` over
-    local shards would compute the wrong global norm -- FSDP exposes its own
-    collective ``clip_grad_norm_`` for this. Plain modules and DDP-wrapped modules
-    have no such method, so they take the standard path (byte-identical to the
-    pre-C1 ``torch.nn.utils.clip_grad_norm_(policy.model.parameters(), 1.0)``)."""
+    """Clip the EntityGraph gradient norm under single-GPU or DDP training."""
     import torch
 
     max_norm = _validate_max_grad_norm(max_norm)
     effective_max_norm = math.inf if max_norm == 0.0 else max_norm
-    model = policy.model
-    fsdp_clip = getattr(model, "clip_grad_norm_", None)
-    if callable(fsdp_clip) and not isinstance(
-        model, torch.nn.parallel.DistributedDataParallel
-    ):
-        # FSDP includes ignored 0-dim parameters (e.g. logit_scale) in its
-        # non-sharded norm/clip surface, but it does not synchronize their
-        # gradients during backward. Average them first so every rank clips and
-        # steps the same replicated values.
-        _synchronize_fsdp_ignored_gradients(policy)
-        return fsdp_clip(effective_max_norm)
-    # The legacy candidate policy keeps its actor/action modules beside
-    # ``model`` rather than inside it. `_params` is the historical authoritative
-    # parameter set there; entity/DDP policies yield only ``model.parameters()``.
     return torch.nn.utils.clip_grad_norm_(list(_params(policy)), effective_max_norm)
 
 
@@ -36353,21 +35505,6 @@ def _checkpoint_config_mismatches(
     hidden_size = getattr(config, "hidden_size", None)
     if hidden_size is not None and int(hidden_size) != int(args.hidden_size):
         mismatches.append(f"hidden_size checkpoint={hidden_size} cli={args.hidden_size}")
-    if args.arch == "xdim_graph":
-        token_count = getattr(config, "token_count", None)
-        if token_count is not None and int(token_count) != int(args.graph_tokens):
-            mismatches.append(f"graph_tokens checkpoint={token_count} cli={args.graph_tokens}")
-        board_layers = getattr(config, "board_layers", None)
-        if board_layers is not None and int(board_layers) != int(args.graph_layers):
-            mismatches.append(f"graph_layers checkpoint={board_layers} cli={args.graph_layers}")
-        attention_heads = getattr(config, "attention_heads", None)
-        if attention_heads is not None and int(attention_heads) != int(args.attention_heads):
-            mismatches.append(
-                f"attention_heads checkpoint={attention_heads} cli={args.attention_heads}"
-            )
-        dropout = getattr(config, "dropout", None)
-        if dropout is not None and abs(float(dropout) - float(args.graph_dropout)) > 1.0e-9:
-            mismatches.append(f"graph_dropout checkpoint={dropout} cli={args.graph_dropout}")
     if args.arch == "entity_graph":
         state_trunk = str(getattr(config, "state_trunk", "transformer"))
         requested_state_trunk = str(
@@ -36598,7 +35735,7 @@ def _checkpoint_config_mismatches(
 
 
 def _preflight_init_checkpoint_architecture(args: argparse.Namespace, ddp: dict) -> None:
-    if not args.init_checkpoint or args.arch not in {"xdim_graph", "entity_graph"}:
+    if not args.init_checkpoint:
         return
     import torch
 
@@ -36653,21 +35790,19 @@ def _enforce_35m_model_size(policy, args: argparse.Namespace) -> None:
 
     if not bool(getattr(args, "require_35m_model", False)):
         return
-    if str(args.arch) not in {"xdim_graph", "entity_graph"}:
-        raise SystemExit("--require-35m-model requires --arch xdim_graph or --arch entity_graph")
     count = int(_parameter_count(policy))
     lower = int(args.min_35m_params)
     upper = int(args.max_35m_params)
     if count < lower or count > upper:
         raise SystemExit(
-            f"{args.arch} total checkpoint parameter count is outside the required "
+            "entity_graph total checkpoint parameter count is outside the required "
             "35M range: "
             f"count={count} expected=[{lower}, {upper}]. Check --hidden-size, "
-            "--graph-tokens, and --graph-layers before launching a production BC run."
+            "--graph-layers before launching a production BC run."
         )
 
 
-def _set_xdim_q_branch_trainable(model, trainable: bool) -> None:
+def _set_entity_q_branch_trainable(model, trainable: bool) -> None:
     module = getattr(model, "module", model)
     for name in ("q_state", "q_action", "q_bias", "q_head"):
         layer = getattr(module, name, None)
@@ -37044,8 +36179,7 @@ def _effective_entity_graph_architecture_report(
 def _set_entity_graph_modules_trainable(
     model, group_names, *, trainable: bool
 ) -> list[str]:
-    """Freeze/unfreeze named EntityGraphNet module groups (mirrors
-    ``_set_xdim_q_branch_trainable``'s pattern for the XDim architecture).
+    """Freeze/unfreeze named EntityGraphNet module groups.
 
     Recognized group names are the keys of ``ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS``.
     Raises SystemExit on an unrecognized name. Returns the list of attribute names
@@ -37304,7 +36438,7 @@ def _apply_lr_schedule(
 # This must cover the complete value-only readout path, including the optional
 # attention pool. Otherwise ``--value-lr-mult`` misleadingly slows the final
 # linear head while its fresh value probe/attention layers train at trunk LR.
-# Missing attributes are harmless for XDimLite/XDimGraph.
+# Missing optional EntityGraph attributes are harmless.
 VALUE_HEAD_MODULE_ATTRS: tuple[str, ...] = (
     "value_blocks",
     "value_state_norm",
@@ -38191,7 +37325,7 @@ def _iter_with_last(iterable):
 
 
 def _gradient_sync_context(model, *, accum_do_step: bool):
-    """Suppress DDP/FSDP gradient sync around a complete micro-batch.
+    """Suppress DDP gradient sync around a complete micro-batch.
 
     PyTorch requires ``no_sync`` to cover the forward pass that creates reducer
     hooks, not merely ``backward``.  The caller therefore enters this context
@@ -41710,10 +40844,6 @@ def _validate_adaptive_policy_kl_args(args: argparse.Namespace) -> None:
         raise SystemExit(
             "--policy-kl-target requires --policy-kl-anchor-direction forward"
         )
-    if str(args.arch) not in {"entity_graph", "xdim_graph"}:
-        raise SystemExit(
-            "--policy-kl-target requires --arch entity_graph/xdim_graph"
-        )
     try:
         AdaptivePolicyKLController(
             target_kl=float(target),
@@ -41811,13 +40941,6 @@ def _rank0_print(message: str, ddp: dict[str, int | bool]) -> None:
         print(message, flush=True)
 
 
-def _is_fsdp(model) -> bool:
-    # Single FSDP-detection path: delegate to the shared util so model-weight gather
-    # (_save_policy) and optimizer-state gather (optim_state.save_optimizer_state) can
-    # never disagree on what "is FSDP" means (CAT-128).
-    from catan_zero.rl.optim_state import is_fsdp
-
-    return is_fsdp(model)
 
 
 def _training_resume_recipe_identity(
@@ -41934,7 +41057,6 @@ def _training_resume_recipe_identity(
         "grad_accum_steps": int(args.grad_accum_steps),
         "world_size": int(ddp["world_size"]),
         "ddp_shard_data": bool(args.ddp_shard_data),
-        "fsdp": bool(args.fsdp),
         "policy_aux_active_batch_size": int(args.policy_aux_active_batch_size),
         "policy_dose_lr_area": float(
             getattr(args, "policy_dose_lr_area", 0.0)
@@ -42223,9 +41345,9 @@ def _policy_aux_stream_slice_contract(
 
 def _save_optimizer_sidecar(checkpoint_path: str, policy, optimizer, ddp: dict):
     """CAT-128 patch #8 wrapper: persist optimizer (Adam) state as
-    ``<checkpoint_path>.optimizer.pt`` via the shared FSDP-safe util. MUST be called on
-    every rank (the FSDP gather is collective); the util rank-guards the write and is
-    fail-soft (a save error logs and does not crash the run)."""
+    ``<checkpoint_path>.optimizer.pt`` via the shared DDP-safe util. The util
+    rank-guards the write and is fail-soft (a save error logs and does not crash
+    the run)."""
     from catan_zero.rl.optim_state import save_optimizer_state
 
     return save_optimizer_state(checkpoint_path, policy.model, optimizer, ddp)
@@ -42328,7 +41450,7 @@ def _save_training_progress_sidecar(
     shared_symmetry_rng_state = _require_shared_symmetry_rng_state(
         gathered_symmetry_rng_states
     )
-    # Non-zero DDP/FSDP ranks participate in optimizer/RNG collectives and the
+    # Non-zero DDP ranks participate in optimizer/RNG collectives and the
     # shared-symmetry invariant, but never write.
     if int(ddp["rank"]) != 0:
         return
@@ -42382,55 +41504,21 @@ def _save_policy(
     value_training: dict[str, object] | None = None,
     training_information_surface: dict[str, object] | None = None,
 ) -> None:
-    """Write a policy checkpoint. Safe to call from EVERY rank: single-GPU and
-    DDP write on rank 0 only, while FSDP gathers a full (unsharded) state_dict --
-    a collective every rank must enter -- and writes it on rank 0. The on-disk
-    format is identical across all three paths so a checkpoint loads the same way
-    regardless of how it was trained."""
+    """Write an EntityGraph checkpoint under single-GPU or DDP training."""
     is_rank0 = int(ddp["rank"]) == 0
-
-    # FSDP: gather the full state_dict on all ranks (offloaded to CPU, populated
-    # only on rank 0), then write on rank 0. Keys come back with their original
-    # (unwrapped) names because the model was wrapped with use_orig_params=True,
-    # so the checkpoint is interchangeable with the DDP/single-GPU form.
-    if _is_fsdp(policy.model):
-        from torch.distributed.fsdp import (
-            FullStateDictConfig,
-            FullyShardedDataParallel as FSDP,
-            StateDictType,
-        )
-
-        gather_cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
-        with FSDP.state_dict_type(policy.model, StateDictType.FULL_STATE_DICT, gather_cfg):
-            model_state = policy.model.state_dict()
-        if not is_rank0:
-            return
-        _write_entity_checkpoint(
-            policy,
-            path,
-            model_state,
-            mask_hidden_info,
-            soft_target_source=soft_target_source,
-            value_training=value_training,
-            training_information_surface=training_information_surface,
-        )
-        return
 
     output = Path(path)
     output.parent.mkdir(parents=True, exist_ok=True)
     tmp = output.with_name(f".{output.name}.tmp.{os.getpid()}")
     if not ddp["enabled"]:
         try:
-            if getattr(policy, "policy_type", "") == "entity_graph":
-                policy.save(
-                    tmp,
-                    mask_hidden_info=bool(mask_hidden_info),
-                    soft_target_source=soft_target_source,
-                    value_training=value_training,
-                    training_information_surface=training_information_surface,
-                )
-            else:
-                policy.save(tmp)
+            policy.save(
+                tmp,
+                mask_hidden_info=bool(mask_hidden_info),
+                soft_target_source=soft_target_source,
+                value_training=value_training,
+                training_information_surface=training_information_surface,
+            )
             if not tmp.exists() or tmp.stat().st_size <= 0:
                 raise RuntimeError(f"checkpoint temp file was not written: {tmp}")
             os.replace(tmp, output)
@@ -42464,8 +41552,7 @@ def _write_entity_checkpoint(
     value_training: dict[str, object] | None = None,
     training_information_surface: dict[str, object] | None = None,
 ) -> None:
-    """Atomically write the durable name-keyed checkpoint dict shared by the DDP
-    and FSDP save paths (mirrors EntityGraphPolicy.save's fields)."""
+    """Atomically write the durable DDP checkpoint (mirrors EntityGraphPolicy.save)."""
     import torch
 
     from catan_zero.rl.config_serialization import config_to_dict
@@ -42487,7 +41574,7 @@ def _write_entity_checkpoint(
     tmp = output.with_name(f".{output.name}.tmp.{os.getpid()}")
     try:
         payload = {
-                "policy_type": getattr(policy, "policy_type", "xdim_lite"),
+                "policy_type": "entity_graph",
                 "config": config_to_dict(policy.config),
                 "action_mask_version": str(getattr(policy.config, "action_mask_version", "")),
                 "mask_hidden_info": bool(mask_hidden_info),
@@ -42503,7 +41590,7 @@ def _write_entity_checkpoint(
                     policy.static_action_features.detach().cpu().numpy()
                 ),
                 "static_action_features": policy.static_action_features.detach().cpu(),
-                # DDP/FSDP checkpoints must carry the same executable-forward
+                # DDP checkpoints must carry the same executable-forward
                 # identity as EntityGraphPolicy.save().  Omitting this field
                 # made every distributedly trained checkpoint fail closed at
                 # evaluation even though its commissioned initializer was

@@ -73,6 +73,55 @@ _ENGINE_SETTING_KEYS = frozenset(
 )
 
 
+# Operational/authority fields intentionally excluded from TrainConfig and the
+# checked-in engine_settings envelope. Canonical launches must not inherit
+# these values by copying the internal experimental parser: doing so makes a
+# newly added train_bc flag silently become production behavior. Keep this
+# small baseline explicit and fail closed below when the internal engine grows
+# a field that is not bound by the recipe, public launcher, or this mapping.
+_CANONICAL_RUNTIME_DEFAULTS: dict[str, Any] = {
+    "acknowledge_authoritative_hard_action_targets": False,
+    "validation_game_seed_manifest": "",
+    "validation_game_sentinel_manifest": "",
+    "accepted_policy_target_identity_sha256": [],
+    "require_only_trainable_prefixes": "",
+    "allow_teacher_score_q_loss": False,
+    "allow_legacy_action_mask_upgrade": False,
+    "acknowledge_diagnostic_outcome_conditioned_policy_distillation": False,
+    "a1_learner_ablation_id": "",
+    "a1_scratch_authority_json": "",
+    "a1_scratch_diagnostic_authority_json": "",
+    "a1_effective_learner_recipe_json": "",
+    "a1_effective_learner_recipe_sha256": "",
+    "a1_ablation_code_binding_json": "",
+    "a1_ablation_code_tree_sha256": "",
+    "a1_reviewed_lock_file_sha256": "",
+    "a1_aux_regularization_binding_json": "",
+    "a1_central_learner_binding_json": "",
+    "a1_coherent_corpus_binding_json": "",
+    "a1_central_executor_authority": "",
+    "a1_central_executor_authority_sha256": "",
+    "a1_aux_stage_binding_json": "",
+    "a1_aux_stage_executor_authority": "",
+    "a1_aux_stage_executor_authority_sha256": "",
+    "a1_dual_learner_lock": "",
+    "a1_dual_reviewed_lock_file_sha256": "",
+    "a1_curriculum_parent_receipt": "",
+    "a1_batch_probe_plan": "",
+    "a1_batch_probe_run_id": "",
+    "save_each_epoch": False,
+    "progress_every_batches": 50,
+    "ddp_find_unused_parameters": False,
+    "float32_matmul_precision": None,
+    "require_strict_35m_teacher": False,
+    "skip_guards": False,
+    "config": None,
+    "dump_config": None,
+    "print_config_hash": False,
+    "config_purpose": "train_bc",
+}
+
+
 _OPENING_POLICY_MASS_MINIMUM_KEYS = (
     "minimum_initial_settlement_policy_mass_fraction",
     "minimum_initial_road_policy_mass_fraction",
@@ -326,13 +375,12 @@ def _encode_setting(action: argparse.Action, value: Any) -> list[str]:
 def _engine_default_namespace(
     parser: argparse.ArgumentParser,
 ) -> argparse.Namespace:
-    """Materialize engine defaults without invoking its legacy CLI parser.
+    """Materialize legacy diagnostic defaults without parsing command text.
 
-    ``train_bc`` still owns parser actions temporarily because historical
-    receipts import them, but canonical launches must not translate a typed
-    recipe back into command-line text.  Copying the action defaults produces
-    the same starting namespace as ``parse_args`` while keeping the handoff
-    entirely in process.
+    Historical R&D helpers still import this compatibility function. Canonical
+    production launches do not: :func:`_engine_namespace` starts from the
+    explicit runtime baseline above and obtains all science values from the
+    typed recipe.
     """
 
     values: dict[str, Any] = {}
@@ -359,7 +407,7 @@ def _engine_namespace(
         for action in internal_parser._actions  # noqa: SLF001
         if action.option_strings
     }
-    args = _engine_default_namespace(internal_parser)
+    args = argparse.Namespace(**copy.deepcopy(_CANONICAL_RUNTIME_DEFAULTS))
     settings = dict(config.field_values())
     engine_settings = dict(engine_settings)
     initialization_mode = str(
@@ -426,6 +474,10 @@ def _engine_namespace(
             unsupported.append(name)
             continue
         if value is None and action.default is None:
+            # ``None`` is an explicit typed sentinel for several canonical
+            # settings (for example categorical value and adaptive KL). Bind it
+            # into the namespace instead of relying on the parser to supply it.
+            setattr(args, name, None)
             continue
         # Reuse the internal parser's exact type/choice contract without
         # reconstructing a giant synthetic command line.
@@ -437,6 +489,13 @@ def _engine_namespace(
         raise SystemExit(
             "canonical TrainConfig contains settings the internal trainer does "
             f"not expose: {sorted(unsupported)}"
+        )
+    missing = sorted(set(actions) - {"help"} - set(vars(args)))
+    if missing:
+        raise SystemExit(
+            "canonical train launch leaves internal engine settings unbound; "
+            "bind them in TrainConfig, engine_settings, the public launcher, or "
+            f"the explicit runtime baseline: {missing}"
         )
     guard_dests = (
         "optimizer",

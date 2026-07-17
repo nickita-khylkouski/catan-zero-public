@@ -295,10 +295,10 @@
     }
   ],
   "fleet": {
-    "fleet_manifest": "../gpu_fleet_64.json",
-    "quota_policy": "balanced_prefix_v1",
+    "fleet_manifest": "../gpu_fleet_h100_8x6.json",
+    "quota_policy": "pilot_one_8gpu_node_v1",
     "seed_base": "__UNRESOLVED__",
-    "seed_block_size": 1000,
+    "seed_block_size": 32,
     "seed_ledger": "__UNRESOLVED__",
     "output_root": "__UNRESOLVED__"
   },

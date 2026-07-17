@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import resource
 import sys
 from pathlib import Path
 from typing import Sequence
@@ -34,6 +35,7 @@ from generate_gumbel_selfplay_data import main as _legacy_executor_main  # noqa:
 
 
 CANONICAL_OPTION_COUNT = 9
+REQUIRED_NOFILE_SOFT = 65_536
 
 # These are not tuning knobs on the production path anymore.  Historical
 # configs remain replayable through generate_gumbel_selfplay_data.py, while the
@@ -212,6 +214,19 @@ def _executor_argv(args: argparse.Namespace) -> list[str]:
     return forwarded
 
 
+def _ensure_runtime_limits() -> None:
+    """Raise the worker FD budget before the legacy prelaunch guard runs."""
+
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    unlimited = resource.RLIM_INFINITY
+    if hard != unlimited and hard < REQUIRED_NOFILE_SOFT:
+        raise RuntimeError(
+            f"hard RLIMIT_NOFILE {hard} is below required {REQUIRED_NOFILE_SOFT}"
+        )
+    if soft != unlimited and soft < REQUIRED_NOFILE_SOFT:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (REQUIRED_NOFILE_SOFT, hard))
+
+
 def main(argv: Sequence[str] | None = None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -230,8 +245,11 @@ def main(argv: Sequence[str] | None = None) -> None:
         parser.error("--base-seed must be non-negative")
     try:
         _validate_config(args.config.expanduser())
+        _ensure_runtime_limits()
     except ValueError as error:
         parser.error(str(error))
+    except (OSError, RuntimeError) as error:
+        parser.error(f"cannot prepare generation runtime: {error}")
     _legacy_executor_main(_executor_argv(args))
 
 
