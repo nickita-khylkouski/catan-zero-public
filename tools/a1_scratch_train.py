@@ -184,6 +184,7 @@ def _science_authority(lock: Mapping[str, Any]) -> dict[str, Any]:
             evaluator_value=science.get("evaluator"),
             generation_value=lock.get("generation"),
             learner_recipe_value=science.get("learner_training_recipe"),
+            learner_value_objective_value=science.get("learner_value_objective"),
             target_regime=lock.get("post_wave_acceptance", {}).get(
                 "require_target_information_regime"
             ),

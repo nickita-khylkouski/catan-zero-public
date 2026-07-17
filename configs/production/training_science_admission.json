@@ -2,7 +2,7 @@
   "schema_version": "catan-zero-training-science-admission-v1",
   "recipes": {
     "a1-current-35m-b200": {
-      "recipe_canonical_sha256": "e7d2d234d07db747dcdbbba98d9a9b31e1a7c6bf703ac8b403429b552742195f",
+      "recipe_canonical_sha256": "e4b7ff452f1605c7084e5a28abfb579e8eb5fa35846ad4089708b014177d9e82",
       "authorized": false,
       "reason": "scratch_training_signal_contract_unresolved",
       "unresolved_requirements": [
@@ -14,12 +14,13 @@
       "observations": {
         "architecture_information_surface": "spatial_state_topology_aliasing",
         "retained_composite_adapter_status": "adapter_v2_only",
-        "opening_policy_loss_mass_fraction": 0.027885
+        "opening_policy_loss_mass_fraction": 0.027885,
+        "scalar_value_objective": "binary_win_bce_logit_equivalent_deployed_tanh"
       },
       "commissioning_evidence": []
     },
     "a1-parent-update-35m-b200": {
-      "recipe_canonical_sha256": "da77bf63dcbd25e966d8e043949fa71574ab40efdf5cac209e19f0f3d6b1b222",
+      "recipe_canonical_sha256": "837655af21b288a97c9fb6fe07cbf84851096c9c322e56223701c3c48a757002",
       "authorized": false,
       "reason": "parent_update_training_signal_contract_unresolved",
       "unresolved_requirements": [
@@ -31,7 +32,8 @@
       "observations": {
         "architecture_information_surface": "spatial_state_topology_aliasing",
         "retained_composite_adapter_status": "adapter_v2_only",
-        "opening_policy_loss_mass_fraction": 0.027885
+        "opening_policy_loss_mass_fraction": 0.027885,
+        "scalar_value_objective": "binary_win_bce_logit_equivalent_deployed_tanh"
       },
       "commissioning_evidence": []
     }

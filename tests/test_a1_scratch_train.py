@@ -18,12 +18,7 @@ def _science_binding() -> dict:
         "science_schema_version": "a1-pre-wave-science-v2",
         "search_operator": current_science.search(),
         "evaluator": current_science.evaluator(),
-        "learner_value_objective": {
-            "objective": "scalar_mse",
-            "value_readout": "deployed_tanh",
-            "value_categorical_bins": 0,
-            "hlgauss_sigma_ratio": 0.75,
-        },
+        "learner_value_objective": current_science.learner_value_objective(),
         "learner_training_recipe": current_science.learner_training_recipe(),
         "learner_initialization": current_science.learner_initialization(),
         "learner_model_construction": current_science.learner_model_construction(),

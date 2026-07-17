@@ -4726,17 +4726,20 @@ def _validate_learner_objective(value: dict[str, Any]) -> None:
             raise ContractError(
                 "HL-Gauss learner objective requires the locked sigma ratio 0.75"
             )
-    elif objective == "mse":
+    elif objective in {"mse", "binary_win_bce"}:
         if readout != "scalar" or value["value_categorical_bins"] is not None:
             raise ContractError(
-                "MSE learner objective requires scalar readout and null categorical bins"
+                f"{objective} learner objective requires scalar readout and null "
+                "categorical bins"
             )
         if value["hlgauss_sigma_ratio"] is not None:
             raise ContractError(
-                "MSE learner objective requires null HL-Gauss sigma ratio"
+                f"{objective} learner objective requires null HL-Gauss sigma ratio"
             )
     else:
-        raise ContractError("learner objective must be 'hlgauss' or 'mse'")
+        raise ContractError(
+            "learner objective must be 'hlgauss', 'mse', or 'binary_win_bce'"
+        )
 
 
 def _validate_learner_training_recipe(
@@ -7179,6 +7182,7 @@ def build_lock(
                 evaluator_value=evaluator,
                 generation_value=generation,
                 learner_recipe_value=learner_training_recipe,
+                learner_value_objective_value=learner_objective,
                 target_regime=target_information_regime,
                 require_adopted=True,
             )
@@ -7801,6 +7805,7 @@ def verify_lock(
                 evaluator_value=evaluator,
                 generation_value=lock.get("generation"),
                 learner_recipe_value=learner_training_recipe,
+                learner_value_objective_value=learner_objective,
                 target_regime=target_information_regime,
                 require_adopted=True,
             )

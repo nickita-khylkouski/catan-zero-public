@@ -103,6 +103,7 @@ PRODUCTION_LEARNER_SIGNAL_CONTRACT = {
     "max_grad_norm": 1.0,
     "fused_optimizer": True,
     "amp": "bf16",
+    "scalar_value_objective": "binary_win_bce",
     "value_lr_mult": 1.0,
     # Adam can cancel a constant parameter-group LR interpretation through its
     # first/second moments, so this is an explicit autograd-boundary scale. The
@@ -247,9 +248,15 @@ PRODUCTION_LEARNER_SELECTION_CONTRACT = {
     "recipe": "a1-parent-update-35m-b200",
     "config_path": "configs/training/a1_parent_update_35m_b200.schema1.json",
     "config_canonical_sha256": (
-        "da77bf63dcbd25e966d8e043949fa71574ab40efdf5cac209e19f0f3d6b1b222"
+        "837655af21b288a97c9fb6fe07cbf84851096c9c322e56223701c3c48a757002"
     ),
     "scratch_status": "research_only_unresolved_not_selected",
+}
+PRODUCTION_LEARNER_VALUE_OBJECTIVE_CONTRACT = {
+    "objective": "binary_win_bce",
+    "value_readout": "scalar",
+    "value_categorical_bins": None,
+    "hlgauss_sigma_ratio": None,
 }
 DIAGNOSTIC_POLICY_AUX_FIELDS = frozenset(
     {"policy_aux_active_batch_size", "policy_aux_loss_weight"}
@@ -405,6 +412,7 @@ def _load() -> dict[str, Any]:
     learner_value = value["learner"]
     if set(learner_value) != {
         "production_selection",
+        "value_objective",
         "initialization",
         "architecture_upgrade_flags",
         "architecture_upgrade_module",
@@ -419,6 +427,11 @@ def _load() -> dict[str, Any]:
         != PRODUCTION_LEARNER_SELECTION_CONTRACT
     ):
         raise ScienceContractError("current production learner selection drifted")
+    if (
+        learner_value.get("value_objective")
+        != PRODUCTION_LEARNER_VALUE_OBJECTIVE_CONTRACT
+    ):
+        raise ScienceContractError("current production learner value objective drifted")
     selected_config = _read_object(CANONICAL_PARENT_UPDATE_CONFIG_PATH)
     if (
         _content_sha256(selected_config).removeprefix("sha256:")
@@ -543,14 +556,17 @@ def _load() -> dict[str, Any]:
         evaluator_value.get("value_readout") == "scalar"
         and evaluator_value.get("value_squash") == "tanh"
         and (
-            recipe.get("scalar_value_loss_readout") != "deployed_tanh"
+            recipe.get("scalar_value_objective") != "binary_win_bce"
+            or learner_value.get("value_objective")
+            != PRODUCTION_LEARNER_VALUE_OBJECTIVE_CONTRACT
+            or recipe.get("scalar_value_loss_readout") != "deployed_tanh"
             or recipe.get("scalar_value_loss_scale")
             != evaluator_value.get("value_scale")
         )
     ):
         raise ScienceContractError(
-            "current scalar learner must optimize the exact deployed tanh "
-            "search readout and scale"
+            "current scalar learner must optimize stable binary win BCE over "
+            "the exact deployed tanh search readout and scale"
         )
     _validate_target_quality_artifacts(value)
     return value
@@ -578,6 +594,10 @@ def learner() -> dict[str, Any]:
 
 def learner_production_selection() -> dict[str, Any]:
     return copy.deepcopy(_load()["learner"]["production_selection"])
+
+
+def learner_value_objective() -> dict[str, Any]:
+    return copy.deepcopy(_load()["learner"]["value_objective"])
 
 
 def require_selected_parent_update(config_path: str | Path) -> Path:
@@ -646,6 +666,7 @@ def require_current_operator(
     evaluator_value: Mapping[str, Any] | None = None,
     generation_value: Mapping[str, Any] | None = None,
     learner_recipe_value: Mapping[str, Any] | None = None,
+    learner_value_objective_value: Mapping[str, Any] | None = None,
     target_regime: str | None = None,
     require_adopted: bool = False,
 ) -> None:
@@ -712,6 +733,19 @@ def require_current_operator(
             raise ScienceContractError(
                 "coherent-public learner recipe differs from current science "
                 f"contract: {differing}"
+            )
+    if learner_value_objective_value is not None:
+        expected_objective = learner_value_objective()
+        actual_objective = dict(learner_value_objective_value)
+        if actual_objective != expected_objective:
+            differing = sorted(
+                key
+                for key in set(actual_objective) | set(expected_objective)
+                if actual_objective.get(key) != expected_objective.get(key)
+            )
+            raise ScienceContractError(
+                "coherent-public learner value objective differs from current "
+                f"science contract: {differing}"
             )
     if target_regime is not None and target_regime != target_information_regime():
         raise ScienceContractError(

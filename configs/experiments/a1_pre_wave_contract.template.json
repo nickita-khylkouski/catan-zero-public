@@ -135,6 +135,7 @@
       "soft_target_temperature": 1.0,
       "soft_target_min_legal_coverage": 1.0,
       "value_loss_weight": 0.25,
+      "scalar_value_objective": "binary_win_bce",
       "scalar_value_loss_readout": "deployed_tanh",
       "scalar_value_loss_scale": 1.0,
       "value_trunk_grad_scale": 0.25,

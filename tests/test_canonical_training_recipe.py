@@ -153,6 +153,18 @@ def test_canonical_recipe_catalog_is_bound_to_role(
     train._load_recipe(recipe)
 
 
+@pytest.mark.parametrize("recipe", (RECIPE, PARENT_RECIPE))
+def test_canonical_scalar_value_objective_uses_stable_binary_win_bce(
+    recipe: Path,
+) -> None:
+    payload = json.loads(recipe.read_text(encoding="utf-8"))
+    engine = payload["engine_settings"]
+
+    assert engine["scalar_value_objective"] == "binary_win_bce"
+    assert engine["scalar_value_loss_readout"] == "deployed_tanh"
+    assert engine["scalar_value_loss_scale"] == 1.0
+
+
 def test_parent_update_recipe_reproduces_split1_selected_step12() -> None:
     payload = json.loads(PARENT_RECIPE.read_text(encoding="utf-8"))
     engine = payload["engine_settings"]

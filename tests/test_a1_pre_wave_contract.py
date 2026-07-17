@@ -1801,6 +1801,17 @@ def test_a0_retain_scalar_is_valid_and_separate_from_teacher_readout(
     assert lock["science"]["value_readout"] == "scalar"
 
 
+def test_binary_win_bce_is_a_scalar_learner_objective_contract() -> None:
+    contract._validate_learner_objective(  # noqa: SLF001
+        {
+            "objective": "binary_win_bce",
+            "value_readout": "scalar",
+            "value_categorical_bins": None,
+            "hlgauss_sigma_ratio": None,
+        }
+    )
+
+
 def test_seal_rejects_nonpassing_a0_evidence(tmp_path: Path) -> None:
     draft = _resolved_draft(tmp_path)
     payload = json.loads(draft.read_text())

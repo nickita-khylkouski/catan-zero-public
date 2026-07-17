@@ -885,7 +885,9 @@ def test_current_coherent_one_dose_requires_selected_parent_update_authority(
             "learner_training_recipe": (
                 executor.current_science.learner_training_recipe()
             ),
-            "learner_value_objective": _objective(),
+            "learner_value_objective": (
+                executor.current_science.learner_value_objective()
+            ),
             "learner_initialization": initialization,
             "learner_initialization_sha256": executor._value_sha256(initialization),
         },
@@ -1524,6 +1526,9 @@ def test_canonical_parent_update_binds_12_step_8x64_recipe(tmp_path: Path) -> No
     assert bound["recipe"]["world_size"] == 8
     assert bound["recipe"]["batch_size"] == 64
     assert bound["recipe"]["global_batch_size"] == 512
+    assert bound["recipe"]["scalar_value_objective"] == "binary_win_bce"
+    assert bound["recipe"]["scalar_value_loss_readout"] == "deployed_tanh"
+    assert bound["recipe"]["scalar_value_loss_scale"] == 1.0
     assert bound["canonical_parent_update"]["parent_checkpoint_sha256"] == (
         producer["sha256"]
     )
@@ -1561,6 +1566,9 @@ def test_canonical_parent_update_binds_12_step_8x64_recipe(tmp_path: Path) -> No
         report=tmp_path / "report.json",
     )
     assert _option(command, "--checkpoint-steps") == "8"
+    assert _option(command, "--scalar-value-objective") == "binary_win_bce"
+    assert _option(command, "--scalar-value-loss-readout") == "deployed_tanh"
+    assert _option(command, "--scalar-value-loss-scale") == "1.0"
 
 
 def test_canonical_parent_update_rejects_malformed_checkpoint_frontier(

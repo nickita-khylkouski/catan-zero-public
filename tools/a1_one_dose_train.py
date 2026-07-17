@@ -1736,6 +1736,9 @@ def _require_a1_science(
                 evaluator_value=science.get("evaluator"),
                 generation_value=lock.get("generation"),
                 learner_recipe_value=science.get("learner_training_recipe"),
+                learner_value_objective_value=science.get(
+                    "learner_value_objective"
+                ),
                 target_regime=lock.get("post_wave_acceptance", {}).get(
                     "require_target_information_regime"
                 ),
@@ -1775,15 +1778,23 @@ def _require_a1_science(
         raise ExecutorError(
             "sealed A1 learner recipe differs from the exact one-dose recipe"
         )
-    objective = science.get("learner_value_objective")
-    if objective != {
-        "objective": "mse",
-        "value_readout": "scalar",
-        "value_categorical_bins": None,
-        "hlgauss_sigma_ratio": None,
-    }:
-        raise ExecutorError("current A1 one-dose executor requires scalar MSE/readout")
     coherent_search = current_science.is_coherent_search(search)
+    objective = science.get("learner_value_objective")
+    expected_objective = (
+        current_science.learner_value_objective()
+        if coherent_search
+        else {
+            "objective": "mse",
+            "value_readout": "scalar",
+            "value_categorical_bins": None,
+            "hlgauss_sigma_ratio": None,
+        }
+    )
+    if objective != expected_objective:
+        raise ExecutorError(
+            "current A1 one-dose executor requires the contract-bound scalar "
+            "value objective/readout"
+        )
     expected_value_lr_mult = (
         current_science.PRODUCTION_LEARNER_SIGNAL_CONTRACT["value_lr_mult"]
         if coherent_search
@@ -2272,6 +2283,23 @@ def bind_canonical_parent_update_recipe(
     if verified.get("data_kind") != "production_composite_v2":
         raise ExecutorError("canonical parent update requires a production composite")
     recipe = dataclasses.asdict(config)
+    scalar_contract = {
+        key: engine.get(key)
+        for key in (
+            "scalar_value_objective",
+            "scalar_value_loss_readout",
+            "scalar_value_loss_scale",
+        )
+    }
+    if scalar_contract != {
+        "scalar_value_objective": "binary_win_bce",
+        "scalar_value_loss_readout": "deployed_tanh",
+        "scalar_value_loss_scale": 1.0,
+    }:
+        raise ExecutorError(
+            "canonical parent-update scalar value objective contract drifted"
+        )
+    recipe.update(scalar_contract)
     # The schema records the per-rank B200 batch.  Bind a logical one-rank
     # recipe here so bind_training_topology can prove the exact 8x64=512 dose.
     recipe.update(
@@ -5800,6 +5828,14 @@ def _build_direct_train_command(
             str(recipe["soft_target_min_legal_coverage"]),
             "--value-loss-weight",
             str(recipe["value_loss_weight"]),
+            *(
+                [
+                    "--scalar-value-objective",
+                    str(recipe["scalar_value_objective"]),
+                ]
+                if "scalar_value_objective" in recipe
+                else []
+            ),
             "--scalar-value-loss-readout",
             str(recipe.get("scalar_value_loss_readout", "raw")),
             "--scalar-value-loss-scale",
@@ -9735,19 +9771,15 @@ def _verify_training_outputs(
             recipe["value_player_outcome_balance_mode"]
         )
     if "scalar_value_loss_readout" in recipe:
-        expected["scalar_value_loss_contract"] = {
-            "schema_version": "scalar-value-loss-readout-v1",
-            "readout": str(recipe["scalar_value_loss_readout"]),
-            "scale": float(recipe["scalar_value_loss_scale"]),
-            "formula": (
-                "raw"
-                if recipe["scalar_value_loss_readout"] == "raw"
-                else "tanh(raw * scale)"
-            ),
-            "matches_scalar_mcts_when_value_squash_tanh": (
-                recipe["scalar_value_loss_readout"] == "deployed_tanh"
-            ),
-        }
+        expected["scalar_value_loss_contract"] = train_bc._scalar_value_loss_contract(  # noqa: SLF001
+            argparse.Namespace(
+                scalar_value_objective=str(
+                    recipe.get("scalar_value_objective", "mse")
+                ),
+                scalar_value_loss_readout=str(recipe["scalar_value_loss_readout"]),
+                scalar_value_loss_scale=float(recipe["scalar_value_loss_scale"]),
+            )
+        )
     if isinstance(learner_ablation, dict):
         # These post-seal optimizer axes are required evidence for diagnostic
         # arms, while legacy production reports retain their historical shape.

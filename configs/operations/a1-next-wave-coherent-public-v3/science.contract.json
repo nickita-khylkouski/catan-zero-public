@@ -119,8 +119,14 @@
       "mode": "canonical_parent_update",
       "recipe": "a1-parent-update-35m-b200",
       "config_path": "configs/training/a1_parent_update_35m_b200.schema1.json",
-      "config_canonical_sha256": "da77bf63dcbd25e966d8e043949fa71574ab40efdf5cac209e19f0f3d6b1b222",
+      "config_canonical_sha256": "837655af21b288a97c9fb6fe07cbf84851096c9c322e56223701c3c48a757002",
       "scratch_status": "research_only_unresolved_not_selected"
+    },
+    "value_objective": {
+      "objective": "binary_win_bce",
+      "value_readout": "scalar",
+      "value_categorical_bins": null,
+      "hlgauss_sigma_ratio": null
     },
     "initialization": {
       "mode": "from_scratch",
@@ -214,6 +220,7 @@
       "soft_target_temperature": 1.0,
       "soft_target_min_legal_coverage": 1.0,
       "value_loss_weight": 0.25,
+      "scalar_value_objective": "binary_win_bce",
       "scalar_value_loss_readout": "deployed_tanh",
       "scalar_value_loss_scale": 1.0,
       "value_target_lambda": 1.0,

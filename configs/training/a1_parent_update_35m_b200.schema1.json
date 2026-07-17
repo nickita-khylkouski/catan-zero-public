@@ -17,7 +17,7 @@
     "required_target_information_regime": "public_belief_single_tree_v1",
     "scalar_value_loss_readout": "deployed_tanh",
     "scalar_value_loss_scale": 1.0,
-    "scalar_value_objective": "mse",
+    "scalar_value_objective": "binary_win_bce",
     "skip_teacher_quality_gate": true,
     "train_diagnostics_every_batches": 8,
     "trust_curated_data_quality": true,

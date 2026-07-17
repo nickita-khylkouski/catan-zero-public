@@ -533,10 +533,10 @@ def test_binary_win_bce_uses_logistic_equivalent_of_deployed_tanh() -> None:
     assert torch.isfinite(raw.grad).all()
 
 
-def test_binary_win_bce_preserves_gradient_on_confidently_wrong_value() -> None:
+def test_binary_win_bce_preserves_large_gradient_on_confidently_wrong_value() -> None:
     torch = pytest.importorskip("torch")
     target = torch.tensor([-1.0])
-    raw_mse = torch.tensor([4.0], requires_grad=True)
+    raw_mse = torch.tensor([5.0], requires_grad=True)
     mse, _, _ = train_bc._scalar_value_objective_errors(
         raw_mse,
         target,
@@ -547,7 +547,7 @@ def test_binary_win_bce_preserves_gradient_on_confidently_wrong_value() -> None:
     mse.mean().backward()
     mse_gradient = abs(float(raw_mse.grad.item()))
 
-    raw_bce = torch.tensor([4.0], requires_grad=True)
+    raw_bce = torch.tensor([5.0], requires_grad=True)
     bce, _, _ = train_bc._scalar_value_objective_errors(
         raw_bce,
         target,
@@ -558,7 +558,7 @@ def test_binary_win_bce_preserves_gradient_on_confidently_wrong_value() -> None:
     bce.mean().backward()
     bce_gradient = abs(float(raw_bce.grad.item()))
 
-    assert bce_gradient > 100.0 * mse_gradient
+    assert bce_gradient > 1_000.0 * mse_gradient
 
 
 def test_xdim_binary_win_bce_keeps_mse_as_a_separate_diagnostic() -> None:

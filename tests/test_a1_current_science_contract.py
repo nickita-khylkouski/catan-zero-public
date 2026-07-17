@@ -11,6 +11,14 @@ from tools import a1_current_science_contract as current_science
 def test_current_production_learner_binds_full_value_and_exact_dose() -> None:
     recipe = current_science.learner_training_recipe()
 
+    assert recipe["scalar_value_objective"] == "binary_win_bce"
+    assert current_science.learner_value_objective() == {
+        "objective": "binary_win_bce",
+        "value_readout": "scalar",
+        "value_categorical_bins": None,
+        "hlgauss_sigma_ratio": None,
+    }
+
     assert (
         current_science.learner_production_selection()
         == current_science.PRODUCTION_LEARNER_SELECTION_CONTRACT
