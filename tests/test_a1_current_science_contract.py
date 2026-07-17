@@ -104,6 +104,7 @@ def test_current_learner_selects_parent_update_and_keeps_scratch_research_only()
     assert set(
         recipe["require_feature_learning_signal_modules"].split(",")
     ) == {
+        "action_cross_blocks",
         "event_encoder",
         "final_vp_head",
         "target_gather_proj",
@@ -120,6 +121,8 @@ def test_current_learner_selects_parent_update_and_keeps_scratch_research_only()
         "public_rule_state_residual",
         "static_action_residual_proj",
         "topology_residual_adapter",
+        "v6_exact_resource_residual",
+        "v6_initial_road_residual",
         "value_blocks",
         "value_head",
         "value_state_norm",
