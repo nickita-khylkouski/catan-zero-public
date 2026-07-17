@@ -93,13 +93,9 @@ def _exact_runtime_report() -> dict[str, object]:
         "torch_cuda_version": executor.PRODUCTION_RUNTIME["torch_cuda_version"],
         "dependency_versions": {
             name: executor.PRODUCTION_RUNTIME[f"{name}_version"]
-            for name in (
-                "numpy", "networkx", "gymnasium", "zstandard", "scipy", "whr"
-            )
+            for name in ("numpy", "networkx", "gymnasium", "zstandard", "scipy", "whr")
         },
-        "nvidia_driver_version": executor.PRODUCTION_RUNTIME[
-            "nvidia_driver_version"
-        ],
+        "nvidia_driver_version": executor.PRODUCTION_RUNTIME["nvidia_driver_version"],
     }
 
 
@@ -199,7 +195,12 @@ def _fixture(
             "eval_server": False,
         },
         "checkpoints": [
-            {"id": "producer", "role": "producer", "path": str(checkpoint), "sha256": _sha(checkpoint)}
+            {
+                "id": "producer",
+                "role": "producer",
+                "path": str(checkpoint),
+                "sha256": _sha(checkpoint),
+            }
         ],
         "fleet": {"seed_ledger": {"path": str(ledger)}, "jobs": []},
         "game_contract": {
@@ -263,7 +264,9 @@ def _fixture(
             argv = contract._generator_argv(lock, job, mix_paths=mix_paths)
             attestation = tmp_path / "attestations" / f"{job_id}.json"
             attestation.parent.mkdir(parents=True, exist_ok=True)
-            attestation.write_text(json.dumps({"job_id": job_id}) + "\n", encoding="utf-8")
+            attestation.write_text(
+                json.dumps({"job_id": job_id}) + "\n", encoding="utf-8"
+            )
             claim_row = contract._ledger_claim_row(lock, job)
             environment = contract._job_environment(lock, job)
             config_provenance = contract._expected_generate_config_provenance(
@@ -275,18 +278,33 @@ def _fixture(
             )
             commands.append(
                 {
-                    **{key: job[key] for key in ("job_id", "worker_id", "host_alias", "gpu", "category")},
+                    **{
+                        key: job[key]
+                        for key in (
+                            "job_id",
+                            "worker_id",
+                            "host_alias",
+                            "gpu",
+                            "category",
+                        )
+                    },
                     "environment": environment,
                     "environment_sha256": contract._digest_value(environment),
                     "config_provenance": config_provenance,
                     "python": "python",
                     "argv": argv,
                     "argv_sha256": contract._digest_value(argv),
-                    "ledger_claim": {"path": str(ledger), "row": claim_row, "row_sha256": contract._digest_value(claim_row)},
+                    "ledger_claim": {
+                        "path": str(ledger),
+                        "row": claim_row,
+                        "row_sha256": contract._digest_value(claim_row),
+                    },
                     "output_attestation": {
                         "source": str(attestation),
                         "source_file_sha256": _sha(attestation),
-                        "destination": str(Path(job["output_dir"]) / "a1_contract.json"),
+                        "destination": str(
+                            Path(job["output_dir"]) / "a1_contract.json"
+                        ),
                     },
                     "must_run_after": [] if previous is None else [previous],
                 }
@@ -330,7 +348,10 @@ def _hosts(tmp_path: Path, rendered: dict) -> Path:
                 "ssh_key": str(key),
                 "remote_root": "/home/ubuntu/a1-production",
                 "python": "/usr/bin/python3",
-                "hosts": {alias: f"10.0.0.{index + 1}" for index, alias in enumerate(sorted(aliases))},
+                "hosts": {
+                    alias: f"10.0.0.{index + 1}"
+                    for index, alias in enumerate(sorted(aliases))
+                },
             }
         ),
         encoding="utf-8",
@@ -352,9 +373,7 @@ def test_remote_install_exact_hit_skips_transfer(
         return subprocess.CompletedProcess([], 0, "", "")
 
     monkeypatch.setattr(executor, "_ssh", exact_precheck)
-    monkeypatch.setattr(
-        executor, "_scp", lambda *args: scp_calls.append(args)
-    )
+    monkeypatch.setattr(executor, "_scp", lambda *args: scp_calls.append(args))
     executor._remote_install(
         {
             "python": sys.executable,
@@ -471,9 +490,10 @@ def test_bulk_install_validates_every_member_before_installing(tmp_path: Path) -
         [(source, str(remote / "artifact"), _sha(source))], bundle
     )
     rebuilt = tmp_path / "tampered.tar"
-    with tarfile.open(bundle) as original, tarfile.open(
-        rebuilt, "w", format=tarfile.USTAR_FORMAT
-    ) as tampered:
+    with (
+        tarfile.open(bundle) as original,
+        tarfile.open(rebuilt, "w", format=tarfile.USTAR_FORMAT) as tampered,
+    ):
         for member in original.getmembers():
             data = original.extractfile(member).read()
             if member.name.startswith("payload/"):
@@ -505,9 +525,7 @@ def test_bulk_install_validates_every_member_before_installing(tmp_path: Path) -
 
 def test_stage_files_are_alias_scoped_except_global_artifacts(tmp_path: Path) -> None:
     _lock_path, _render_path, lock, rendered = _fixture(tmp_path)
-    required = rendered["required_artifacts"] | {
-        "checkpoints": lock["checkpoints"]
-    }
+    required = rendered["required_artifacts"] | {"checkpoints": lock["checkpoints"]}
     lanes = {
         "h00_gpu0": rendered["commands"][:3],
         "h01_gpu0": rendered["commands"][12:15],
@@ -583,7 +601,9 @@ def test_live_shaped_db1_runtime_paths_relocate_to_identical_current_bytes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     historical, current, relative, digest = _historical_repo_pair(tmp_path)
-    campaign = historical / "configs/operations/a1-dual-arm-56gpu-20260710/contract.json"
+    campaign = (
+        historical / "configs/operations/a1-dual-arm-56gpu-20260710/contract.json"
+    )
     monkeypatch.setattr(executor, "HISTORICAL_DB1_REPO_ROOT", historical)
     monkeypatch.setattr(executor, "HISTORICAL_DB1_CAMPAIGN_PATH", campaign)
     lock = {
@@ -691,9 +711,7 @@ def test_dry_plan_is_exact_40_lane_120_job_n128_mps_contract(
 ) -> None:
     lock_path, render_path, lock, rendered = _fixture(tmp_path)
     hosts = _hosts(tmp_path, rendered)
-    monkeypatch.setattr(
-        executor, "_repo_artifacts", lambda _rendered, **_kwargs: []
-    )
+    monkeypatch.setattr(executor, "_repo_artifacts", lambda _rendered, **_kwargs: [])
     plan = executor.build_plan(
         lock_path=lock_path,
         render_path=render_path,
@@ -708,11 +726,21 @@ def test_dry_plan_is_exact_40_lane_120_job_n128_mps_contract(
     assert all("--resume" in command["argv"] for command in rendered["commands"])
     assert all(
         command["environment"]["CATAN_ZERO_CONFIG_REGISTRY"]
-        == str(Path(command["argv"][command["argv"].index("--out-dir") + 1]) / "config_registry.jsonl")
+        == str(
+            Path(command["argv"][command["argv"].index("--out-dir") + 1])
+            / "config_registry.jsonl"
+        )
         for command in rendered["commands"]
     )
-    assert all(command["argv"][command["argv"].index("--n-full") + 1] == "128" for command in rendered["commands"])
-    assert not any(flag in command["argv"] for command in rendered["commands"] for flag in executor.FORBIDDEN_ADAPTIVE_ARGV)
+    assert all(
+        command["argv"][command["argv"].index("--n-full") + 1] == "128"
+        for command in rendered["commands"]
+    )
+    assert not any(
+        flag in command["argv"]
+        for command in rendered["commands"]
+        for flag in executor.FORBIDDEN_ADAPTIVE_ARGV
+    )
 
 
 def test_current_v3_dry_plan_is_exact_64_lane_192_job_contract(
@@ -895,9 +923,7 @@ def test_render_environment_digest_and_per_job_registry_fail_closed(
     with pytest.raises(executor.ExecutorError, match="client environment drift"):
         executor.verify_render(lock_path, render_path, verify_lock_fn=_verifier(lock))
 
-    command["environment"] = contract._job_environment(
-        lock, lock["fleet"]["jobs"][0]
-    )
+    command["environment"] = contract._job_environment(lock, lock["fleet"]["jobs"][0])
     command["environment_sha256"] = "sha256:" + "0" * 64
     rendered.pop("render_sha256")
     rendered["render_sha256"] = contract._digest_value(rendered)
@@ -953,9 +979,7 @@ def _arm_lane(tmp_path: Path, arm_id: str) -> tuple[Path, dict]:
 
 
 @pytest.mark.parametrize("arm_id", ["n128", "n256"])
-def test_supervisor_accepts_live_shaped_arm_lane(
-    tmp_path: Path, arm_id: str
-) -> None:
+def test_supervisor_accepts_live_shaped_arm_lane(tmp_path: Path, arm_id: str) -> None:
     lane_path, _lane_payload = _arm_lane(tmp_path, arm_id)
 
     loaded = supervisor.load_lane(lane_path)
@@ -1084,8 +1108,14 @@ def test_completed_receipts_are_validated_and_never_rerun(
             "status": "complete",
             **completed,
         }
-        Path(lane["receipt_dir"], f"{command['job_id']}.json").write_text(json.dumps(receipt), encoding="utf-8")
-    monkeypatch.setattr(supervisor.subprocess, "Popen", lambda *_a, **_k: pytest.fail("completed job reran"))
+        Path(lane["receipt_dir"], f"{command['job_id']}.json").write_text(
+            json.dumps(receipt), encoding="utf-8"
+        )
+    monkeypatch.setattr(
+        supervisor.subprocess,
+        "Popen",
+        lambda *_a, **_k: pytest.fail("completed job reran"),
+    )
     assert supervisor.run_lane(lane_path)["status"] == "complete"
 
 
@@ -1156,7 +1186,10 @@ def test_run_lane_selects_requested_lane_lock_mode(
     monkeypatch.setattr(
         supervisor,
         "_run_job",
-        lambda _lane_payload, command: {"job_id": command["job_id"], "status": "complete"},
+        lambda _lane_payload, command: {
+            "job_id": command["job_id"],
+            "status": "complete",
+        },
     )
 
     result = supervisor.run_lane(
@@ -1168,7 +1201,9 @@ def test_run_lane_selects_requested_lane_lock_mode(
     assert observed == [(Path(lane["lane_lock"]), wait_for_lane_lock)]
 
 
-def test_run_cli_enables_lane_lock_wait(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_run_cli_enables_lane_lock_wait(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     lane_path = tmp_path / "lane.json"
     observed: list[tuple[Path, bool]] = []
 
@@ -1178,7 +1213,9 @@ def test_run_cli_enables_lane_lock_wait(monkeypatch: pytest.MonkeyPatch, tmp_pat
 
     monkeypatch.setattr(supervisor, "run_lane", fake_run)
 
-    assert supervisor.main(["run", "--lane", str(lane_path), "--wait-for-lane-lock"]) == 0
+    assert (
+        supervisor.main(["run", "--lane", str(lane_path), "--wait-for-lane-lock"]) == 0
+    )
     assert observed == [(lane_path, True)]
 
 
@@ -1196,7 +1233,9 @@ def test_incomplete_lane_runs_exact_resume_sequentially(
 
         def __init__(self, argv, **kwargs):
             calls.append((argv, kwargs["env"], kwargs))
-            command = next(item for item in lane["commands"] if item["argv"] == argv[1:])
+            command = next(
+                item for item in lane["commands"] if item["argv"] == argv[1:]
+            )
             _complete_output(command)
 
         def wait(self):
@@ -1206,16 +1245,29 @@ def test_incomplete_lane_runs_exact_resume_sequentially(
     assert supervisor.run_lane(lane_path)["status"] == "complete"
     assert len(calls) == 3
     assert all("--resume" in argv for argv, _environment, _kwargs in calls)
-    assert all(environment["CUDA_MPS_PIPE_DIRECTORY"] == "/tmp/mps_pipe_host" for _argv, environment, _kwargs in calls)
+    assert all(
+        environment["CUDA_MPS_PIPE_DIRECTORY"] == "/tmp/mps_pipe_host"
+        for _argv, environment, _kwargs in calls
+    )
     assert all(
         environment["CATAN_ZERO_CONFIG_REGISTRY"].endswith("/config_registry.jsonl")
         for _argv, environment, _kwargs in calls
     )
     assert all(kwargs.get("pass_fds") for _argv, _environment, kwargs in calls)
-    assert all(environment == command["environment"] for (_argv, environment, _kwargs), command in zip(calls, lane["commands"], strict=True))
-    assert all("NVIDIA_TF32_OVERRIDE" not in environment for _argv, environment, _kwargs in calls)
+    assert all(
+        environment == command["environment"]
+        for (_argv, environment, _kwargs), command in zip(
+            calls, lane["commands"], strict=True
+        )
+    )
+    assert all(
+        "NVIDIA_TF32_OVERRIDE" not in environment
+        for _argv, environment, _kwargs in calls
+    )
     assert all("PYTHONHOME" not in environment for _argv, environment, _kwargs in calls)
-    assert [command["category"] for command in lane["commands"]] == list(supervisor.CATEGORY_ORDER)
+    assert [command["category"] for command in lane["commands"]] == list(
+        supervisor.CATEGORY_ORDER
+    )
 
 
 def test_completed_job_rejects_forged_minimal_registry_record(tmp_path: Path) -> None:
@@ -1267,7 +1319,9 @@ def test_completed_receipt_rejects_post_completion_registry_mutation(
     record = json.loads(registry.read_text(encoding="utf-8"))
     record["purpose"] = "mutated-after-completion"
     registry.write_text(json.dumps(record) + "\n", encoding="utf-8")
-    with pytest.raises(supervisor.SupervisorError, match="config_registry_sha256 drift"):
+    with pytest.raises(
+        supervisor.SupervisorError, match="config_registry_sha256 drift"
+    ):
         supervisor._run_job(lane, command)
 
 
@@ -1279,9 +1333,7 @@ def test_lane_rejects_registry_escape_even_with_rehashed_environment(
     commands[0]["environment"]["CATAN_ZERO_CONFIG_REGISTRY"] = str(
         tmp_path / "shared.jsonl"
     )
-    commands[0]["environment_sha256"] = supervisor._digest(
-        commands[0]["environment"]
-    )
+    commands[0]["environment_sha256"] = supervisor._digest(commands[0]["environment"])
     lane_path, _lane_payload = _lane(tmp_path, commands)
     with pytest.raises(supervisor.SupervisorError, match="sealed inside its output"):
         supervisor.load_lane(lane_path)
@@ -1312,7 +1364,9 @@ def test_exact_incomplete_attempt_is_quarantined_before_fresh_replay(
         "status": "failed",
         "attempts": 1,
     }
-    (receipt_dir / f"{command['job_id']}.json").write_text(json.dumps(receipt), encoding="utf-8")
+    (receipt_dir / f"{command['job_id']}.json").write_text(
+        json.dumps(receipt), encoding="utf-8"
+    )
     out = Path(command["argv"][command["argv"].index("--out-dir") + 1])
     out.mkdir(parents=True)
     (out / "partial.bin").write_bytes(b"forensic")
@@ -1330,7 +1384,9 @@ def test_exact_incomplete_attempt_is_quarantined_before_fresh_replay(
     monkeypatch.setattr(supervisor.subprocess, "Popen", Process)
     result = supervisor._run_job(supervisor.load_lane(lane_path), command)
     assert result["status"] == "complete"
-    preserved = list(Path(lane["quarantine_dir"]).glob(f"{command['job_id']}.attempt-*"))
+    preserved = list(
+        Path(lane["quarantine_dir"]).glob(f"{command['job_id']}.attempt-*")
+    )
     preserved = [path for path in preserved if not path.name.endswith(".receipt.json")]
     assert len(preserved) == 1
     assert (preserved[0] / "partial.bin").read_bytes() == b"forensic"
@@ -1354,9 +1410,13 @@ def test_invalid_manifest_is_forensic_then_replayed_not_stuck(
         "status": "running",
         "attempts": 1,
     }
-    (receipt_dir / f"{command['job_id']}.json").write_text(json.dumps(receipt), encoding="utf-8")
+    (receipt_dir / f"{command['job_id']}.json").write_text(
+        json.dumps(receipt), encoding="utf-8"
+    )
     _complete_output(command)
-    manifest = Path(command["argv"][command["argv"].index("--out-dir") + 1]) / "manifest.json"
+    manifest = (
+        Path(command["argv"][command["argv"].index("--out-dir") + 1]) / "manifest.json"
+    )
     broken = json.loads(manifest.read_text())
     broken["games_failed"] = 1
     manifest.write_text(json.dumps(broken), encoding="utf-8")
@@ -1371,14 +1431,20 @@ def test_invalid_manifest_is_forensic_then_replayed_not_stuck(
             return 0
 
     monkeypatch.setattr(supervisor.subprocess, "Popen", Process)
-    assert supervisor._run_job(supervisor.load_lane(lane_path), command)["status"] == "complete"
+    assert (
+        supervisor._run_job(supervisor.load_lane(lane_path), command)["status"]
+        == "complete"
+    )
     forensic_manifests = list(Path(lane["quarantine_dir"]).glob("*/manifest.json"))
     assert len(forensic_manifests) == 1
     assert json.loads(forensic_manifests[0].read_text())["games_failed"] == 1
 
 
 def test_append_only_ledger_update_contract() -> None:
-    assert executor._append_only_bytes(b"prefix\n", b"prefix\nclaim\n") == b"prefix\nclaim\n"
+    assert (
+        executor._append_only_bytes(b"prefix\n", b"prefix\nclaim\n")
+        == b"prefix\nclaim\n"
+    )
     assert executor._append_only_bytes(b"live\n", b"live\n") == b"live\n"
     with pytest.raises(executor.ExecutorError, match="not an exact prefix"):
         executor._append_only_bytes(b"diverged\n", b"prefix\nclaim\n")
@@ -1463,9 +1529,7 @@ def test_prepared_bridged_plan_resumes_through_one_bulk_stage_per_host(
     monkeypatch.setattr(
         executor,
         "_remote_bulk_install",
-        lambda _hosts, alias, files, _temporary: bulk_calls.append(
-            (alias, len(files))
-        ),
+        lambda _hosts, alias, files, _temporary: bulk_calls.append((alias, len(files))),
     )
     monkeypatch.setattr(executor, "_stage_repo", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
@@ -1494,6 +1558,79 @@ def test_prepared_bridged_plan_resumes_through_one_bulk_stage_per_host(
         f"h{index:02d}" for index in range(10)
     ]
     assert all(count > 4 for _alias, count in bulk_calls)
+
+
+def test_wait_terminalizes_only_after_every_generation_job_completes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    receipt_path = tmp_path / "executor.json"
+    receipt_path.write_text(
+        json.dumps(
+            {
+                "schema_version": executor.RECEIPT_SCHEMA,
+                "status": "launched",
+                "plan_sha256": "sha256:plan",
+            }
+        ),
+        encoding="utf-8",
+    )
+    plan = {
+        "plan_sha256": "sha256:plan",
+        "_private": {"lanes": {"w0": [{}, {}], "w1": [{}]}},
+    }
+    snapshots = iter(
+        (
+            {
+                "executor_status": "launched",
+                "lanes": [{"jobs": []}],
+                "job_status_counts": {"running": 2, "complete": 1},
+            },
+            {
+                "executor_status": "launched",
+                "lanes": [{"jobs": []}],
+                "job_status_counts": {"complete": 3},
+            },
+        )
+    )
+    monkeypatch.setattr(executor, "status", lambda *_args, **_kwargs: next(snapshots))
+    sleeps: list[float] = []
+    monkeypatch.setattr(executor.time, "sleep", sleeps.append)
+
+    result = executor.wait_for_completion(plan, receipt_path=receipt_path)
+
+    assert result["status"] == "complete"
+    assert result["terminal_status"]["job_status_counts"] == {"complete": 3}
+    assert sleeps == [executor.WAIT_POLL_SECONDS]
+    assert json.loads(receipt_path.read_text())["status"] == "complete"
+
+
+def test_wait_fails_closed_on_any_generation_job_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    receipt_path = tmp_path / "executor.json"
+    receipt_path.write_text(
+        json.dumps({"status": "launched", "plan_sha256": "sha256:plan"}),
+        encoding="utf-8",
+    )
+    plan = {
+        "plan_sha256": "sha256:plan",
+        "_private": {"lanes": {"w0": [{}, {}]}},
+    }
+    monkeypatch.setattr(
+        executor,
+        "status",
+        lambda *_args, **_kwargs: {
+            "executor_status": "launched",
+            "lanes": [{"jobs": []}],
+            "job_status_counts": {"complete": 1, "failed": 1},
+        },
+    )
+
+    with pytest.raises(executor.ExecutorError, match="terminal success"):
+        executor.wait_for_completion(plan, receipt_path=receipt_path)
+
+    failed = json.loads(receipt_path.read_text())
+    assert failed["status"] == "generation_failed"
 
 
 def test_exact_stop_ssh_is_hard_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1546,9 +1683,14 @@ def test_preflight_accepts_only_exact_report(monkeypatch: pytest.MonkeyPatch) ->
     monkeypatch.setattr(
         executor,
         "_ssh",
-        lambda *_args, **_kwargs: subprocess.CompletedProcess([], 0, json.dumps(report), ""),
+        lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            [], 0, json.dumps(report), ""
+        ),
     )
-    assert executor._preflight_host({"python": "/venv/bin/python"}, "h00", [0, 1, 2, 3]) == report
+    assert (
+        executor._preflight_host({"python": "/venv/bin/python"}, "h00", [0, 1, 2, 3])
+        == report
+    )
     report["client_environment"] = {"CUDA_MPS_PIPE_DIRECTORY": "/tmp/wrong"}
     with pytest.raises(executor.ExecutorError, match="environment drift"):
         executor._preflight_host({"python": "/venv/bin/python"}, "h00", [0, 1, 2, 3])
@@ -1603,9 +1745,7 @@ def test_preflight_fails_closed_on_production_runtime_report(
         ),
     )
     with pytest.raises(executor.ExecutorError, match=message):
-        executor._preflight_host(
-            {"python": "/venv/bin/python"}, "h00", [0, 1, 2, 3]
-        )
+        executor._preflight_host({"python": "/venv/bin/python"}, "h00", [0, 1, 2, 3])
 
 
 @pytest.mark.parametrize(
@@ -1650,9 +1790,7 @@ def test_preflight_fails_closed_on_nofile_report(
         ),
     )
     with pytest.raises(executor.ExecutorError, match=message):
-        executor._preflight_host(
-            {"python": "/venv/bin/python"}, "h00", [0, 1, 2, 3]
-        )
+        executor._preflight_host({"python": "/venv/bin/python"}, "h00", [0, 1, 2, 3])
 
 
 def test_supervisor_launch_raises_nofile_before_new_session_and_env(
@@ -1682,6 +1820,7 @@ time.sleep(30)
         repo_dir="/sealed/repo",
         extra_environment={"A1_TEST_OBSERVATION": str(observation)},
     )
+
     def low_soft_nofile() -> None:
         _current_soft, current_hard = resource.getrlimit(resource.RLIMIT_NOFILE)
         resource.setrlimit(resource.RLIMIT_NOFILE, (1024, current_hard))
@@ -1690,7 +1829,10 @@ time.sleep(30)
     hostile_environment["NVIDIA_TF32_OVERRIDE"] = "1"
     hostile_environment["PYTHONHOME"] = "/unsealed/ambient-python"
     result = subprocess.run(
-        shlex.split(command), text=True, capture_output=True, check=False,
+        shlex.split(command),
+        text=True,
+        capture_output=True,
+        check=False,
         preexec_fn=low_soft_nofile,
         env=hostile_environment,
     )
@@ -1704,7 +1846,9 @@ time.sleep(30)
         assert observed["argv"] == ["run", "--lane", "/sealed/lane.json"]
         assert observed["soft"] >= executor.REQUIRED_NOFILE_SOFT
         assert observed["pid"] == observed["sid"] == observed["pgid"] == pid
-        assert observed["pipe"] == executor.CLIENT_ENVIRONMENT["CUDA_MPS_PIPE_DIRECTORY"]
+        assert (
+            observed["pipe"] == executor.CLIENT_ENVIRONMENT["CUDA_MPS_PIPE_DIRECTORY"]
+        )
         assert observed["pythonpath"] == "/sealed/repo/src:/sealed/repo"
         assert observed["dont_write_bytecode"] == "1"
         assert observed["tf32_override"] is None
@@ -1748,8 +1892,13 @@ def test_staged_repo_is_read_only_bytecode_clean_and_resume_verifiable(
     root = tmp_path / "sealed-repo"
     receipt = tmp_path / "receipt.json"
     argv = [
-        sys.executable, "-c", executor._STAGE_REPO_SCRIPT,
-        str(archive_path), str(root), str(manifest_path), str(receipt),
+        sys.executable,
+        "-c",
+        executor._STAGE_REPO_SCRIPT,
+        str(archive_path),
+        str(root),
+        str(manifest_path),
+        str(receipt),
     ]
 
     first = subprocess.run(argv, text=True, capture_output=True, check=False)
@@ -1815,9 +1964,7 @@ def test_staged_catanatron_import_origin_is_inside_content_addressed_repo(
     (vendor / "__init__.py").write_text("# sealed package\n", encoding="utf-8")
     (models / "__init__.py").write_text("# sealed models\n", encoding="utf-8")
     for name in ("map", "board", "enums", "player"):
-        (models / f"{name}.py").write_text(
-            f"ORIGIN = {name!r}\n", encoding="utf-8"
-        )
+        (models / f"{name}.py").write_text(f"ORIGIN = {name!r}\n", encoding="utf-8")
 
     command = executor._staged_catanatron_origin_command(
         python=sys.executable, repo_dir=str(root)

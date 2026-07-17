@@ -73,6 +73,7 @@ STAGE_ARTIFACT_BINDINGS: Mapping[str, tuple[tuple[str, str, str, bool], ...]] = 
     ),
 }
 
+
 class ProductionLoopError(RuntimeError):
     """The loop is malformed, stale, or cannot advance safely."""
 
@@ -164,7 +165,9 @@ def _expand(value: str, values: Mapping[str, str]) -> str:
     for name in PLACEHOLDERS:
         result = result.replace("{" + name + "}", values[name])
     if "{" in result or "}" in result:
-        raise ProductionLoopError(f"unknown or malformed command placeholder: {value!r}")
+        raise ProductionLoopError(
+            f"unknown or malformed command placeholder: {value!r}"
+        )
     return result
 
 
@@ -207,7 +210,10 @@ def _bind_stage_artifacts(
     bindings: list[dict[str, str]] = []
     if name == "harvest":
         executor_receipt = _flag_path(command, "--executor-receipt", stage=name)
-        if executor_receipt not in inputs or executor_receipt not in predecessor_outputs:
+        if (
+            executor_receipt not in inputs
+            or executor_receipt not in predecessor_outputs
+        ):
             raise ProductionLoopError(
                 "harvest must consume the immediate generation --receipt through "
                 "--executor-receipt"
@@ -253,9 +259,7 @@ def _bind_stage_artifacts(
         )
     if name == "composite":
         audit_receipt = _flag_path(command, "--post-wave-audit", stage=name)
-        selected_games = _flag_path(
-            command, "--selected-game-manifest", stage=name
-        )
+        selected_games = _flag_path(command, "--selected-game-manifest", stage=name)
         if audit_receipt not in inputs or audit_receipt not in predecessor_outputs:
             raise ProductionLoopError(
                 "composite must consume the immediate audit --out through "
@@ -484,9 +488,7 @@ def load_config(path: Path, *, state_dir: Path) -> dict[str, Any]:
 
     stages = payload["stages"]
     if not isinstance(stages, dict) or set(stages) != set(STAGES):
-        raise ProductionLoopError(
-            f"stages must contain exactly: {', '.join(STAGES)}"
-        )
+        raise ProductionLoopError(f"stages must contain exactly: {', '.join(STAGES)}")
     values = {
         "repo": str(repo),
         "state_dir": str(state_dir.expanduser().resolve(strict=False)),
@@ -528,13 +530,17 @@ def load_config(path: Path, *, state_dir: Path) -> dict[str, Any]:
         if name == "audit" and "audit" not in command[2:]:
             raise ProductionLoopError("audit stage must select the audit subcommand")
         if name == "promote" and "promote" not in command[2:]:
-            raise ProductionLoopError("promote stage must select the promote subcommand")
+            raise ProductionLoopError(
+                "promote stage must select the promote subcommand"
+            )
         if tool_name == "tools/fleet/a1_production_executor.py" and not {
             "run",
             "--go",
+            "--wait",
         }.issubset(command[2:]):
             raise ProductionLoopError(
-                "fleet generation must select the executor run transaction with --go"
+                "fleet generation must select the executor run transaction with "
+                "--go --wait so harvest cannot race detached jobs"
             )
         if tool_name == "tools/a1_one_dose_train.py" and "--go" not in command[2:]:
             raise ProductionLoopError(
@@ -549,7 +555,10 @@ def load_config(path: Path, *, state_dir: Path) -> dict[str, Any]:
                 raise ProductionLoopError(
                     "scratch training stage must bind a fresh --execution-receipt"
                 )
-        if tool_name == "tools/a1_promotion_transaction.py" and "--go" not in command[2:]:
+        if (
+            tool_name == "tools/a1_promotion_transaction.py"
+            and "--go" not in command[2:]
+        ):
             raise ProductionLoopError(
                 "promotion stage must commit the verified transaction with --go"
             )
@@ -651,9 +660,7 @@ def load_config(path: Path, *, state_dir: Path) -> dict[str, Any]:
                     }
                 )
         if name == "train" and tool_name == "tools/a1_scratch_train.py":
-            execution_receipt = _flag_path(
-                command, "--execution-receipt", stage=name
-            )
+            execution_receipt = _flag_path(command, "--execution-receipt", stage=name)
             if execution_receipt not in outputs:
                 raise ProductionLoopError(
                     "scratch --execution-receipt must be a declared train output"
@@ -822,7 +829,9 @@ def _lock(state_dir: Path) -> Iterator[None]:
         try:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as error:
-            raise ProductionLoopError("another loop process owns this state directory") from error
+            raise ProductionLoopError(
+                "another loop process owns this state directory"
+            ) from error
         try:
             yield
         finally:
@@ -847,7 +856,10 @@ def _load_state(path: Path, config: Mapping[str, Any]) -> dict[str, Any]:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
         raise ProductionLoopError(f"cannot load loop state: {error}") from error
-    if not isinstance(value, dict) or value.get("schema_version") != STATE_SCHEMA_VERSION:
+    if (
+        not isinstance(value, dict)
+        or value.get("schema_version") != STATE_SCHEMA_VERSION
+    ):
         raise ProductionLoopError("loop state schema is invalid")
     for key in ("loop_id", "config_sha256", "repository_commit"):
         if value.get(key) != config.get(key):
@@ -863,15 +875,18 @@ def _load_state(path: Path, config: Mapping[str, Any]) -> dict[str, Any]:
         if receipt.get("command_sha256") != _value_sha256(stage["command"]):
             raise ProductionLoopError(f"completed stage {name!r} command drifted")
         current_inputs = [
-            _artifact_ref(Path(item), where=f"{name} input")
-            for item in stage["inputs"]
+            _artifact_ref(Path(item), where=f"{name} input") for item in stage["inputs"]
         ]
         current_outputs = [
             _artifact_ref(Path(item), where=f"{name} output")
             for item in stage["outputs"]
         ]
-        if current_inputs != receipt.get("inputs") or current_outputs != receipt.get("outputs"):
-            raise ProductionLoopError(f"completed stage {name!r} artifact bytes drifted")
+        if current_inputs != receipt.get("inputs") or current_outputs != receipt.get(
+            "outputs"
+        ):
+            raise ProductionLoopError(
+                f"completed stage {name!r} artifact bytes drifted"
+            )
     return value
 
 
@@ -913,11 +928,7 @@ def execute(config: Mapping[str, Any], *, state_dir: Path) -> dict[str, Any]:
                     raise ProductionLoopError(
                         f"stage {name!r} refuses pre-existing unreceipted output: {output}"
                     )
-            log_path = (
-                state_dir
-                / "logs"
-                / f"{name}.attempt-{time.time_ns()}.log"
-            )
+            log_path = state_dir / "logs" / f"{name}.attempt-{time.time_ns()}.log"
             log_path.parent.mkdir(parents=True, exist_ok=True)
             started_ns = time.time_ns()
             with log_path.open("xb") as log:
@@ -962,6 +973,14 @@ def execute(config: Mapping[str, Any], *, state_dir: Path) -> dict[str, Any]:
                     f"stage {name!r} exited {completed.returncode}; see {log_path}"
                 )
             _repository_guard(config, stage=name)
+            current_inputs = [
+                _artifact_ref(Path(item), where=f"{name} input")
+                for item in stage["inputs"]
+            ]
+            if current_inputs != inputs:
+                raise ProductionLoopError(
+                    f"stage {name!r} mutated an input while executing"
+                )
             if (
                 name == "train"
                 and _command_tool(stage["command"], repo=Path(config["repository"]))

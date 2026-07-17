@@ -11,7 +11,7 @@ Without `--go`, it prints the exact remaining commands. With `--go`, it runs
 the fixed transaction below and journals every completed boundary atomically.
 
 ```text
-generate  H100 sealed executor receipt
+generate  H100 sealed executor terminal-success receipt
    ↓
 harvest   direct host-to-controller SSH harvest relocation receipt
    ↓
@@ -39,6 +39,9 @@ evaluation configs. The coordinator does not reinterpret those settings.
 - The Python interpreter is exact and every command invokes an exact
   repo-relative, stage-allowlisted tool (matching a basename is insufficient).
 - Commands are argument arrays, never shell strings.
+- Fleet generation uses `--go --wait`. A detached `status=launched`
+  acknowledgement is not stage completion; every sealed lane job must be
+  `complete` before harvest starts.
 - Each stage consumes an immutable output from its immediate predecessor.
 - Typed CLI bindings prove that the composite is the learner's actual
   `--data`, its build receipt is the learner's actual
@@ -54,6 +57,9 @@ evaluation configs. The coordinator does not reinterpret those settings.
 - Restarting the same turn replays hashes and resumes after the last committed
   stage. Drift fails closed instead of repeating a generation, learner, or
   promotion side effect.
+- Every stage input is re-hashed after the child exits and before the stage is
+  committed, so a tool cannot mutate consumed evidence and advance the same
+  turn toward promotion.
 - Scratch training must use `--go` and emit a separate completed
   `--execution-receipt`; a successful plan-only invocation cannot advance the
   loop.
@@ -67,7 +73,7 @@ evaluation configs. The coordinator does not reinterpret those settings.
 
 | Stage | Allowed entry points |
 |---|---|
-| generate | `tools/fleet/a1_production_executor.py run --go` |
+| generate | `tools/fleet/a1_production_executor.py run --go --wait` |
 | harvest | `tools/fleet/a1_harvest_transaction.py` |
 | audit | `tools/a1_pre_wave_contract.py audit` |
 | composite | `tools/a1_build_post_wave_composite.py` |

@@ -42,6 +42,7 @@ CLIENT_ENVIRONMENT = {
 SUPERVISOR_ENVIRONMENT = {"PYTHONDONTWRITEBYTECODE": "1"}
 REQUIRED_NOFILE_SOFT = 65_536
 STOP_SSH_TIMEOUT_SECONDS = 45.0
+WAIT_POLL_SECONDS = 5.0
 MAX_PARALLEL_STAGE_HOSTS = 12
 MPS_UNIT_PATH = _REPO_ROOT / "tools/fleet/systemd/nvidia-mps.service"
 PRODUCTION_RUNTIME = runtime_contract.load_runtime_contract()
@@ -49,9 +50,7 @@ PRODUCTION_RUNTIME_CONTRACT_PATH = runtime_contract.DEFAULT_CONTRACT
 NATIVE_WHEEL_VERSION = PRODUCTION_RUNTIME["catanatron_rs_version"]
 NATIVE_WHEEL_NAME = PRODUCTION_RUNTIME["catanatron_rs_wheel_filename"]
 NATIVE_WHEEL_INVENTORY = _REPO_ROOT / "native/catanatron-rs/WHEEL_SHA256SUMS"
-VENDORED_CATANATRON_SENTINEL = (
-    "vendor/catanatron/catanatron/catanatron/models/map.py"
-)
+VENDORED_CATANATRON_SENTINEL = "vendor/catanatron/catanatron/catanatron/models/map.py"
 HISTORICAL_DB1_REPO_ROOT = Path("/home/ubuntu/catan-db1c8b1-campaign")
 HISTORICAL_DB1_CAMPAIGN_PATH = (
     HISTORICAL_DB1_REPO_ROOT
@@ -505,9 +504,7 @@ def _native_wheel_release_identity() -> dict[str, Any]:
     try:
         rows = [
             line.split()
-            for line in NATIVE_WHEEL_INVENTORY.read_text(
-                encoding="utf-8"
-            ).splitlines()
+            for line in NATIVE_WHEEL_INVENTORY.read_text(encoding="utf-8").splitlines()
             if line.strip()
         ]
     except OSError as error:
@@ -572,15 +569,28 @@ def _create_json(path: Path, value: Any) -> None:
 def load_hosts(path: Path, aliases: set[str]) -> dict[str, Any]:
     mode = stat.S_IMODE(path.stat().st_mode)
     if mode & 0o077:
-        raise ExecutorError(f"private host config must be mode 0600: {path} is {mode:o}")
+        raise ExecutorError(
+            f"private host config must be mode 0600: {path} is {mode:o}"
+        )
     value = _load(path)
-    expected = {"schema_version", "ssh_user", "ssh_key", "remote_root", "python", "hosts"}
+    expected = {
+        "schema_version",
+        "ssh_user",
+        "ssh_key",
+        "remote_root",
+        "python",
+        "hosts",
+    }
     if set(value) != expected or value["schema_version"] != HOST_SCHEMA:
         raise ExecutorError(f"host config must use exact {HOST_SCHEMA} schema")
     if not isinstance(value["hosts"], dict) or set(value["hosts"]) != aliases:
         raise ExecutorError("private host aliases must exactly match the sealed render")
     for name, host in value["hosts"].items():
-        if not SAFE_ALIAS.fullmatch(name) or not isinstance(host, str) or not SAFE_ALIAS.fullmatch(host):
+        if (
+            not SAFE_ALIAS.fullmatch(name)
+            or not isinstance(host, str)
+            or not SAFE_ALIAS.fullmatch(host)
+        ):
             raise ExecutorError(f"unsafe alias/host in private config: {name!r}")
     for key in ("ssh_user", "remote_root", "python"):
         if not isinstance(value[key], str) or not value[key].strip():
@@ -605,7 +615,9 @@ def verify_render(
     try:
         lock = verify_lock_fn(lock_path, require_all_job_claims=True)
     except Exception as error:
-        raise ExecutorError(f"sealed lock/all-claim verification failed: {error}") from error
+        raise ExecutorError(
+            f"sealed lock/all-claim verification failed: {error}"
+        ) from error
     rendered = _load(render_path)
     if rendered.get("schema_version") != contract.RENDER_SCHEMA:
         raise ExecutorError(f"render schema must be {contract.RENDER_SCHEMA}")
@@ -618,7 +630,9 @@ def verify_render(
     try:
         topology = contract._sealed_game_contract_shape(lock)  # noqa: SLF001
     except contract.ContractError as error:
-        raise ExecutorError(f"sealed production topology is invalid: {error}") from error
+        raise ExecutorError(
+            f"sealed production topology is invalid: {error}"
+        ) from error
     arm_id = topology["arm_id"]
     expected_jobs = int(topology["job_count"])
     expected_lanes = int(topology["worker_count"])
@@ -662,7 +676,9 @@ def verify_render(
         try:
             contract._promoted_producer_job_identity(lock, job)  # noqa: SLF001
         except contract.ContractError as error:
-            raise ExecutorError(f"unsafe promoted producer identity for {job_id}: {error}") from error
+            raise ExecutorError(
+                f"unsafe promoted producer identity for {job_id}: {error}"
+            ) from error
         if arm_id is not None and (
             command.get("arm_id") != arm_id or job.get("arm_id") != arm_id
         ):
@@ -671,7 +687,9 @@ def verify_render(
             raise ExecutorError(f"argv digest mismatch for {job_id}")
         expected_argv = contract._generator_argv(lock, job, mix_paths=mix_paths)
         if command.get("argv") != expected_argv:
-            raise ExecutorError(f"rendered argv differs from sealed command for {job_id}")
+            raise ExecutorError(
+                f"rendered argv differs from sealed command for {job_id}"
+            )
         if "--skip-guards" in expected_argv or "--no-seed-claim" in expected_argv:
             raise ExecutorError(f"guard bypass in {job_id}")
         if "--resume" not in expected_argv:
@@ -706,19 +724,24 @@ def verify_render(
             raise ExecutorError(f"typed config provenance drift for {job_id}")
         claim = command.get("ledger_claim", {})
         expected_row = contract._ledger_claim_row(lock, job)
-        if claim.get("row") != expected_row or claim.get("row_sha256") != contract._digest_value(expected_row):
+        if claim.get("row") != expected_row or claim.get(
+            "row_sha256"
+        ) != contract._digest_value(expected_row):
             raise ExecutorError(f"claim row drift for {job_id}")
         source = Path(command["output_attestation"]["source"])
-        if not source.is_file() or _sha256(source) != command["output_attestation"]["source_file_sha256"]:
+        if (
+            not source.is_file()
+            or _sha256(source) != command["output_attestation"]["source_file_sha256"]
+        ):
             raise ExecutorError(f"job attestation drift for {job_id}")
         if arm_id is not None:
             expected_attestation = contract._job_attestation(lock, job)
-            if (
-                contract._load_json(source) != expected_attestation
-                or command["output_attestation"].get("payload_sha256")
-                != contract._digest_value(expected_attestation)
-            ):
-                raise ExecutorError(f"dual-arm job attestation payload drift for {job_id}")
+            if contract._load_json(source) != expected_attestation or command[
+                "output_attestation"
+            ].get("payload_sha256") != contract._digest_value(expected_attestation):
+                raise ExecutorError(
+                    f"dual-arm job attestation payload drift for {job_id}"
+                )
         by_lane.setdefault(command["worker_id"], []).append(command)
     if seen != set(jobs) or len(by_lane) != expected_lanes:
         raise ExecutorError(
@@ -775,7 +798,9 @@ def _relocate_historical_artifact(
             metadata = path.lstat()
             resolved = path.resolve(strict=True)
         except OSError as error:
-            raise ExecutorError(f"{label} runtime artifact is unavailable: {path}") from error
+            raise ExecutorError(
+                f"{label} runtime artifact is unavailable: {path}"
+            ) from error
         if (
             stat.S_ISLNK(metadata.st_mode)
             or not stat.S_ISREG(metadata.st_mode)
@@ -787,7 +812,9 @@ def _relocate_historical_artifact(
         try:
             resolved.relative_to(root)
         except ValueError as error:
-            raise ExecutorError(f"{label} runtime artifact escapes repo: {path}") from error
+            raise ExecutorError(
+                f"{label} runtime artifact escapes repo: {path}"
+            ) from error
         if _sha256(path) != record["sha256"]:
             raise ExecutorError(f"{label} runtime artifact hash drift: {path}")
     try:
@@ -796,7 +823,9 @@ def _relocate_historical_artifact(
     except FileNotFoundError:
         return str(relative), raw
     except OSError as error:
-        raise ExecutorError(f"current runtime artifact is unavailable: {current}") from error
+        raise ExecutorError(
+            f"current runtime artifact is unavailable: {current}"
+        ) from error
     if (
         stat.S_ISLNK(current_metadata.st_mode)
         or not stat.S_ISREG(current_metadata.st_mode)
@@ -808,7 +837,9 @@ def _relocate_historical_artifact(
     try:
         resolved_current.relative_to(current_root)
     except ValueError as error:
-        raise ExecutorError(f"current runtime artifact escapes repo: {current}") from error
+        raise ExecutorError(
+            f"current runtime artifact escapes repo: {current}"
+        ) from error
     return (
         (str(relative), current)
         if _sha256(current) == record["sha256"]
@@ -851,7 +882,9 @@ def _repo_artifacts(
         try:
             relative = path.relative_to(root)
         except ValueError as error:
-            raise ExecutorError(f"runtime artifact is outside canonical repo: {path}") from error
+            raise ExecutorError(
+                f"runtime artifact is outside canonical repo: {path}"
+            ) from error
         files[str(relative)] = path
     supervisor = (root / "tools/fleet/a1_lane_supervisor.py").resolve()
     files[str(supervisor.relative_to(root))] = supervisor
@@ -864,11 +897,7 @@ def _repo_artifacts(
             "path": key,
             "sha256": _sha256(files[key]),
             "mode": 0o555 if os.access(files[key], os.X_OK) else 0o444,
-            **(
-                {"source_path": str(files[key])}
-                if files[key] != root / key
-                else {}
-            ),
+            **({"source_path": str(files[key])} if files[key] != root / key else {}),
         }
         for key in sorted(files)
     ]
@@ -893,7 +922,9 @@ def _repo_files(
             metadata = source.lstat()
             resolved = source.resolve(strict=True)
         except OSError as error:
-            raise ExecutorError(f"repo artifact source is unavailable: {source}") from error
+            raise ExecutorError(
+                f"repo artifact source is unavailable: {source}"
+            ) from error
         if (
             not source.is_absolute()
             or stat.S_ISLNK(metadata.st_mode)
@@ -928,15 +959,16 @@ def _execution_repo_root(plan: Mapping[str, Any]) -> Path:
     declared = unhashed.pop("bridge_sha256")
     if bridge["schema_version"] != BRIDGE_SCHEMA or declared != _digest(unhashed):
         raise ExecutorError("frozen-plan executor bridge digest mismatch")
-    if (
-        bridge["plan_sha256"] != plan.get("plan_sha256")
-        or bridge["repo_artifacts_sha256"] != plan.get("repo_artifacts_sha256")
-    ):
+    if bridge["plan_sha256"] != plan.get("plan_sha256") or bridge[
+        "repo_artifacts_sha256"
+    ] != plan.get("repo_artifacts_sha256"):
         raise ExecutorError("frozen-plan executor bridge plan binding drift")
     root = Path(str(bridge["frozen_repo_root"])).resolve(strict=True)
     frozen_path = (root / "tools/fleet/a1_production_executor.py").resolve(strict=True)
     hardened_path = Path(__file__).resolve(strict=True)
-    bridge_path = (_REPO_ROOT / "tools/fleet/a1_executor_bridge.py").resolve(strict=True)
+    bridge_path = (_REPO_ROOT / "tools/fleet/a1_executor_bridge.py").resolve(
+        strict=True
+    )
     expected_references = (
         (bridge["frozen_executor"], frozen_path, "frozen"),
         (bridge["hardened_executor"], hardened_path, "hardened"),
@@ -1055,9 +1087,17 @@ def _ssh(
 ) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [
-            "ssh", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new",
-            "-o", "ConnectTimeout=10", "-i", hosts["ssh_key"],
-            f"{hosts['ssh_user']}@{hosts['hosts'][alias]}", remote_command,
+            "ssh",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "StrictHostKeyChecking=accept-new",
+            "-o",
+            "ConnectTimeout=10",
+            "-i",
+            hosts["ssh_key"],
+            f"{hosts['ssh_user']}@{hosts['hosts'][alias]}",
+            remote_command,
         ],
         text=True,
         capture_output=True,
@@ -1069,8 +1109,17 @@ def _ssh(
 def _scp(hosts: dict[str, Any], alias: str, source: Path, destination: str) -> None:
     result = subprocess.run(
         [
-            "scp", "-q", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new",
-            "-o", "ConnectTimeout=10", "-i", hosts["ssh_key"], str(source),
+            "scp",
+            "-q",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "StrictHostKeyChecking=accept-new",
+            "-o",
+            "ConnectTimeout=10",
+            "-i",
+            hosts["ssh_key"],
+            str(source),
             f"{hosts['ssh_user']}@{hosts['hosts'][alias]}:{destination}",
         ],
         text=True,
@@ -1104,7 +1153,9 @@ def _build_bulk_install_bundle(
         try:
             metadata = source.lstat()
         except OSError as error:
-            raise ExecutorError(f"cannot stat bulk install source {source}: {error}") from error
+            raise ExecutorError(
+                f"cannot stat bulk install source {source}: {error}"
+            ) from error
         if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
             raise ExecutorError(
                 f"bulk install source is not a regular non-symlink file: {source}"
@@ -1143,7 +1194,9 @@ def _build_bulk_install_bundle(
         "artifacts": artifacts,
     }
     manifest["manifest_sha256"] = _digest(manifest)
-    manifest_bytes = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
+    manifest_bytes = json.dumps(
+        manifest, sort_keys=True, separators=(",", ":")
+    ).encode()
 
     with tarfile.open(destination, "w", format=tarfile.USTAR_FORMAT) as archive:
         manifest_info = tarfile.TarInfo("manifest.json")
@@ -1164,7 +1217,9 @@ def _build_bulk_install_bundle(
             with source.open("rb") as handle:
                 archive.addfile(info, handle)
             if _sha256(source) != record["sha256"]:
-                raise ExecutorError(f"bulk install source changed while archiving: {source}")
+                raise ExecutorError(
+                    f"bulk install source changed while archiving: {source}"
+                )
     return manifest, _sha256(destination)
 
 
@@ -1203,7 +1258,9 @@ def _remote_bulk_install(
     incoming = f"{incoming_dir}/bulk-{uuid.uuid4().hex}.tar"
     mkdir = _ssh(hosts, alias, f"mkdir -p {shlex.quote(incoming_dir)}")
     if mkdir.returncode != 0:
-        raise ExecutorError(f"remote bulk mkdir failed on {alias}: {mkdir.stderr.strip()}")
+        raise ExecutorError(
+            f"remote bulk mkdir failed on {alias}: {mkdir.stderr.strip()}"
+        )
     _scp(hosts, alias, bundle, incoming)
     command = " ".join(
         shlex.quote(value)
@@ -1219,7 +1276,11 @@ def _remote_bulk_install(
     result = _ssh(hosts, alias, command)
     if result.returncode != 0:
         # The remote script unlinks the incoming bundle in a finally block.
-        detail = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
+        detail = (
+            result.stderr.strip()
+            or result.stdout.strip()
+            or f"exit {result.returncode}"
+        )
         raise ExecutorError(f"bulk immutable install failed on {alias}: {detail}")
 
 
@@ -1262,7 +1323,9 @@ def _remote_install(
     result = _ssh(hosts, alias, command)
     _ssh(hosts, alias, f"rm -f {shlex.quote(incoming)}")
     if result.returncode != 0:
-        raise ExecutorError(f"immutable install failed on {alias}: {result.stderr.strip()}")
+        raise ExecutorError(
+            f"immutable install failed on {alias}: {result.stderr.strip()}"
+        )
 
 
 def _stage_files_by_alias(
@@ -1291,17 +1354,23 @@ def _stage_files_by_alias(
             candidate = (Path(source), source, str(record["source_file_sha256"]))
             previous = attestations[alias].get(source)
             if previous is not None and previous != candidate:
-                raise ExecutorError(f"conflicting attestation source on {alias}: {source}")
+                raise ExecutorError(
+                    f"conflicting attestation source on {alias}: {source}"
+                )
             attestations[alias][source] = candidate
     for alias in aliases:
-        staged[alias].extend(attestations[alias][path] for path in sorted(attestations[alias]))
+        staged[alias].extend(
+            attestations[alias][path] for path in sorted(attestations[alias])
+        )
     return staged
 
 
 def _append_only_bytes(existing: bytes, desired: bytes) -> bytes:
     if desired == existing or desired.startswith(existing):
         return desired
-    raise ExecutorError("remote seed ledger is not an exact prefix of the bound live ledger")
+    raise ExecutorError(
+        "remote seed ledger is not an exact prefix of the bound live ledger"
+    )
 
 
 def _remote_sync_append_only_ledger(
@@ -1310,9 +1379,11 @@ def _remote_sync_append_only_ledger(
     incoming = f"{hosts['remote_root']}/incoming/{uuid.uuid4().hex}"
     mkdir = _ssh(hosts, alias, f"mkdir -p {shlex.quote(str(Path(incoming).parent))}")
     if mkdir.returncode != 0:
-        raise ExecutorError(f"remote ledger mkdir failed on {alias}: {mkdir.stderr.strip()}")
+        raise ExecutorError(
+            f"remote ledger mkdir failed on {alias}: {mkdir.stderr.strip()}"
+        )
     _scp(hosts, alias, source, incoming)
-    script = r'''import hashlib,os,pathlib,sys,uuid
+    script = r"""import hashlib,os,pathlib,sys,uuid
 src=pathlib.Path(sys.argv[1]);dst=pathlib.Path(sys.argv[2]);expected=sys.argv[3]
 data=src.read_bytes();sha=lambda value:'sha256:'+hashlib.sha256(value).hexdigest()
 if sha(data)!=expected: raise SystemExit('incoming live ledger digest drift')
@@ -1325,7 +1396,7 @@ tmp=dst.parent/('.'+dst.name+'.'+uuid.uuid4().hex+'.tmp')
 fd=os.open(tmp,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o644)
 with os.fdopen(fd,'wb') as handle: handle.write(data);handle.flush();os.fsync(handle.fileno())
 os.replace(tmp,dst)
-if sha(dst.read_bytes())!=expected: raise SystemExit('installed live ledger digest drift')'''
+if sha(dst.read_bytes())!=expected: raise SystemExit('installed live ledger digest drift')"""
     command = " ".join(
         shlex.quote(value)
         for value in (hosts["python"], "-c", script, incoming, destination, expected)
@@ -1333,7 +1404,9 @@ if sha(dst.read_bytes())!=expected: raise SystemExit('installed live ledger dige
     result = _ssh(hosts, alias, command)
     _ssh(hosts, alias, f"rm -f {shlex.quote(incoming)}")
     if result.returncode != 0:
-        raise ExecutorError(f"append-only ledger sync failed on {alias}: {result.stderr.strip()}")
+        raise ExecutorError(
+            f"append-only ledger sync failed on {alias}: {result.stderr.strip()}"
+        )
 
 
 def _preflight_host(
@@ -1342,7 +1415,7 @@ def _preflight_host(
     """Read-only launch preflight: topology, resources, idle compute plane, MPS."""
     expected_mps_unit_sha256 = _sha256(MPS_UNIT_PATH)
     expected_native_wheel = _native_wheel_release_identity()
-    script = r'''import hashlib,importlib.metadata,json,os,pathlib,resource,subprocess,sys
+    script = r"""import hashlib,importlib.metadata,json,os,pathlib,resource,subprocess,sys
 expected=json.loads(sys.argv[1])
 required_nofile=int(sys.argv[2])
 expected_mps_unit_sha256=sys.argv[3]
@@ -1440,12 +1513,16 @@ capabilities=set(capability_fn())
 required_capabilities=set(expected_native_wheel['required_capabilities'])
 missing=sorted(required_capabilities-capabilities)
 if missing: raise SystemExit('installed catanatron-rs lacks required capabilities: '+repr(missing))
-print(json.dumps({'gpu_indices':indices,'compute_apps':'mps_only_or_empty','mps_active':active,'mps_enabled':enabled,'mps_main_pid':main_pid,'mps_unit_sha256':mps_unit_sha256,'mps_limit_nofile_soft':mps_limit_nofile_soft,'client_environment':required,'python':sys.executable,'python_version':python_version,'torch_version':torch_version,'torch_cuda_version':torch_cuda_version,'dependency_versions':dependency_versions,'nvidia_driver_version':nvidia_driver_version,'catanatron_rs_version':rust_version,'native_wheel_sha256':expected_native_wheel['sha256'],'native_mcts_capabilities':sorted(capabilities),'required_nofile_soft':required_nofile,'nofile_soft_before':nofile_soft_before,'nofile_soft':nofile_soft,'nofile_hard':nofile_hard},sort_keys=True))'''
+print(json.dumps({'gpu_indices':indices,'compute_apps':'mps_only_or_empty','mps_active':active,'mps_enabled':enabled,'mps_main_pid':main_pid,'mps_unit_sha256':mps_unit_sha256,'mps_limit_nofile_soft':mps_limit_nofile_soft,'client_environment':required,'python':sys.executable,'python_version':python_version,'torch_version':torch_version,'torch_cuda_version':torch_cuda_version,'dependency_versions':dependency_versions,'nvidia_driver_version':nvidia_driver_version,'catanatron_rs_version':rust_version,'native_wheel_sha256':expected_native_wheel['sha256'],'native_mcts_capabilities':sorted(capabilities),'required_nofile_soft':required_nofile,'nofile_soft_before':nofile_soft_before,'nofile_soft':nofile_soft,'nofile_hard':nofile_hard},sort_keys=True))"""
     command = " ".join(
         shlex.quote(value)
         for value in (
-            hosts["python"], "-c", script, json.dumps(sorted(expected_gpus)),
-            str(REQUIRED_NOFILE_SOFT), expected_mps_unit_sha256,
+            hosts["python"],
+            "-c",
+            script,
+            json.dumps(sorted(expected_gpus)),
+            str(REQUIRED_NOFILE_SOFT),
+            expected_mps_unit_sha256,
             json.dumps(expected_native_wheel, sort_keys=True),
             json.dumps(PRODUCTION_RUNTIME, sort_keys=True),
         )
@@ -1457,7 +1534,9 @@ print(json.dumps({'gpu_indices':indices,'compute_apps':'mps_only_or_empty','mps_
     try:
         report = json.loads(result.stdout)
     except json.JSONDecodeError as error:
-        raise ExecutorError(f"host preflight returned invalid JSON on {alias}") from error
+        raise ExecutorError(
+            f"host preflight returned invalid JSON on {alias}"
+        ) from error
     if report.get("client_environment") != CLIENT_ENVIRONMENT:
         raise ExecutorError(f"host MPS client environment drift on {alias}")
     expected_dependencies = {
@@ -1472,7 +1551,10 @@ print(json.dumps({'gpu_indices':indices,'compute_apps':'mps_only_or_empty','mps_
         raise ExecutorError(f"host torch CUDA runtime drift on {alias}")
     if report.get("dependency_versions") != expected_dependencies:
         raise ExecutorError(f"host production dependency runtime drift on {alias}")
-    if report.get("nvidia_driver_version") != PRODUCTION_RUNTIME["nvidia_driver_version"]:
+    if (
+        report.get("nvidia_driver_version")
+        != PRODUCTION_RUNTIME["nvidia_driver_version"]
+    ):
         raise ExecutorError(f"host NVIDIA driver runtime drift on {alias}")
     if report.get("mps_unit_sha256") != expected_mps_unit_sha256:
         raise ExecutorError(f"host MPS service unit digest drift on {alias}")
@@ -1496,7 +1578,10 @@ print(json.dumps({'gpu_indices':indices,'compute_apps':'mps_only_or_empty','mps_
             f"{REQUIRED_NOFILE_SOFT} on {alias}"
         )
     limit_fields = (
-        "required_nofile_soft", "nofile_soft_before", "nofile_soft", "nofile_hard",
+        "required_nofile_soft",
+        "nofile_soft_before",
+        "nofile_soft",
+        "nofile_hard",
     )
     if any(type(report.get(field)) is not int for field in limit_fields):
         raise ExecutorError(f"invalid RLIMIT_NOFILE report on {alias}")
@@ -1550,13 +1635,17 @@ def _supervisor_launch_command(
         **extra,
     }
     if any(
-        not isinstance(key, str) or not isinstance(value, str) or not key
-        or "=" in key or "\x00" in key or "\x00" in value
+        not isinstance(key, str)
+        or not isinstance(value, str)
+        or not key
+        or "=" in key
+        or "\x00" in key
+        or "\x00" in value
         for key, value in environment.items()
     ):
         raise ExecutorError("invalid supervisor launch environment")
     argv = [python, supervisor, "run", "--lane", remote_lane]
-    script = r'''import json,pathlib,resource,subprocess,sys
+    script = r"""import json,pathlib,resource,subprocess,sys
 required=int(sys.argv[1]);log=pathlib.Path(sys.argv[2]);environment=json.loads(sys.argv[3]);argv=json.loads(sys.argv[4])
 soft,hard=resource.getrlimit(resource.RLIMIT_NOFILE);unlimited=resource.RLIM_INFINITY
 if hard!=unlimited and hard<required: raise SystemExit(f'hard RLIMIT_NOFILE {hard} is below required {required}')
@@ -1568,7 +1657,7 @@ if raised!=unlimited and raised<required: raise SystemExit(f'soft RLIMIT_NOFILE 
 log.parent.mkdir(parents=True,exist_ok=True)
 with log.open('ab',buffering=0) as output:
     process=subprocess.Popen(argv,stdin=subprocess.DEVNULL,stdout=output,stderr=subprocess.STDOUT,env=environment,start_new_session=True,close_fds=True)
-print(process.pid,flush=True)'''
+print(process.pid,flush=True)"""
     invocation = [
         "/usr/bin/env",
         "-i",
@@ -1584,7 +1673,7 @@ print(process.pid,flush=True)'''
     return " ".join(shlex.quote(value) for value in invocation)
 
 
-_STAGE_REPO_SCRIPT = r'''import hashlib,json,os,pathlib,shutil,stat,sys,tarfile,time,uuid
+_STAGE_REPO_SCRIPT = r"""import hashlib,json,os,pathlib,shutil,stat,sys,tarfile,time,uuid
 src,root,manifest_path,receipt_path=map(pathlib.Path,sys.argv[1:5])
 manifest=json.loads(manifest_path.read_text())
 sha=lambda p:'sha256:'+hashlib.sha256(p.read_bytes()).hexdigest()
@@ -1667,9 +1756,9 @@ receipt['completed_at']=time.time()
 tmp=receipt_path.parent/('.'+receipt_path.name+'.'+uuid.uuid4().hex+'.tmp')
 with tmp.open('x') as f: json.dump(receipt,f,sort_keys=True);f.flush();os.fsync(f.fileno())
 os.replace(tmp,receipt_path)
-if not verify_tree(root): raise SystemExit('installed repo verification failed')'''
+if not verify_tree(root): raise SystemExit('installed repo verification failed')"""
 
-_STAGED_CATANATRON_ORIGIN_SCRIPT = r'''import json,pathlib,sys
+_STAGED_CATANATRON_ORIGIN_SCRIPT = r"""import json,pathlib,sys
 from catan_zero.rl._catanatron import import_catanatron_module
 root=pathlib.Path(sys.argv[1]).resolve(strict=True)
 expected=(root/'vendor/catanatron/catanatron/catanatron').resolve(strict=True)
@@ -1677,7 +1766,7 @@ modules={name:import_catanatron_module(name) for name in ('catanatron','catanatr
 origins={name:str(pathlib.Path(module.__file__).resolve(strict=True)) for name,module in modules.items()}
 outside={name:path for name,path in origins.items() if not pathlib.Path(path).is_relative_to(expected)}
 if outside: raise SystemExit(f'vendored Catanatron import escaped sealed repo: {outside!r}')
-print(json.dumps({'vendor_root':str(expected),'origins':origins},sort_keys=True))'''
+print(json.dumps({'vendor_root':str(expected),'origins':origins},sort_keys=True))"""
 
 
 def _staged_catanatron_origin_command(*, python: str, repo_dir: str) -> str:
@@ -1718,7 +1807,9 @@ def _repo_stage_inputs(
     }
     manifest["manifest_sha256"] = _digest(manifest)
     local_manifest = temporary_path / "repo-manifest.json"
-    local_manifest.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    local_manifest.write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
     token = repo_sha.removeprefix("sha256:")
     remote_tar = f"{hosts['remote_root']}/operator/repo-{token}.tar"
     remote_manifest = f"{hosts['remote_root']}/operator/repo-{token}.json"
@@ -1764,7 +1855,9 @@ def _stage_repo(
         ),
     )
     if result.returncode != 0:
-        raise ExecutorError(f"immutable repo stage failed on {alias}: {result.stderr.strip()}")
+        raise ExecutorError(
+            f"immutable repo stage failed on {alias}: {result.stderr.strip()}"
+        )
     artifact_paths = {str(record["path"]) for record in artifacts}
     if VENDORED_CATANATRON_SENTINEL in artifact_paths:
         origin = _ssh(
@@ -1821,7 +1914,9 @@ def _resume_receipt(
     if not receipt_path.exists():
         return None
     if not resume:
-        raise ExecutorError("executor receipt exists; pass --resume for exact incomplete jobs")
+        raise ExecutorError(
+            "executor receipt exists; pass --resume for exact incomplete jobs"
+        )
     receipt = _load(receipt_path)
     if receipt.get("schema_version") != RECEIPT_SCHEMA:
         raise ExecutorError("executor receipt schema drift")
@@ -1836,7 +1931,9 @@ def _resume_receipt(
     return receipt
 
 
-def execute(plan: dict[str, Any], *, receipt_path: Path, resume: bool) -> dict[str, Any]:
+def execute(
+    plan: dict[str, Any], *, receipt_path: Path, resume: bool
+) -> dict[str, Any]:
     _verify_plan_digest(plan)
     repo_source_root = _execution_repo_root(plan)
     private = plan["_private"]
@@ -1846,7 +1943,9 @@ def execute(plan: dict[str, Any], *, receipt_path: Path, resume: bool) -> dict[s
     public = _public(plan)
     expected_by_alias: dict[str, list[int]] = {}
     for lane in private["lanes"].values():
-        expected_by_alias.setdefault(lane[0]["host_alias"], []).append(int(lane[0]["gpu"]))
+        expected_by_alias.setdefault(lane[0]["host_alias"], []).append(
+            int(lane[0]["gpu"])
+        )
     preflight = {
         alias: _preflight_host(hosts, alias, sorted(set(gpus)))
         for alias, gpus in sorted(expected_by_alias.items())
@@ -1888,7 +1987,10 @@ def execute(plan: dict[str, Any], *, receipt_path: Path, resume: bool) -> dict[s
         aliases = sorted({lane[0]["host_alias"] for lane in lanes.values()})
         required = rendered["required_artifacts"]
         stage_files_by_alias = _stage_files_by_alias(required, lanes)
-        if _sha256(Path(required["seed_ledger"]["path"])) != public["live_seed_ledger_sha256"]:
+        if (
+            _sha256(Path(required["seed_ledger"]["path"]))
+            != public["live_seed_ledger_sha256"]
+        ):
             raise ExecutorError("live seed ledger changed after dry-run plan binding")
         operator_manifests = {
             name: {
@@ -2009,8 +2111,13 @@ def execute(plan: dict[str, Any], *, receipt_path: Path, resume: bool) -> dict[s
             )
             _atomic_json(receipt_path, receipt)
             result = _ssh(hosts, alias, launch)
-            if result.returncode != 0 or not result.stdout.strip().splitlines()[-1].isdigit():
-                raise ExecutorError(f"detached supervisor launch failed for {worker_id}")
+            if (
+                result.returncode != 0
+                or not result.stdout.strip().splitlines()[-1].isdigit()
+            ):
+                raise ExecutorError(
+                    f"detached supervisor launch failed for {worker_id}"
+                )
             lane_pids[worker_id] = int(result.stdout.strip().splitlines()[-1])
             receipt.update({"status": "launching", "lane_pids": lane_pids})
             receipt.pop("launch_pending_worker_id", None)
@@ -2022,12 +2129,20 @@ def execute(plan: dict[str, Any], *, receipt_path: Path, resume: bool) -> dict[s
             supervisor = f"{repo_dir}/tools/fleet/a1_lane_supervisor.py"
             status_command = " ".join(
                 shlex.quote(value)
-                for value in (hosts["python"], supervisor, "status", "--lane", remote_lane)
+                for value in (
+                    hosts["python"],
+                    supervisor,
+                    "status",
+                    "--lane",
+                    remote_lane,
+                )
             )
             command = f"kill -0 {int(lane_pids[worker_id])} && {status_command}"
             response = _ssh(hosts, alias, command)
             try:
-                acknowledgement = json.loads(response.stdout) if response.returncode == 0 else None
+                acknowledgement = (
+                    json.loads(response.stdout) if response.returncode == 0 else None
+                )
             except json.JSONDecodeError:
                 acknowledgement = None
             if not isinstance(acknowledgement, dict) or any(
@@ -2041,7 +2156,9 @@ def execute(plan: dict[str, Any], *, receipt_path: Path, resume: bool) -> dict[s
                     }
                 )
                 _atomic_json(receipt_path, receipt)
-                raise ExecutorError(f"supervisor acknowledgement failed for {worker_id}")
+                raise ExecutorError(
+                    f"supervisor acknowledgement failed for {worker_id}"
+                )
             acknowledgements[worker_id] = acknowledgement
     receipt.update(
         {
@@ -2104,13 +2221,10 @@ def _stop_helper_call(
         + "; fi"
     )
     try:
-        response = _ssh(
-            hosts, alias, command, timeout_seconds=STOP_SSH_TIMEOUT_SECONDS
-        )
+        response = _ssh(hosts, alias, command, timeout_seconds=STOP_SSH_TIMEOUT_SECONDS)
     except subprocess.TimeoutExpired as error:
         raise ExecutorError(
-            f"A1 {action} timed out for {worker_id} after "
-            f"{STOP_SSH_TIMEOUT_SECONDS:g}s"
+            f"A1 {action} timed out for {worker_id} after {STOP_SSH_TIMEOUT_SECONDS:g}s"
         ) from error
     if response.returncode != 0:
         detail = (response.stderr or response.stdout).strip()
@@ -2118,7 +2232,9 @@ def _stop_helper_call(
     try:
         result = json.loads(response.stdout)
     except json.JSONDecodeError as error:
-        raise ExecutorError(f"A1 {action} returned invalid JSON for {worker_id}") from error
+        raise ExecutorError(
+            f"A1 {action} returned invalid JSON for {worker_id}"
+        ) from error
     if not isinstance(result, dict) or result.get("worker_id") != worker_id:
         raise ExecutorError(f"A1 {action} identity drift for {worker_id}")
     return result
@@ -2214,12 +2330,25 @@ def status(plan: dict[str, Any], *, receipt_path: Path) -> dict[str, Any]:
         )
         response = _ssh(hosts, alias, command)
         if response.returncode != 0:
-            results.append({"worker_id": worker_id, "host_alias": alias, "status": "unreachable_or_invalid", "error": response.stderr.strip()})
+            results.append(
+                {
+                    "worker_id": worker_id,
+                    "host_alias": alias,
+                    "status": "unreachable_or_invalid",
+                    "error": response.stderr.strip(),
+                }
+            )
             continue
         try:
             results.append(json.loads(response.stdout))
         except json.JSONDecodeError:
-            results.append({"worker_id": worker_id, "host_alias": alias, "status": "invalid_status_output"})
+            results.append(
+                {
+                    "worker_id": worker_id,
+                    "host_alias": alias,
+                    "status": "invalid_status_output",
+                }
+            )
     counts: dict[str, int] = {}
     for lane in results:
         for job in lane.get("jobs", []):
@@ -2233,6 +2362,78 @@ def status(plan: dict[str, Any], *, receipt_path: Path) -> dict[str, Any]:
     }
 
 
+def wait_for_completion(
+    plan: dict[str, Any],
+    *,
+    receipt_path: Path,
+    poll_seconds: float = WAIT_POLL_SECONDS,
+) -> dict[str, Any]:
+    """Wait for every exact detached lane job and terminalize the receipt."""
+
+    expected_jobs = sum(
+        len(commands) for commands in plan["_private"]["lanes"].values()
+    )
+    if expected_jobs < 1:
+        raise ExecutorError("wait requires at least one sealed generation job")
+    while True:
+        snapshot = status(plan, receipt_path=receipt_path)
+        if snapshot.get("executor_status") != "launched":
+            raise ExecutorError(
+                "wait requires the exact executor receipt in launched state"
+            )
+        invalid_lanes = [
+            lane
+            for lane in snapshot.get("lanes", [])
+            if lane.get("status") in {"unreachable_or_invalid", "invalid_status_output"}
+        ]
+        counts = snapshot.get("job_status_counts")
+        if not isinstance(counts, dict):
+            raise ExecutorError("generation status omitted job status counts")
+        unknown = sorted(
+            str(key)
+            for key in counts
+            if key not in {"pending", "prepared", "running", "complete", "failed"}
+        )
+        failed = int(counts.get("failed", 0))
+        if invalid_lanes or unknown or failed:
+            receipt = _load(receipt_path)
+            receipt.update(
+                {
+                    "status": "generation_failed",
+                    "terminal_status": snapshot,
+                    "failed_at": time.time(),
+                }
+            )
+            _atomic_json(receipt_path, receipt)
+            raise ExecutorError(
+                "generation did not reach terminal success: "
+                f"failed={failed} unknown={unknown} invalid_lanes={len(invalid_lanes)}"
+            )
+        observed_jobs = sum(int(value) for value in counts.values())
+        complete = int(counts.get("complete", 0))
+        if observed_jobs != expected_jobs:
+            raise ExecutorError(
+                "generation status job count drift: "
+                f"expected={expected_jobs} actual={observed_jobs}"
+            )
+        if complete == expected_jobs:
+            receipt = _load(receipt_path)
+            if receipt.get("plan_sha256") != plan["plan_sha256"]:
+                raise ExecutorError(
+                    "completion receipt binds a different execution plan"
+                )
+            receipt.update(
+                {
+                    "status": "complete",
+                    "completed_at": time.time(),
+                    "terminal_status": snapshot,
+                }
+            )
+            _atomic_json(receipt_path, receipt)
+            return receipt
+        time.sleep(poll_seconds)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -2244,9 +2445,18 @@ def build_parser() -> argparse.ArgumentParser:
         item.add_argument("--receipt", required=True, type=Path)
     run = sub.choices["run"]
     run.add_argument("--resume", action="store_true")
-    run.add_argument("--go", action="store_true", help="stage and launch; default dry-run")
+    run.add_argument(
+        "--go", action="store_true", help="stage and launch; default dry-run"
+    )
+    run.add_argument(
+        "--wait",
+        action="store_true",
+        help="wait for every detached lane job and terminalize the receipt",
+    )
     sub.choices["stop"].add_argument(
-        "--go", action="store_true", help="stop exact A1 process groups; default dry-run"
+        "--go",
+        action="store_true",
+        help="stop exact A1 process groups; default dry-run",
     )
     return parser
 
@@ -2254,15 +2464,24 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
-        plan = build_plan(lock_path=args.lock, render_path=args.render, hosts_path=args.hosts, receipt_path=args.receipt)
+        plan = build_plan(
+            lock_path=args.lock,
+            render_path=args.render,
+            hosts_path=args.hosts,
+            receipt_path=args.receipt,
+        )
         if args.command == "status":
             result = status(plan, receipt_path=args.receipt)
         elif args.command == "stop":
             result = stop_execution(plan, receipt_path=args.receipt, go=bool(args.go))
         elif not args.go:
+            if args.wait:
+                raise ExecutorError("--wait requires --go")
             result = _public(plan)
         else:
             result = execute(plan, receipt_path=args.receipt, resume=bool(args.resume))
+            if args.wait:
+                result = wait_for_completion(plan, receipt_path=args.receipt)
     except ExecutorError as error:
         print(f"REFUSING: {error}", file=sys.stderr)
         return 2

@@ -19,7 +19,7 @@ from catan_zero.rl.production_loop import (
 from tools import loop
 
 
-WRITER = r'''from pathlib import Path
+WRITER = r"""from pathlib import Path
 import sys
 
 args = sys.argv[1:]
@@ -43,7 +43,10 @@ if Path(sys.argv[0]).name == "a1_pre_wave_contract.py":
     out.with_suffix(".selected_games.json").write_text("selected games\n")
     raise SystemExit(0)
 outputs = []
-for flag in ("--emit", "--execution-receipt", "--checkpoint", "--report", "--out", "--receipt"):
+output_flags = ["--emit", "--execution-receipt", "--checkpoint", "--report", "--out", "--receipt"]
+if Path(sys.argv[0]).name == "a1_scratch_train.py":
+    output_flags.remove("--receipt")
+for flag in output_flags:
     if flag in args:
         outputs.append(Path(args[args.index(flag) + 1]))
 assert outputs
@@ -51,7 +54,7 @@ prefix = "" if source is None else source.read_text()
 for output in outputs:
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(prefix + Path(sys.argv[0]).name + "\n")
-'''
+"""
 
 
 def _fixture(tmp_path: Path) -> tuple[Path, Path, Path, dict[str, object]]:
@@ -106,6 +109,7 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, Path, dict[str, object]]:
             command += [
                 "run",
                 "--go",
+                "--wait",
                 "--lock",
                 str(previous),
                 "--receipt",
@@ -255,6 +259,64 @@ def test_train_data_must_be_exact_immediate_composite_output(tmp_path: Path) -> 
         load_config(config_path, state_dir=tmp_path / "state")
 
 
+def test_fleet_generation_requires_terminal_wait_before_harvest(
+    tmp_path: Path,
+) -> None:
+    _repository, config_path, _final, payload = _fixture(tmp_path)
+    stages = payload["stages"]
+    assert isinstance(stages, dict) and isinstance(stages["generate"], dict)
+    command = stages["generate"]["command"]
+    assert isinstance(command, list)
+    command.remove("--wait")
+    config_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ProductionLoopError, match="harvest cannot race"):
+        load_config(config_path, state_dir=tmp_path / "state")
+
+
+def test_stage_cannot_mutate_its_input_and_advance_same_turn(tmp_path: Path) -> None:
+    repository, config_path, _final, payload = _fixture(tmp_path)
+    evaluate = repository / "tools" / "evaluate.py"
+    evaluate.write_text(
+        """from pathlib import Path
+import sys
+args = sys.argv[1:]
+source = Path(args[args.index('--candidate') + 1])
+source.write_text('mutated input\\n')
+out = Path(args[args.index('--out') + 1])
+out.write_text('evaluation\\n')
+""",
+        encoding="utf-8",
+    )
+    subprocess.run(("git", "-C", str(repository), "add", "."), check=True)
+    subprocess.run(
+        (
+            "git",
+            "-C",
+            str(repository),
+            "-c",
+            "user.name=Loop Test",
+            "-c",
+            "user.email=loop@example.invalid",
+            "commit",
+            "-qm",
+            "mutating evaluator",
+        ),
+        check=True,
+    )
+    payload["repository_commit"] = subprocess.check_output(
+        ("git", "-C", str(repository), "rev-parse", "HEAD"), text=True
+    ).strip()
+    config_path.write_text(json.dumps(payload), encoding="utf-8")
+    state_dir = tmp_path / "state"
+    loaded = load_config(config_path, state_dir=state_dir)
+
+    with pytest.raises(ProductionLoopError, match="mutated an input"):
+        execute(loaded, state_dir=state_dir)
+    state = json.loads((state_dir / "state.json").read_text(encoding="utf-8"))
+    assert state["completed_stages"] == list(STAGES[:5])
+
+
 def test_promotion_cannot_substitute_training_report_for_execution_receipt(
     tmp_path: Path,
 ) -> None:
@@ -272,7 +334,9 @@ def test_promotion_cannot_substitute_training_report_for_execution_receipt(
     promote["inputs"] = [str(tmp_path / "evaluate.json"), training_report]
     config_path.write_text(json.dumps(payload), encoding="utf-8")
 
-    with pytest.raises(ProductionLoopError, match="typed train-stage execution receipt"):
+    with pytest.raises(
+        ProductionLoopError, match="typed train-stage execution receipt"
+    ):
         load_config(config_path, state_dir=tmp_path / "state")
 
 
@@ -404,7 +468,9 @@ def test_exact_repo_relative_tool_and_untracked_cleanliness(tmp_path: Path) -> N
         load_config(config_path, state_dir=tmp_path / "state")
 
 
-def test_bare_config_launcher_is_not_a_production_training_receipt(tmp_path: Path) -> None:
+def test_bare_config_launcher_is_not_a_production_training_receipt(
+    tmp_path: Path,
+) -> None:
     repository, config_path, _final, payload = _fixture(tmp_path)
     bare = repository / "tools" / "train.py"
     bare.write_text(WRITER, encoding="utf-8")
@@ -548,7 +614,7 @@ def test_timeout_kills_local_stage_process_group(tmp_path: Path) -> None:
         (
             "import subprocess,sys,time;"
             "subprocess.Popen([sys.executable,'-c',"
-            f"\"import time,pathlib;time.sleep(2);pathlib.Path({str(marker)!r}).touch()\"]);"
+            f'"import time,pathlib;time.sleep(2);pathlib.Path({str(marker)!r}).touch()"]);'
             "time.sleep(30)"
         ),
     ]

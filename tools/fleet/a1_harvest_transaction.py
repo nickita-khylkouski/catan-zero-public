@@ -74,8 +74,16 @@ def _contract_shape(lock: Mapping[str, Any]) -> dict[str, Any]:
         or not isinstance(category_attempts, dict)
         or set(category_games) != set(contract.EXPECTED_GAMES)
         or set(category_attempts) != set(contract.EXPECTED_GAMES)
-        or any(isinstance(value, bool) or not isinstance(value, int) or value <= 0 for value in category_games.values())
-        or any(isinstance(value, bool) or not isinstance(value, int) or value < category_games[key] for key, value in category_attempts.items())
+        or any(
+            isinstance(value, bool) or not isinstance(value, int) or value <= 0
+            for value in category_games.values()
+        )
+        or any(
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or value < category_games[key]
+            for key, value in category_attempts.items()
+        )
         or game_contract.get("total_complete_games") != sum(category_games.values())
         or game_contract.get("total_attempts") != sum(category_attempts.values())
     ):
@@ -150,12 +158,16 @@ class _PinnedInput:
 
     def revalidate(self) -> None:
         if _stat_identity(os.fstat(self.descriptor)) != self.identity:
-            raise HarvestError(f"pinned immutable input descriptor drifted: {self.path}")
+            raise HarvestError(
+                f"pinned immutable input descriptor drifted: {self.path}"
+            )
         flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
         try:
             current = os.open(self.path, flags)
         except OSError as error:
-            raise HarvestError(f"pinned immutable input path drifted: {self.path}: {error}") from error
+            raise HarvestError(
+                f"pinned immutable input path drifted: {self.path}: {error}"
+            ) from error
         try:
             if _stat_identity(os.fstat(current)) != self.identity:
                 raise HarvestError(f"pinned immutable input inode drifted: {self.path}")
@@ -265,7 +277,9 @@ def _validate_inputs(
     jobs = list(lock["fleet"]["jobs"])
     shape = _contract_shape(lock)
     if len(jobs) != shape["job_count"]:
-        raise HarvestError(f"expected {shape['job_count']} sealed jobs, got {len(jobs)}")
+        raise HarvestError(
+            f"expected {shape['job_count']} sealed jobs, got {len(jobs)}"
+        )
     commands = {str(item.get("job_id", "")): item for item in rendered["commands"]}
     if len(commands) != shape["job_count"]:
         raise HarvestError("render contains duplicate job identities")
@@ -279,7 +293,9 @@ def _validate_inputs(
         if not _HOST_RE.fullmatch(host):
             raise HarvestError(f"unsafe host alias for {job_id}: {host!r}")
         hosts.add(host)
-        output = _normal_remote_path(str(job["output_dir"]), where=f"{job_id}.output_dir")
+        output = _normal_remote_path(
+            str(job["output_dir"]), where=f"{job_id}.output_dir"
+        )
         if output.name != job_id:
             raise HarvestError(f"{job_id}: output basename must equal immutable job id")
         if str(output) in seen_outputs:
@@ -313,10 +329,15 @@ def _validate_inputs(
         for job in jobs:
             games[str(job["category"])] += int(job["games"])
             attempts[str(job["category"])] += int(job["attempts"])
-        if dict(games) != shape["category_games"] or dict(attempts) != shape["category_attempts"]:
+        if (
+            dict(games) != shape["category_games"]
+            or dict(attempts) != shape["category_attempts"]
+        ):
             raise HarvestError("dual-arm jobs do not equal sealed category quotas")
     if shape["host_count"] is not None and len(hosts) != shape["host_count"]:
-        raise HarvestError(f"expected {shape['host_count']} immutable hosts, got {len(hosts)}")
+        raise HarvestError(
+            f"expected {shape['host_count']} immutable hosts, got {len(hosts)}"
+        )
     if shape["arm_id"] is not None and not hosts:
         raise HarvestError("dual-arm harvest has no immutable hosts")
     return lock, rendered, jobs
@@ -335,9 +356,7 @@ def _member_relative(member_name: str, expected_roots: set[str]) -> Path:
     return Path(*parts)
 
 
-def _extract_archive(
-    archive: Path, target: Path, *, expected_roots: set[str]
-) -> None:
+def _extract_archive(archive: Path, target: Path, *, expected_roots: set[str]) -> None:
     target.mkdir(parents=True, exist_ok=False)
     seen: set[Path] = set()
     roots_seen: set[str] = set()
@@ -361,8 +380,14 @@ def _extract_archive(
                     )
                 file_count += 1
                 total_size += int(member.size)
-                if file_count > 1_000_000 or member.size > (1 << 40) or total_size > (1 << 44):
-                    raise HarvestError("archive exceeds fail-closed member/byte safety limits")
+                if (
+                    file_count > 1_000_000
+                    or member.size > (1 << 40)
+                    or total_size > (1 << 44)
+                ):
+                    raise HarvestError(
+                        "archive exceeds fail-closed member/byte safety limits"
+                    )
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 if destination.exists():
                     raise HarvestError(f"archive member collides at {member.name!r}")
@@ -417,7 +442,9 @@ def _inventory_job(
         if not stat.S_ISREG(mode):
             raise HarvestError(f"non-regular file appeared in harvested tree: {path}")
         relative = path.relative_to(job_dir)
-        source = PurePosixPath(str(job["output_dir"])) / PurePosixPath(relative.as_posix())
+        source = PurePosixPath(str(job["output_dir"])) / PurePosixPath(
+            relative.as_posix()
+        )
         records.append(
             {
                 "source_path": str(source),
@@ -435,7 +462,9 @@ def _inventory_job(
     }
     missing = required - relative_names
     if missing:
-        raise HarvestError(f"{job['job_id']}: missing required outputs {sorted(missing)}")
+        raise HarvestError(
+            f"{job['job_id']}: missing required outputs {sorted(missing)}"
+        )
     attestation = _load_json(job_dir / "a1_contract.json")
     if attestation != contract._job_attestation(dict(lock), dict(job)):
         raise HarvestError(f"{job['job_id']}: immutable output attestation drift")
@@ -459,7 +488,11 @@ def _inventory_job(
                 raise HarvestError(
                     f"{job['job_id']}: {label} reference is non-canonical: {raw!r}"
                 )
-            source = raw_path if raw_path.is_absolute() else manifest_source.parent / raw_path
+            source = (
+                raw_path
+                if raw_path.is_absolute()
+                else manifest_source.parent / raw_path
+            )
             if ".." in source.parts or str(source) not in source_paths:
                 raise HarvestError(
                     f"{job['job_id']}: {label} reference is absent or unsafe: {raw!r}"
@@ -471,10 +504,7 @@ def _write_exclusive_json(path: Path, payload: dict[str, Any]) -> None:
     data = json.dumps(payload, indent=2, sort_keys=True).encode("utf-8") + b"\n"
     descriptor = os.open(
         path,
-        os.O_WRONLY
-        | os.O_CREAT
-        | os.O_EXCL
-        | getattr(os, "O_NOFOLLOW", 0),
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
         0o444,
     )
     try:
@@ -543,7 +573,10 @@ def _verify_state(
 
 
 def _ssh_fetch(
-    ssh_command: Sequence[str], host: str, outputs: Sequence[PurePosixPath], archive: Path
+    ssh_command: Sequence[str],
+    host: str,
+    outputs: Sequence[PurePosixPath],
+    archive: Path,
 ) -> None:
     parents = {str(path.parent) for path in outputs}
     if len(parents) != 1:
@@ -573,9 +606,7 @@ def _ssh_output_bytes(
 ) -> int:
     """Measure the apparent remote bytes needed for a host archive."""
 
-    remote = " ".join(
-        ["du -sb --", *(shlex.quote(str(path)) for path in outputs)]
-    )
+    remote = " ".join(["du -sb --", *(shlex.quote(str(path)) for path in outputs)])
     result = subprocess.run(
         [*ssh_command, host, remote],
         stdout=subprocess.PIPE,
@@ -602,8 +633,7 @@ def _ssh_output_bytes(
 def _estimated_archive_bytes(apparent_bytes: int) -> int:
     return max(
         _TAR_ESTIMATE_FLOOR,
-        (apparent_bytes * _TAR_ESTIMATE_NUMERATOR
-         + _TAR_ESTIMATE_DENOMINATOR - 1)
+        (apparent_bytes * _TAR_ESTIMATE_NUMERATOR + _TAR_ESTIMATE_DENOMINATOR - 1)
         // _TAR_ESTIMATE_DENOMINATOR,
     )
 
@@ -765,7 +795,10 @@ def _validate_published(
     lock_pin: _PinnedInput,
     render_pin: _PinnedInput,
 ) -> dict[str, Any]:
-    if destination.is_symlink() or destination.resolve(strict=True) != destination.absolute():
+    if (
+        destination.is_symlink()
+        or destination.resolve(strict=True) != destination.absolute()
+    ):
         raise HarvestError("published harvest root is a symlink")
     receipt = _load_json(destination / "harvest_receipt.json")
     relocation = _load_json(destination / "relocation_map.json")
@@ -824,9 +857,10 @@ def _validate_published(
         path = destination / str(record["relative_path"])
         if path.is_symlink() or not path.is_file():
             raise HarvestError(f"published harvested file is missing: {path}")
-        if path.stat().st_size != int(record["size_bytes"]) or _file_sha256(path) != record[
-            "sha256"
-        ]:
+        if (
+            path.stat().st_size != int(record["size_bytes"])
+            or _file_sha256(path) != record["sha256"]
+        ):
             raise HarvestError(f"published harvested bytes drifted: {path}")
     return relocation
 
@@ -855,7 +889,9 @@ def _atomic_publish_noreplace(
             ctypes.c_uint(1),
         )
     else:
-        raise HarvestError("platform has no atomic no-replace directory publish primitive")
+        raise HarvestError(
+            "platform has no atomic no-replace directory publish primitive"
+        )
     if result != 0:
         error_number = ctypes.get_errno()
         if error_number in {errno.EEXIST, errno.ENOTEMPTY}:
@@ -909,7 +945,9 @@ def _harvest_locked(
         if transaction_guard is not None:
             transaction_guard()
         return result
-    stage = destination.parent / f".{destination.name}.harvest-{transaction_key}.staging"
+    stage = (
+        destination.parent / f".{destination.name}.harvest-{transaction_key}.staging"
+    )
     payload = stage / "payload"
     jobs_root = payload / "jobs"
     state_root = stage / "state"
@@ -991,34 +1029,31 @@ def _harvest_locked(
     # Re-read the entire staged payload immediately before metadata creation.
     # State receipts accelerate network resume but are never final authority.
     final_inventories = {
-        str(job["job_id"]): _inventory_job(
-            jobs_root / str(job["job_id"]), job, lock
-        )
+        str(job["job_id"]): _inventory_job(jobs_root / str(job["job_id"]), job, lock)
         for job in jobs
     }
     if final_inventories != inventories:
         raise HarvestError("staged payload changed after its per-job receipts")
-    files = [
-        record
-        for job in jobs
-        for record in final_inventories[str(job["job_id"])]
-    ]
+    files = [record for job in jobs for record in final_inventories[str(job["job_id"])]]
     source_paths = [record["source_path"] for record in files]
     if len(source_paths) != len(set(source_paths)):
         raise HarvestError("harvest contains duplicate immutable source paths")
     identity_fields = (
-        "job_id", "worker_id", "host_alias", "gpu", "category", "output_dir"
+        "job_id",
+        "worker_id",
+        "host_alias",
+        "gpu",
+        "category",
+        "output_dir",
     ) + (("arm_id",) if _contract_shape(lock)["arm_id"] is not None else ())
-    job_identities = [
-        {
-            key: job[key]
-            for key in identity_fields
-        }
-        for job in jobs
-    ]
+    job_identities = [{key: job[key] for key in identity_fields} for job in jobs]
     relocation = {
         "schema_version": SCHEMA,
-        **({} if _contract_shape(lock)["arm_id"] is None else {"arm_id": _contract_shape(lock)["arm_id"]}),
+        **(
+            {}
+            if _contract_shape(lock)["arm_id"] is None
+            else {"arm_id": _contract_shape(lock)["arm_id"]}
+        ),
         "contract_path": str(lock_path),
         "contract_file_sha256": lock_pin.sha256,
         "contract_sha256": lock["contract_sha256"],
@@ -1036,7 +1071,11 @@ def _harvest_locked(
     _install_or_verify_json(staged_map, relocation)
     receipt = {
         "schema_version": RECEIPT_SCHEMA,
-        **({} if _contract_shape(lock)["arm_id"] is None else {"arm_id": _contract_shape(lock)["arm_id"]}),
+        **(
+            {}
+            if _contract_shape(lock)["arm_id"] is None
+            else {"arm_id": _contract_shape(lock)["arm_id"]}
+        ),
         "contract_sha256": lock["contract_sha256"],
         "render_sha256": rendered["render_sha256"],
         "relocation_sha256": relocation["relocation_sha256"],
@@ -1052,6 +1091,7 @@ def _harvest_locked(
         os.fsync(directory_fd)
     finally:
         os.close(directory_fd)
+
     def preflight() -> None:
         if transaction_guard is not None:
             transaction_guard()
@@ -1095,10 +1135,7 @@ def _harvest_locked(
 def _write_snapshot(path: Path, data: bytes) -> None:
     descriptor = os.open(
         path,
-        os.O_WRONLY
-        | os.O_CREAT
-        | os.O_EXCL
-        | getattr(os, "O_NOFOLLOW", 0),
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
         0o400,
     )
     try:
@@ -1129,9 +1166,13 @@ def harvest(
         try:
             canonical = path.resolve(strict=True)
         except OSError as error:
-            raise HarvestError(f"cannot resolve immutable {label} input: {error}") from error
+            raise HarvestError(
+                f"cannot resolve immutable {label} input: {error}"
+            ) from error
         if canonical != path:
-            raise HarvestError(f"immutable {label} input path must not traverse symlinks")
+            raise HarvestError(
+                f"immutable {label} input path must not traverse symlinks"
+            )
     if executor_receipt is not None:
         receipt_path = executor_receipt.expanduser().absolute()
         try:
@@ -1144,12 +1185,12 @@ def harvest(
         lock = _load_json(lock_path)
         rendered = _load_json(render_path)
         if (
-            receipt.get("status") != "launched"
+            receipt.get("status") != "complete"
             or receipt.get("contract_sha256") != lock.get("contract_sha256")
             or receipt.get("render_sha256") != rendered.get("render_sha256")
         ):
             raise HarvestError(
-                "executor receipt is not the launched transaction for this lock/render"
+                "executor receipt is not the completed transaction for this lock/render"
             )
     try:
         destination_parent = destination.parent.resolve(strict=True)
@@ -1170,10 +1211,7 @@ def harvest(
         try:
             transaction_fd = os.open(
                 lock_name,
-                os.O_RDWR
-                | os.O_CREAT
-                | os.O_EXCL
-                | getattr(os, "O_NOFOLLOW", 0),
+                os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
                 0o600,
                 dir_fd=parent_fd,
             )
@@ -1208,7 +1246,9 @@ def harvest(
             try:
                 named = os.stat(lock_name, dir_fd=parent_fd, follow_symlinks=False)
             except FileNotFoundError as error:
-                raise HarvestError("destination transaction lock was unlinked") from error
+                raise HarvestError(
+                    "destination transaction lock was unlinked"
+                ) from error
             if (
                 not stat.S_ISREG(held.st_mode)
                 or held.st_nlink != 1
@@ -1297,7 +1337,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     except (HarvestError, contract.ContractError, OSError, tarfile.TarError) as error:
         parser.error(str(error))
-    print(json.dumps({"status": "PASS", "relocation_sha256": result["relocation_sha256"]}))
+    print(
+        json.dumps({"status": "PASS", "relocation_sha256": result["relocation_sha256"]})
+    )
     return 0
 
 

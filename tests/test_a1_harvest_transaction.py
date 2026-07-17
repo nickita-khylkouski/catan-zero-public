@@ -68,7 +68,9 @@ def test_bounded_fetch_uses_multiple_direct_host_streams(
     monkeypatch.setattr(harvest, "_ssh_fetch", fake_fetch)
     monkeypatch.setattr(harvest, "_ssh_output_bytes", lambda *_args: 1)
     monkeypatch.setattr(harvest, "_preflight_cohort_disk", lambda *_args: None)
-    monkeypatch.setattr(harvest, "_install_fetched_batch", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        harvest, "_install_fetched_batch", lambda *_args, **_kwargs: None
+    )
     batches = [
         harvest._HostFetch(  # noqa: SLF001 - focused transport concurrency test.
             host=f"h{index}",
@@ -356,6 +358,30 @@ def test_collects_exact_120_jobs_from_eight_hosts_and_resumes_published(
     assert len((fleet[-1]).read_text().splitlines()) == 8
 
 
+def test_harvest_refuses_detached_launch_acknowledgement(fleet, tmp_path: Path) -> None:
+    lock, rendered, lock_path, render_path, _remote, ssh, _log = fleet
+    receipt = tmp_path / "executor.json"
+    receipt.write_text(
+        json.dumps(
+            {
+                "status": "launched",
+                "contract_sha256": lock["contract_sha256"],
+                "render_sha256": rendered["render_sha256"],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(harvest.HarvestError, match="completed transaction"):
+        harvest.harvest(
+            lock_path,
+            render_path,
+            tmp_path / "published",
+            executor_receipt=receipt,
+            ssh_command=(str(ssh),),
+        )
+
+
 def test_parallel_fetch_publishes_the_same_validated_inventory(
     fleet, tmp_path: Path
 ) -> None:
@@ -469,9 +495,7 @@ def test_member_path_validator_rejects_noncanonical_names(relative: str) -> None
         harvest._member_relative(relative, {"job"})
 
 
-def test_missing_and_corrupt_outputs_fail_before_publish(
-    fleet, tmp_path: Path
-) -> None:
+def test_missing_and_corrupt_outputs_fail_before_publish(fleet, tmp_path: Path) -> None:
     lock, _rendered, *_rest, remote, _ssh, _log = fleet
     first = lock["fleet"]["jobs"][0]
     (remote / first["host_alias"] / first["job_id"] / "config_registry.jsonl").unlink()
@@ -541,7 +565,9 @@ def test_resume_refuses_corrupt_staged_bytes(
 
 def test_relocation_loader_rejects_post_publish_symlink(fleet, tmp_path: Path) -> None:
     result = _run(fleet, tmp_path)
-    record = next(item for item in result["files"] if item["source_path"].endswith("shard.npz"))
+    record = next(
+        item for item in result["files"] if item["source_path"].endswith("shard.npz")
+    )
     victim = tmp_path / "published" / record["relative_path"]
     replacement = tmp_path / "replacement"
     replacement.write_bytes(victim.read_bytes())
