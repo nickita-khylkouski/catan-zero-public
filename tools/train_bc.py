@@ -14920,7 +14920,7 @@ def main(
                 json.dumps({"progress": "warm_start_grow", **grow_report}, sort_keys=True),
                 ddp,
             )
-        scratch_history_initialization = _initialize_scratch_meaningful_history_path(
+        scratch_history_initialization = _initialize_cold_start_meaningful_history_path(
             policy,
             scratch=not bool(args.init_checkpoint or args.grow_from_checkpoint),
         )
@@ -21062,25 +21062,30 @@ def _route_mixed_public_award_batch(
     return routed
 
 
-SCRATCH_MEANINGFUL_HISTORY_GATE_INITIAL_SCALE = 0.1
+MEANINGFUL_HISTORY_COLD_START_GATE_INITIAL_SCALE = 0.1
 
 
-def _initialize_scratch_meaningful_history_path(
+def _initialize_cold_start_meaningful_history_path(
     policy: Any,
     *,
     scratch: bool,
 ) -> dict[str, object]:
-    """Activate history conservatively only for a genuinely new model.
+    """Activate an untrained history branch before its first learner step.
 
-    A zero gate is required when adding history to an incumbent checkpoint:
-    it preserves the parent's function exactly. A scratch model has no parent
-    function to preserve, and leaving a gate at zero blocks gradients into the
-    module behind it on step one. Unit scale is also unsafe: both random history
-    branches are added after the final state normalization, so long histories
-    can dominate the initial representation. Start both configured branches at
-    a small nonzero scale that preserves first-step gradients without injecting
-    the full random adapter; warm-started models retain serialized gates exactly.
+    Exact-zero gates are needed while *constructing* a function-preserving
+    checkpoint upgrade.  They are not a valid training initialization once a
+    corpus supplies meaningful public history: multiplication by an all-zero
+    gate gives the gate a gradient but gives the event encoder and ordered pool
+    exactly none.  The old scratch-only rule accidentally left this dead path
+    in place for every function-preserving history upgrade.
+
+    Preserve a checkpoint that has already learned either history gate.  For a
+    cold path (both configured gates are exactly zero), seed a small scale once
+    before the optimizer is created.  This keeps the new random residual
+    bounded, while letting its representation learn on the first backward pass.
     """
+
+    import torch
 
     model = getattr(policy, "model", policy)
     config = getattr(policy, "config", getattr(model, "config", None))
@@ -21096,33 +21101,36 @@ def _initialize_scratch_meaningful_history_path(
         raise RuntimeError(
             "meaningful public history is enabled but its residual gate is absent"
         )
-    if not scratch:
+    ordered_gate = getattr(model, "meaningful_history_ordered_gate", None)
+    gate_is_live = bool(torch.count_nonzero(gate).item())
+    ordered_gate_is_live = bool(
+        ordered_gate is not None and torch.count_nonzero(ordered_gate).item()
+    )
+    if gate_is_live or ordered_gate_is_live:
         return {
             "enabled": True,
-            "scratch": False,
+            "scratch": bool(scratch),
             "masked_mean_gate_initialization": "checkpoint_preserved",
             "ordered_additive_gate_initialization": "checkpoint_preserved",
         }
-    import torch
 
     with torch.no_grad():
-        gate.fill_(SCRATCH_MEANINGFUL_HISTORY_GATE_INITIAL_SCALE)
-    ordered_gate = getattr(model, "meaningful_history_ordered_gate", None)
+        gate.fill_(MEANINGFUL_HISTORY_COLD_START_GATE_INITIAL_SCALE)
     if ordered_gate is not None:
         with torch.no_grad():
-            ordered_gate.fill_(SCRATCH_MEANINGFUL_HISTORY_GATE_INITIAL_SCALE)
+            ordered_gate.fill_(MEANINGFUL_HISTORY_COLD_START_GATE_INITIAL_SCALE)
     return {
         "enabled": True,
-        "scratch": True,
-        "masked_mean_gate_initialization": "small_nonzero_constant",
-        "masked_mean_gate_initial_scale": (
-            SCRATCH_MEANINGFUL_HISTORY_GATE_INITIAL_SCALE
-        ),
+        "scratch": bool(scratch),
+        "masked_mean_gate_initialization": "cold_start_small_nonzero_constant",
+        "masked_mean_gate_initial_scale": MEANINGFUL_HISTORY_COLD_START_GATE_INITIAL_SCALE,
         "ordered_additive_gate_initialization": (
-            "small_nonzero_constant" if ordered_gate is not None else "not_present"
+            "cold_start_small_nonzero_constant"
+            if ordered_gate is not None
+            else "not_present"
         ),
         "ordered_additive_gate_initial_scale": (
-            SCRATCH_MEANINGFUL_HISTORY_GATE_INITIAL_SCALE
+            MEANINGFUL_HISTORY_COLD_START_GATE_INITIAL_SCALE
             if ordered_gate is not None
             else None
         ),

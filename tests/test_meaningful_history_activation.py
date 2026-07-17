@@ -198,12 +198,12 @@ def test_scratch_training_activates_history_but_warm_start_preserves_zero():
     from tools import train_bc
 
     scratch = EntityGraphNet(_config(history=True)).train()
-    scratch_report = train_bc._initialize_scratch_meaningful_history_path(
+    scratch_report = train_bc._initialize_cold_start_meaningful_history_path(
         scratch, scratch=True
     )
     assert (
         scratch_report["masked_mean_gate_initialization"]
-        == "small_nonzero_constant"
+        == "cold_start_small_nonzero_constant"
     )
     assert scratch_report["masked_mean_gate_initial_scale"] == 0.1
     assert torch.equal(
@@ -212,16 +212,31 @@ def test_scratch_training_activates_history_but_warm_start_preserves_zero():
     )
 
     warm_start = EntityGraphNet(_config(history=True)).train()
-    warm_report = train_bc._initialize_scratch_meaningful_history_path(
+    warm_report = train_bc._initialize_cold_start_meaningful_history_path(
         warm_start, scratch=False
     )
     assert (
         warm_report["masked_mean_gate_initialization"]
-        == "checkpoint_preserved"
+        == "cold_start_small_nonzero_constant"
     )
-    assert torch.count_nonzero(
-        warm_start.meaningful_history_residual_gate
-    ).item() == 0
+    assert torch.equal(
+        warm_start.meaningful_history_residual_gate,
+        torch.full_like(warm_start.meaningful_history_residual_gate, 0.1),
+    )
+
+    # A checkpoint whose history branch has actually started learning must not
+    # be overwritten merely because it is a warm start.
+    trained = EntityGraphNet(_config(history=True)).train()
+    with torch.no_grad():
+        trained.meaningful_history_residual_gate.fill_(0.03)
+    trained_report = train_bc._initialize_cold_start_meaningful_history_path(
+        trained, scratch=False
+    )
+    assert trained_report["masked_mean_gate_initialization"] == "checkpoint_preserved"
+    assert torch.equal(
+        trained.meaningful_history_residual_gate,
+        torch.full_like(trained.meaningful_history_residual_gate, 0.03),
+    )
 
 
 def test_zero_gate_preserves_incumbent_dropout_rng_and_event_encoder_gradients():

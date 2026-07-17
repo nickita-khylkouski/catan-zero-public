@@ -159,13 +159,13 @@ def test_scratch_ordered_history_is_live_on_the_first_backward() -> None:
 
     torch.manual_seed(23)
     model = EntityGraphNet(_config(ordered=True)).train()
-    report = train_bc._initialize_scratch_meaningful_history_path(
+    report = train_bc._initialize_cold_start_meaningful_history_path(
         model, scratch=True
     )
 
-    assert report["masked_mean_gate_initialization"] == "small_nonzero_constant"
+    assert report["masked_mean_gate_initialization"] == "cold_start_small_nonzero_constant"
     assert report["ordered_additive_gate_initialization"] == (
-        "small_nonzero_constant"
+        "cold_start_small_nonzero_constant"
     )
     assert report["masked_mean_gate_initial_scale"] == 0.1
     assert report["ordered_additive_gate_initial_scale"] == 0.1
