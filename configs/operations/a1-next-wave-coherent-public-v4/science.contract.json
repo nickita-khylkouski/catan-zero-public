@@ -239,7 +239,7 @@
       "max_grad_norm": 1.0,
       "fused_optimizer": true,
       "value_lr_mult": 1.0,
-      "value_trunk_grad_scale": 0.25,
+      "value_trunk_grad_scale": 0.1,
       "post_policy_dose_value_trunk_grad_scale": 0.0,
       "train_diagnostics_every_batches": 16,
       "objective_gradient_interference_every_batches": 16,

@@ -203,6 +203,15 @@ def test_canonical_forced_value_baseline_preserves_boundary_evidence() -> None:
     )
 
 
+def test_canonical_v7_value_routing_protects_only_the_shared_trunk() -> None:
+    """V7 commissions a 0.1 shared boundary with a fully live private tower."""
+
+    fields = _fields()
+    engine = _payload()["engine_settings"]
+    assert fields["value_trunk_grad_scale"] == 0.1
+    assert engine["value_tower_split_layers"] == 1
+
+
 def test_scratch_horizon_is_not_relabelled_as_the_parent_update_frontier() -> None:
     """The proven 32-step result was a parent update, not scratch evidence."""
 

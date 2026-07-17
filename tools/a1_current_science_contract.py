@@ -104,11 +104,13 @@ PRODUCTION_LEARNER_SIGNAL_CONTRACT = {
     "value_lr_mult": 1.0,
     # Adam can cancel a constant parameter-group LR interpretation through its
     # first/second moments, so this is an explicit autograd-boundary scale. The
-    # private final value block protects the policy readout, while a
-    # measured 0.25 boundary gradient still lets terminal outcomes train the
-    # shared token/history representation from scratch.  A zero boundary made
-    # every value-only row useless to the 5 shared blocks and input encoders.
-    "value_trunk_grad_scale": 0.25,
+    # private final value block protects the policy readout, while a 0.1
+    # boundary gradient still lets terminal outcomes train the shared
+    # token/history representation from scratch.  A zero boundary made every
+    # value-only row useless to the 5 shared blocks and input encoders.  Keep
+    # this scale at the shared/private boundary: the private value tower and
+    # readouts remain fully trainable.
+    "value_trunk_grad_scale": 0.1,
     # Dormant while policy_dose_lr_area is unresolved/zero. Once a positive
     # policy frontier is sealed, terminal value learning continues only through
     # the private value tower/readouts instead of drifting the policy trunk.

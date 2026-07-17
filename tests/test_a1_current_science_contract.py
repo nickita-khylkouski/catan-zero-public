@@ -28,7 +28,7 @@ def test_current_learner_selects_parent_update_and_keeps_scratch_research_only()
     assert selection["initialization"]["optimizer_state"] == "fresh"
     assert selection["execution_topology"]["world_size"] == 8
     assert selection["execution_topology"]["global_batch_size"] == 512
-    assert selection["execution_topology"]["go_authorized"] is False
+    assert selection["execution_topology"]["go_authorized"] is True
     learner = current_science.learner()
     assert "initialization" not in learner
     assert "execution_topology" not in learner
@@ -66,7 +66,7 @@ def test_current_learner_selects_parent_update_and_keeps_scratch_research_only()
     assert model["action_target_gather"] is True
     assert model["legal_action_value_set_statistics"] is True
     assert model["actor_public_rule_state"].startswith("dev_used_")
-    assert recipe["value_trunk_grad_scale"] == 0.25
+    assert recipe["value_trunk_grad_scale"] == 0.1
     assert recipe["post_policy_dose_value_trunk_grad_scale"] == 0.0
     execution = current_science.learner_execution_topology()
     assert execution == current_science.PRODUCTION_LEARNER_EXECUTION_TOPOLOGY_CONTRACT
@@ -208,7 +208,9 @@ def test_current_contract_rejects_parent_update_admission_becoming_implicit(
     admission = json.loads(
         current_science.TRAINING_SCIENCE_ADMISSION_PATH.read_text(encoding="utf-8")
     )
-    admission["recipes"]["a1-parent-update-35m-b200"]["authorized"] = True
+    admission["recipes"]["a1-parent-update-35m-b200"][
+        "commissioning_evidence"
+    ] = []
     path = tmp_path / "training_science_admission.json"
     path.write_text(json.dumps(admission), encoding="utf-8")
     monkeypatch.setattr(current_science, "TRAINING_SCIENCE_ADMISSION_PATH", path)
@@ -220,15 +222,12 @@ def test_current_contract_rejects_parent_update_admission_becoming_implicit(
         current_science.load()
 
 
-def test_selected_parent_update_go_is_explicitly_unauthorized() -> None:
+def test_selected_parent_update_go_is_explicitly_authorized() -> None:
     commissioning = current_science.selected_parent_update_commissioning()
-    assert commissioning["authorized"] is False
-    assert commissioning["go_authorized"] is False
-    with pytest.raises(
-        current_science.ScienceContractError,
-        match="not authorized for --go",
-    ):
-        current_science.require_selected_parent_update_go_authorized()
+    assert commissioning["authorized"] is True
+    assert commissioning["go_authorized"] is True
+    assert commissioning["commissioning_evidence"]
+    assert current_science.require_selected_parent_update_go_authorized() == commissioning
 
 
 def test_current_target_quality_generation_is_bound_to_config_and_guard() -> None:
@@ -369,7 +368,7 @@ def test_current_contract_rejects_uncommissioned_boundary_particles(
     ("field", "diagnostic_value"),
     (
         ("value_lr_mult", 0.3),
-        ("value_trunk_grad_scale", 0.1),
+        ("value_trunk_grad_scale", 0.25),
         ("grad_accum_steps", 4),
         ("max_steps", 1024),
         ("phase_weights", ""),
