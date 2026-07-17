@@ -541,12 +541,18 @@ def test_coherent_row_surface_is_copied_into_spawned_worker_payload(
             "--event-history-limit",
             "32",
             "--no-record-automatic-transitions",
+            "--policy-target-min-visits",
+            "3",
         ]
     )
 
     assert captured["meaningful_public_history"] is True
     assert captured["event_history_limit"] == 32
     assert captured["record_automatic_transitions"] is False
+    # The stored policy target is pruned inside the spawned worker's MCTS,
+    # not in the top-level launcher.  This protects nonzero sealed recipes
+    # from silently falling back to the MCTS default (no pruning).
+    assert captured["policy_target_min_visits"] == 3
 
 
 def test_config_filled_values_are_explicit_to_prelaunch_guard(tmp_path):

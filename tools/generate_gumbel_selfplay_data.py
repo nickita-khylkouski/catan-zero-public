@@ -1123,6 +1123,16 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--policy-target-min-visits",
+        type=int,
+        default=0,
+        help=(
+            "Drop root actions with fewer visits than this from the stored "
+            "policy target. This is part of the teacher operator, not a "
+            "learner-only filter; zero preserves the unpruned target."
+        ),
+    )
+    parser.add_argument(
         "--target-reliability-audit-fraction",
         type=float,
         default=0.0,
@@ -1651,6 +1661,12 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "shard_size": int(args.shard_size),
                 "format": args.format,
                 "preserve_search_evidence": bool(args.preserve_search_evidence),
+                # This changes the policy-target support itself, so it must
+                # cross the parent/worker boundary rather than merely being
+                # recorded in GenerateConfig provenance.  A missing payload
+                # key would make every nonzero sealed recipe fall back to the
+                # MCTS default of zero pruning.
+                "policy_target_min_visits": int(args.policy_target_min_visits),
                 "target_reliability_audit_fraction": float(
                     args.target_reliability_audit_fraction
                 ),
