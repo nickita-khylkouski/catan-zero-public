@@ -137,6 +137,9 @@ CHECKPOINT_HOLDOUT_SCHEMA = "train-bc-checkpoint-holdout-v1"
 CHECKPOINT_HOLDOUT_FRONTIER_SCHEMA = (
     "train-bc-checkpoint-holdout-frontier-v1"
 )
+CANONICAL_PARENT_UPDATE_CHILD_AUTHORITY_SCHEMA = (
+    "a1-canonical-parent-update-child-authority-v1"
+)
 POLICY_AUX_SAMPLING_LEGACY_REPLACEMENT_V1 = (
     "weighted_with_replacement_legacy_v1"
 )
@@ -1977,6 +1980,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--a1-learner-ablation-id", default="", help=argparse.SUPPRESS)
     parser.add_argument(
         "--a1-scratch-authority-json", default="", help=argparse.SUPPRESS
+    )
+    parser.add_argument(
+        "--a1-canonical-parent-update-authority-json",
+        default="",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--a1-scratch-diagnostic-authority-json",
@@ -11133,10 +11141,13 @@ def _require_explicit_production_checkpoint_architecture(
     central_raw = str(
         getattr(args, "a1_central_learner_binding_json", "") or ""
     )
+    parent_update_raw = str(
+        getattr(args, "a1_canonical_parent_update_authority_json", "") or ""
+    )
     if not (
         composite_meta.get("schema_version") == "memmap_composite_v2"
         and composite_meta.get("promotion_eligible") is True
-        and central_raw
+        and (central_raw or parent_update_raw)
     ):
         return
     checkpoint_owned = (
@@ -11279,6 +11290,224 @@ def _preflight_production_composite_central_authority(
         )
 
 
+def _validate_production_composite_parent_update_authority(
+    args: argparse.Namespace,
+    ddp: dict[str, int | bool],
+    composite_meta: Mapping[str, object],
+) -> dict[str, object]:
+    """Replay the commissioned B12 warm-start authority before payload/CUDA work."""
+
+    raw = str(
+        getattr(args, "a1_canonical_parent_update_authority_json", "") or ""
+    )
+    try:
+        authority = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise SystemExit(
+            f"invalid canonical parent-update authority JSON: {error}"
+        ) from error
+    expected_fields = {
+        "schema_version",
+        "contract_sha256",
+        "claim_identity_sha256",
+        "data",
+        "descriptor_file_sha256",
+        "payload_inventory_sha256",
+        "source_authority",
+        "category_semantics",
+        "category_semantics_sha256",
+        "composite_build_receipt",
+        "parent_checkpoint",
+        "migrated_initializer",
+        "information_contract_migration",
+        "canonical_parent_update",
+        "runtime_recipe",
+        "runtime_recipe_sha256",
+        "training_topology",
+        "ddp_canary_semantic_identity_sha256",
+        "trainer_authority_sha256",
+        "trainer_sha256",
+        "training_science_commissioning",
+        "event_history_training_contract_sha256",
+        "lock_verifier_authority_sha256",
+        "lock",
+        "lock_file_sha256",
+        "diagnostic_only",
+        "promotion_eligible",
+        "eligible_for_full_gate",
+        "promotion_block_reason",
+        "authority_sha256",
+    }
+    if not isinstance(authority, dict) or set(authority) != expected_fields:
+        raise SystemExit("canonical parent-update authority fields drift")
+    unhashed = dict(authority)
+    stated = unhashed.pop("authority_sha256", None)
+    if (
+        authority.get("schema_version")
+        != CANONICAL_PARENT_UPDATE_CHILD_AUTHORITY_SCHEMA
+        or stated != _canonical_json_sha256(unhashed)
+        or not _is_sha256(authority.get("contract_sha256"))
+        or not _is_sha256(authority.get("claim_identity_sha256"))
+        or authority.get("diagnostic_only") is not False
+        or authority.get("promotion_eligible") is not False
+        or authority.get("eligible_for_full_gate") is not True
+        or authority.get("promotion_block_reason")
+        != "requires_normal_full_promotion_gates"
+    ):
+        raise SystemExit("canonical parent-update authority digest/status drift")
+
+    try:
+        data_path = Path(str(authority["data"])).expanduser().resolve(strict=True)
+        actual_data = Path(str(args.data)).expanduser().resolve(strict=True)
+    except OSError as error:
+        raise SystemExit(f"cannot resolve canonical parent-update data: {error}") from error
+    if (
+        data_path != actual_data
+        or str(data_path) != str(authority["data"])
+        or authority["descriptor_file_sha256"]
+        != composite_meta.get("descriptor_file_sha256")
+        or authority["payload_inventory_sha256"]
+        != composite_meta.get("payload_inventory_sha256")
+        or authority["source_authority"] != composite_meta.get("source_authority_ref")
+        or authority["category_semantics"] != composite_meta.get("category_semantics")
+        or authority["category_semantics_sha256"]
+        != composite_meta.get("category_semantics_sha256")
+    ):
+        raise SystemExit(
+            "canonical parent-update authority differs from composite metadata"
+        )
+
+    parent = authority["parent_checkpoint"]
+    initializer = authority["migrated_initializer"]
+    replay = composite_meta.get("flywheel_replay_contract")
+    if not isinstance(parent, dict) or set(parent) != {"path", "sha256"}:
+        raise SystemExit("canonical parent-update parent checkpoint is malformed")
+    if not isinstance(initializer, dict) or set(initializer) != {"path", "sha256"}:
+        raise SystemExit("canonical parent-update initializer is malformed")
+    if not isinstance(replay, Mapping):
+        raise SystemExit("canonical parent-update composite lacks replay parent")
+    try:
+        parent_path = Path(str(parent["path"])).expanduser().resolve(strict=True)
+        initializer_path = Path(str(initializer["path"])).expanduser().resolve(
+            strict=True
+        )
+        runtime_initializer = Path(str(args.init_checkpoint)).expanduser().resolve(
+            strict=True
+        )
+    except OSError as error:
+        raise SystemExit(
+            f"cannot resolve canonical parent-update checkpoint: {error}"
+        ) from error
+    if (
+        _sha256_existing_file(parent_path) != parent.get("sha256")
+        or _sha256_existing_file(initializer_path) != initializer.get("sha256")
+        or runtime_initializer != initializer_path
+        or replay.get("initializer_checkpoint_path") != str(parent_path)
+        or replay.get("initializer_checkpoint_sha256") != parent.get("sha256")
+    ):
+        raise SystemExit("canonical parent -> migration -> initializer chain drift")
+    args.init_checkpoint_sha256 = str(initializer["sha256"])
+
+    migration_ref = authority["information_contract_migration"]
+    if not isinstance(migration_ref, dict):
+        raise SystemExit("canonical parent-update migration authority is malformed")
+    receipt_ref = migration_ref.get("receipt")
+    if not isinstance(receipt_ref, dict) or set(receipt_ref) != {"path", "sha256"}:
+        raise SystemExit("canonical parent-update migration receipt is malformed")
+    try:
+        from tools import a1_information_contract_migration as migration_tool
+
+        migration = migration_tool.verify_receipt(Path(str(receipt_ref["path"])))
+    except (OSError, ValueError, migration_tool.MigrationError) as error:
+        raise SystemExit(
+            f"canonical parent-update migration replay refused: {error}"
+        ) from error
+    expected_migration = {
+        "migration": migration["migration"],
+        "receipt": migration["receipt"],
+        "receipt_sha256": migration["receipt_sha256"],
+        "source": migration["source"],
+        "migrated_initializer": migration["migrated_initializer"],
+        "forward_identical": migration["forward_identical"],
+        "promotion_eligible": migration["promotion_eligible"],
+    }
+    if (
+        migration_ref != expected_migration
+        or migration["source"] != parent
+        or migration["migrated_initializer"] != initializer
+        or migration["forward_identical"] is not False
+        or migration["promotion_eligible"] is not False
+    ):
+        raise SystemExit("canonical parent-update migration lineage drift")
+
+    canonical = authority["canonical_parent_update"]
+    if not isinstance(canonical, dict):
+        raise SystemExit("canonical parent-update recipe authority is malformed")
+    canonical_unhashed = dict(canonical)
+    canonical_digest = canonical_unhashed.pop("authority_sha256", None)
+    try:
+        selected_config = current_science.require_selected_parent_update(
+            Path(str(canonical.get("config", "")))
+        )
+        current_commissioning = current_science.selected_parent_update_commissioning()
+    except current_science.ScienceContractError as error:
+        raise SystemExit(f"canonical parent-update science refused: {error}") from error
+    if (
+        canonical_digest != _canonical_json_sha256(canonical_unhashed)
+        or str(selected_config) != canonical.get("config")
+        or _sha256_existing_file(selected_config) != canonical.get("config_sha256")
+        or canonical.get("parent_checkpoint_sha256") != parent.get("sha256")
+        or canonical.get("composite_descriptor_sha256")
+        != composite_meta.get("descriptor_file_sha256")
+        or authority["training_science_commissioning"] != current_commissioning
+        or current_commissioning.get("authorized") is not True
+        or current_commissioning.get("go_authorized") is not True
+    ):
+        raise SystemExit("canonical parent-update commissioned science drift")
+
+    build_ref = authority["composite_build_receipt"]
+    if not isinstance(build_ref, dict) or set(build_ref) != {
+        "path",
+        "file_sha256",
+        "receipt_sha256",
+    }:
+        raise SystemExit("canonical parent-update build receipt is malformed")
+    try:
+        build_path = Path(str(build_ref["path"])).expanduser().resolve(strict=True)
+        lock_path = Path(str(authority["lock"])).expanduser().resolve(strict=True)
+    except OSError as error:
+        raise SystemExit(
+            f"cannot resolve canonical parent-update authority files: {error}"
+        ) from error
+    if (
+        _sha256_existing_file(build_path) != build_ref["file_sha256"]
+        or canonical.get("composite_build_receipt_sha256")
+        != build_ref["file_sha256"]
+        or _sha256_existing_file(lock_path) != authority["lock_file_sha256"]
+        or authority["trainer_sha256"]
+        != _sha256_existing_file(Path(__file__).resolve(strict=True))
+    ):
+        raise SystemExit("canonical parent-update immutable file authority drift")
+
+    runtime_recipe = authority["runtime_recipe"]
+    topology = authority["training_topology"]
+    if (
+        not isinstance(runtime_recipe, dict)
+        or authority["runtime_recipe_sha256"]
+        != _canonical_json_sha256(runtime_recipe)
+        or not isinstance(topology, dict)
+        or topology.get("schema_version")
+        != "a1-one-dose-training-topology-v1"
+        or int(topology.get("world_size", 0)) != int(ddp["world_size"])
+        or int(topology.get("local_batch_size", 0)) != int(args.batch_size)
+        or int(topology.get("global_batch_size", 0))
+        != int(args.batch_size) * int(ddp["world_size"])
+        or runtime_recipe != _effective_a1_learner_training_recipe(args, ddp)
+    ):
+        raise SystemExit("canonical parent-update effective recipe/topology drift")
+    return copy.deepcopy(authority)
+
+
 def _require_production_composite_execution_authority(
     args: argparse.Namespace,
     composite_meta: Mapping[str, object] | None,
@@ -11296,20 +11525,23 @@ def _require_production_composite_execution_authority(
     central_raw = str(
         getattr(args, "a1_central_learner_binding_json", "") or ""
     )
-    if bool(scratch_raw) == bool(central_raw):
+    parent_update_raw = str(
+        getattr(args, "a1_canonical_parent_update_authority_json", "") or ""
+    )
+    if sum(map(bool, (scratch_raw, central_raw, parent_update_raw))) != 1:
         raise SystemExit(
             "promotion-eligible production composite requires exactly one sealed "
-            "scratch or central learner execution authority"
+            "scratch, central learner, or canonical parent-update execution authority"
         )
 
     init_checkpoint = str(getattr(args, "init_checkpoint", "") or "")
     grow_checkpoint = str(getattr(args, "grow_from_checkpoint", "") or "")
     warm_start = bool(init_checkpoint or grow_checkpoint)
     if warm_start:
-        if not central_raw:
+        if not (central_raw or parent_update_raw):
             raise SystemExit(
                 "promotion-eligible production composite warm-start requires the "
-                "central learner authority, not a scratch authority"
+                "central learner or canonical parent-update authority, not scratch"
             )
         if not init_checkpoint or grow_checkpoint:
             raise SystemExit(
@@ -11321,6 +11553,16 @@ def _require_production_composite_execution_authority(
             raise SystemExit(
                 "promotion-eligible production composite lacks its initializer contract"
             )
+        if parent_update_raw:
+            # The descriptor binds the V2 search producer.  The canonical
+            # authority separately proves the reviewed V2->V6 migration and
+            # therefore owns the runtime initializer check.
+            _validate_production_composite_parent_update_authority(
+                args,
+                _distributed_state(),
+                composite_meta,
+            )
+            return
         expected_path_raw = str(
             replay_contract.get("initializer_checkpoint_path", "") or ""
         )
@@ -11357,6 +11599,10 @@ def _require_production_composite_execution_authority(
             "production composite central learner authority requires an exact "
             "--init-checkpoint warm-start"
         )
+    if parent_update_raw:
+        raise SystemExit(
+            "canonical parent-update authority requires exact --init-checkpoint warm-start"
+        )
     _preflight_a1_scratch_execution_authority(
         scratch_raw,
         str(
@@ -11384,6 +11630,9 @@ def _validate_production_composite_execution_authority_before_payloads(
     central_raw = str(
         getattr(args, "a1_central_learner_binding_json", "") or ""
     )
+    parent_update_raw = str(
+        getattr(args, "a1_canonical_parent_update_authority_json", "") or ""
+    )
     if scratch_raw:
         binding = _validate_production_composite_scratch_binding(
             args,
@@ -11391,6 +11640,14 @@ def _validate_production_composite_execution_authority_before_payloads(
             composite_meta,
         )
         args.early_production_composite_scratch_binding = binding
+        return
+    if parent_update_raw:
+        binding = _validate_production_composite_parent_update_authority(
+            args,
+            ddp,
+            composite_meta,
+        )
+        args.early_production_composite_parent_update_binding = binding
         return
     if not central_raw:
         raise SystemExit(
@@ -14162,6 +14419,7 @@ def main(
     a1_training_binding: dict[str, object] | None = None
     central_composite_binding: dict[str, object] | None = None
     central_published_executor_authority: dict[str, object] | None = None
+    parent_update_composite_binding: dict[str, object] | None = None
     if is_memmap_composite:
         _bind_composite_validation_provenance(
             args,
@@ -14173,12 +14431,16 @@ def main(
         central_raw = str(
             getattr(args, "a1_central_learner_binding_json", "") or ""
         )
+        parent_update_raw = str(
+            getattr(args, "a1_canonical_parent_update_authority_json", "") or ""
+        )
         scratch_raw = str(
             getattr(args, "a1_scratch_authority_json", "") or ""
         )
-        if scratch_raw and central_raw:
+        if sum(map(bool, (scratch_raw, central_raw, parent_update_raw))) > 1:
             raise SystemExit(
-                "A1 scratch and central learner authorities are mutually exclusive"
+                "A1 scratch, central, and canonical parent-update authorities are "
+                "mutually exclusive"
             )
         if scratch_raw:
             a1_training_binding = getattr(
@@ -14230,10 +14492,34 @@ def main(
                 raise SystemExit(
                     "central learner sample authority differs from composite bytes"
                 )
+        elif parent_update_raw:
+            parent_update_composite_binding = getattr(
+                args,
+                "early_production_composite_parent_update_binding",
+                None,
+            )
+            if not isinstance(parent_update_composite_binding, dict):
+                raise SystemExit(
+                    "production composite canonical parent-update authority was not "
+                    "validated before payload loading"
+                )
+            if (
+                parent_update_composite_binding["descriptor_file_sha256"]
+                != a1_preflight_meta["descriptor_file_sha256"]
+                or parent_update_composite_binding["payload_inventory_sha256"]
+                != a1_preflight_meta["payload_inventory_sha256"]
+                or parent_update_composite_binding["source_authority"]
+                != a1_preflight_meta.get("source_authority_ref")
+                or parent_update_composite_binding["category_semantics_sha256"]
+                != a1_preflight_meta.get("category_semantics_sha256")
+            ):
+                raise SystemExit(
+                    "canonical parent-update authority differs from composite bytes"
+                )
         elif a1_preflight_meta.get("promotion_eligible") is True:
             raise SystemExit(
                 "promotion composite reached corpus execution without its "
-                "validated scratch or central authority"
+                "validated scratch, central, or canonical parent-update authority"
             )
     elif validation_seed_contract is not None:
         if coherent_corpus_binding_raw:
@@ -19932,6 +20218,9 @@ def main(
         "a1_central_published_executor_authority": (
             central_published_executor_authority
         ),
+        "a1_canonical_parent_update_authority": (
+            parent_update_composite_binding
+        ),
         "a1_realized_central_sample_order": central_realized_sample_evidence,
         "a1_aux_stage_binding": a1_aux_stage_binding,
         "a1_realized_aux_stage_sample_order": (
@@ -20590,6 +20879,25 @@ def main(
                 "eligible_for_full_gate": bool(
                     central_composite_binding["eligible_for_full_gate"]
                 ),
+            }
+        )
+    if parent_update_composite_binding is not None:
+        report.update(
+            {
+                "a1_effective_learner_training_recipe": (
+                    parent_update_composite_binding["runtime_recipe"]
+                ),
+                "a1_effective_learner_training_recipe_sha256": (
+                    parent_update_composite_binding["runtime_recipe_sha256"]
+                ),
+                "diagnostic_only": False,
+                "promotion_eligible": False,
+                "eligible_for_full_gate": bool(
+                    parent_update_composite_binding["eligible_for_full_gate"]
+                ),
+                "promotion_block_reason": parent_update_composite_binding[
+                    "promotion_block_reason"
+                ],
             }
         )
     if learner_ablation is not None:

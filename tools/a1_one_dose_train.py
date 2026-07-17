@@ -139,6 +139,9 @@ MIGRATION_RECEIPT_SCHEMA = "a1-information-migration-training-receipt-v1"
 MIGRATION_CLAIM_SCHEMA = "a1-information-migration-training-claim-v1"
 CENTRAL_RECEIPT_SCHEMA = "a1-central-learner-training-receipt-v1"
 CENTRAL_CLAIM_SCHEMA = "a1-central-learner-training-claim-v1"
+CANONICAL_PARENT_UPDATE_CHILD_AUTHORITY_SCHEMA = (
+    "a1-canonical-parent-update-child-authority-v1"
+)
 CLAIM_DIRECTORY = ".a1-one-dose-training-claims"
 MIN_NOFILE = 65_536
 MAX_IDLE_GPU_MEMORY_MIB = 64
@@ -1089,6 +1092,12 @@ def _input_binding(verified: dict[str, Any]) -> dict[str, Any]:
             payload["diagnostic_training_descriptor_authority"] = copy.deepcopy(
                 verified["diagnostic_training_descriptor_authority"]
             )
+        if isinstance(
+            verified.get("canonical_parent_update_child_authority"), dict
+        ):
+            payload["canonical_parent_update_child_authority"] = copy.deepcopy(
+                verified["canonical_parent_update_child_authority"]
+            )
     elif verified.get("data_kind") == "coherent_direct_memmap_v1":
         payload["coherent_corpus_admission"] = copy.deepcopy(
             verified["coherent_direct_corpus_binding"]["corpus_admission"]
@@ -1117,6 +1126,101 @@ def _input_binding(verified: dict[str, Any]) -> dict[str, Any]:
         payload["lock_verifier_authority"] = copy.deepcopy(lock_verifier_authority)
     payload["binding_sha256"] = _value_sha256(payload)
     return payload
+
+
+def _bind_canonical_parent_update_child_authority(
+    verified: dict[str, Any],
+    *,
+    runtime_recipe: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Bind the sealed one-dose wrapper to its production trainer child.
+
+    Production scratch and the historical P1/AUX/FINAL coordinator already
+    carried explicit child authorities.  The independently commissioned B12
+    parent update is neither: it warm-starts from the typed V2->V6 migration
+    and uses the production composite directly.  This projection lets
+    ``train_bc`` independently replay that exact route without pretending it
+    is an old central experiment or weakening the production-composite gate.
+    """
+
+    if verified.get("data_kind") != "production_composite_v2":
+        return verified
+    canonical = verified.get("canonical_parent_update")
+    migration = verified.get("information_contract_migration")
+    commissioning = verified.get("training_science_commissioning")
+    topology = verified.get("training_topology")
+    initializer = verified.get("architecture_initializer")
+    if not all(
+        isinstance(value, dict)
+        for value in (canonical, migration, commissioning, topology, initializer)
+    ):
+        return verified
+    if isinstance(verified.get("central_learner_binding"), dict):
+        raise ExecutorError(
+            "canonical parent update cannot also carry central learner authority"
+        )
+    if verified.get("learner_ablation") is not None:
+        raise ExecutorError(
+            "canonical parent update cannot hide inside a learner ablation"
+        )
+    authority: dict[str, Any] = {
+        "schema_version": CANONICAL_PARENT_UPDATE_CHILD_AUTHORITY_SCHEMA,
+        "contract_sha256": verified["contract_sha256"],
+        "claim_identity_sha256": verified["claim_identity_sha256"],
+        "data": str(verified["data_path"]),
+        "descriptor_file_sha256": verified["corpus_meta_file_sha256"],
+        "payload_inventory_sha256": verified["payload_inventory_sha256"],
+        "source_authority": copy.deepcopy(verified.get("source_authority_ref")),
+        "category_semantics": copy.deepcopy(verified.get("category_semantics")),
+        "category_semantics_sha256": verified.get("category_semantics_sha256"),
+        "composite_build_receipt": copy.deepcopy(
+            verified["composite_build_receipt"]
+        ),
+        "parent_checkpoint": {
+            "path": str(verified["producer"]["path"]),
+            "sha256": str(verified["producer"]["sha256"]),
+        },
+        "migrated_initializer": copy.deepcopy(initializer),
+        "information_contract_migration": {
+            "migration": migration["migration"],
+            "receipt": copy.deepcopy(migration["receipt"]),
+            "receipt_sha256": migration["receipt_sha256"],
+            "source": copy.deepcopy(migration["source"]),
+            "migrated_initializer": copy.deepcopy(
+                migration["migrated_initializer"]
+            ),
+            "forward_identical": migration["forward_identical"],
+            "promotion_eligible": migration["promotion_eligible"],
+        },
+        "canonical_parent_update": copy.deepcopy(canonical),
+        "runtime_recipe": copy.deepcopy(dict(runtime_recipe)),
+        "runtime_recipe_sha256": _value_sha256(dict(runtime_recipe)),
+        "training_topology": copy.deepcopy(topology),
+        "ddp_canary_semantic_identity_sha256": verified.get("ddp_canary", {}).get(
+            "semantic_identity_sha256"
+        ),
+        "trainer_authority_sha256": verified["trainer_authority"][
+            "authority_sha256"
+        ],
+        "trainer_sha256": verified["trainer_authority"]["sha256"],
+        "training_science_commissioning": copy.deepcopy(commissioning),
+        "event_history_training_contract_sha256": _value_sha256(
+            verified["event_history_training_contract"]
+        ),
+        "lock_verifier_authority_sha256": verified["lock_verifier_authority"][
+            "authority_sha256"
+        ],
+        "lock": str(verified["lock_path"]),
+        "lock_file_sha256": verified["lock_file_sha256"],
+        "diagnostic_only": False,
+        "promotion_eligible": False,
+        "eligible_for_full_gate": bool(verified["eligible_for_full_gate"]),
+        "promotion_block_reason": str(verified["promotion_block_reason"]),
+    }
+    authority["authority_sha256"] = _value_sha256(authority)
+    result = dict(verified)
+    result["canonical_parent_update_child_authority"] = authority
+    return result
 
 
 def _training_transaction_sha256(
@@ -6480,6 +6584,41 @@ def build_train_command(
         checkpoint=checkpoint,
         report=report,
     )
+    if (
+        verified.get("data_kind") == "production_composite_v2"
+        and isinstance(verified.get("canonical_parent_update"), dict)
+    ):
+        try:
+            parsed = train_bc.build_parser().parse_args(direct[2:])
+            runtime_recipe = train_bc._effective_a1_learner_training_recipe(  # noqa: SLF001
+                parsed,
+                {
+                    "enabled": world_size > 1,
+                    "world_size": world_size,
+                    "rank": 0,
+                    "local_rank": 0,
+                },
+            )
+        except SystemExit as error:
+            raise ExecutorError(
+                f"canonical parent-update child recipe projection refused: {error}"
+            ) from error
+        verified_with_child_authority = (
+            _bind_canonical_parent_update_child_authority(
+                verified,
+                runtime_recipe=runtime_recipe,
+            )
+        )
+        verified.clear()
+        verified.update(verified_with_child_authority)
+        direct.extend(
+            [
+                "--a1-canonical-parent-update-authority-json",
+                _canonical_bytes(
+                    verified["canonical_parent_update_child_authority"]
+                ).decode("ascii"),
+            ]
+        )
     command = _topologize_train_command(direct, world_size=world_size)
     _require_current_production_trainer_authority(verified, command=command)
     return command
