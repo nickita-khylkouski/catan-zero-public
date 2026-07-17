@@ -216,6 +216,12 @@ _REVIEWED_LEGACY_POLICY_SEMANTIC_TRANSLATIONS = {
         # are the exact macOS and H100/Linux guarded-source identities.
         "sha256:0810d0c33db3a5fc51c716a7c23b1bfe06c6b6f1c4a65beedcddb0f58fbb0a90",
         "sha256:de74d6d3e510a222fbf5a89de5f1555942e1e41d59c7e485354388673398cb05",
+        # Split EvalServer transport now carries a per-row ordered-history
+        # position offset, and exposes history to the scratch bottleneck
+        # decoder.  Neither route is reachable for the reviewed legacy
+        # Transformer: it has no offset field, no meaningful-history adapter,
+        # and a zero bottleneck. Its default forward remains unchanged.
+        "sha256:824eac305d761ca8fb627549892ada37be1dbea3266df46d3d18d1b0f21a73e9",
     }
 }
 
