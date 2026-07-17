@@ -241,6 +241,13 @@ class TrainConfig(PipelineConfig):
     public_card_count_features: bool | None = None
     public_card_count_feature_schema: str = "public_card_state_v2"
     public_card_count_residual_bias: bool | None = None
+    # V8's exact public two-player resource-composition residual is a distinct
+    # checkpoint-owned input path.  Keep it separate from the older card-count
+    # flag: otherwise a run can execute the V8 architecture while its typed
+    # recipe/hash claims only the V5 card-count surface.
+    # ``None`` inherits a checkpoint-backed topology; fresh canonical recipes
+    # bind an explicit value.
+    public_card_exact_resource_residual: bool | None = None
     # Structured action/value residuals are checkpoint-owned architecture.
     # Main resolves the inherit sentinel to concrete bools before hashing.
     static_action_residual: bool | None = None

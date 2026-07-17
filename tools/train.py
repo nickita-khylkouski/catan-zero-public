@@ -472,6 +472,14 @@ def _engine_namespace(
     for name, value in settings.items():
         action = actions.get(name)
         if action is None:
+            # The V8 exact-resource residual is checkpoint-owned architecture,
+            # deliberately not a public train.py knob.  Still materialize the
+            # typed recipe value on the internal namespace so train_bc can
+            # verify it against the initializer and record the effective
+            # topology in its immutable TrainConfig.
+            if name == "public_card_exact_resource_residual":
+                setattr(args, name, value)
+                continue
             # Derived identities (corpus/checkpoint hashes, effective holdout
             # hashes) are filled by the engine after authentication.
             if name in {
@@ -668,6 +676,7 @@ def _parent_initializer_binding(
     migration_kind = replayed.get("migration")
     expected_forward_identity = {
         migration.MIGRATION_CURRENT_V2_TO_V6_TOPOLOGY_SPLIT1: False,
+        migration.MIGRATION_CURRENT_V2_TO_V6_TOPOLOGY_SPLIT1_PUBLIC_RESOURCE_V8: False,
         migration.MIGRATION_V5_TO_V7_INPUT_COMPATIBILITY: True,
         migration.MIGRATION_V5_TO_V8_PUBLIC_RESOURCE_COMPATIBILITY: True,
     }.get(migration_kind)

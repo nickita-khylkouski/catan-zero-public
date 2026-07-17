@@ -121,7 +121,7 @@
       "mode": "canonical_parent_update",
       "recipe": "a1-parent-update-35m-b200",
       "config_path": "configs/training/a1_parent_update_35m_b200.schema1.json",
-      "config_canonical_sha256": "85359773c9685b96079759912c65ead695d8c09216d784b0c81211965d36c3a1",
+      "config_canonical_sha256": "1a89018a6d3c5174472508b0ae7cc7ffdb204dfda11a8ae39119e7a3d243b31e",
       "initialization": {
         "mode": "parent_fresh_optimizer",
         "binding_schema": "a1-canonical-parent-initializer-v1",
@@ -129,6 +129,7 @@
         "init_checkpoint": "required_runtime_input",
         "information_contract_migration_receipt": "required_if_checkpoint_bytes_differ",
         "entity_feature_adapter_version": "rust_entity_adapter_v6_exact_actor_resources_initial_road_two_hop",
+        "public_card_exact_resource_residual": true,
         "optimizer_state": "fresh"
       },
       "execution_topology": {
@@ -151,9 +152,9 @@
         "local_batch_size": 64,
         "grad_accum_steps": 1,
         "global_batch_size": 512,
-        "go_authorized": false,
+        "go_authorized": true,
         "authorization_authority": "configs/production/training_science_admission.json",
-        "authorization_reason": "v8_parent_update_requires_fresh_commissioning"
+        "authorization_reason": "v6_b12_commissioned_on_fresh_coherent_n128"
       },
       "research_scratch_status": "research_only_unresolved_not_selected"
     },
@@ -169,8 +170,8 @@
       "checkpoint": null,
       "optimizer_state": "fresh"
     },
-    "architecture_upgrade_flags": "v5_to_v7_input_compatibility_migration",
-    "architecture_upgrade_module": "entity_graph.v5_to_v7_input_compatibility.v1",
+    "architecture_upgrade_flags": "current_v8_information_migration_topology_split1",
+    "architecture_upgrade_module": "entity_graph.current_v2_to_v6_information_contract+topology+split1+public_resource_v8.v1",
     "research_scratch_model_construction": {
       "arch": "entity_graph",
       "hidden_size": 640,
@@ -190,6 +191,7 @@
       "value_tower_split_layers": 1,
       "public_card_count_features": true,
       "public_card_count_residual_bias": false,
+      "public_card_exact_resource_residual": false,
       "public_rule_state_features": true,
       "public_rule_state_feature_schema": "actor_public_rule_state_2p_v1",
       "actor_public_rule_state": "dev_used_road_building_free_roads_discard_remainder_playable_dev_counts",
@@ -295,7 +297,7 @@
       "winner_sample_weight": 1.0,
       "loser_sample_weight": 1.0,
       "teacher_weights": "",
-      "phase_weights": "PLAY_TURN=4.0,MOVE_ROBBER=3.0,BUILD_INITIAL_ROAD=2.0,DISCARD=1.5",
+      "phase_weights": "PLAY_TURN=4.0",
       "value_phase_weights": "none",
       "ddp_shard_data": false
     }

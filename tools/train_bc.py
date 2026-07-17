@@ -3689,6 +3689,23 @@ def _checkpoint_public_card_count_features(checkpoint_path: str) -> bool:
     return bool(getattr(config, "public_card_count_features", False))
 
 
+def _checkpoint_public_card_exact_resource_residual(checkpoint_path: str) -> bool:
+    """Read the V8 exact-public-resource path from checkpoint topology."""
+
+    import torch
+
+    from catan_zero.rl.config_serialization import config_attr_view
+
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    if not isinstance(checkpoint, dict) or "config" not in checkpoint:
+        raise SystemExit(
+            f"{checkpoint_path} is not a policy checkpoint with a config; cannot "
+            "resolve public_card_exact_resource_residual"
+        )
+    config = config_attr_view(checkpoint["config"])
+    return bool(getattr(config, "public_card_exact_resource_residual", False))
+
+
 def _checkpoint_public_card_count_residual_bias(checkpoint_path: str) -> bool:
     """Read the checkpoint-owned card-count residual topology."""
 
@@ -10545,6 +10562,9 @@ def _validate_a1_scratch_runtime_projection(
         != model["value_tower_split_layers"],
         "public_card_count_features": bool(args.public_card_count_features)
         != model["public_card_count_features"],
+        "public_card_exact_resource_residual": bool(
+            args.public_card_exact_resource_residual
+        ) != model["public_card_exact_resource_residual"],
         "public_card_count_residual_bias": bool(
             args.public_card_count_residual_bias
         )
@@ -11576,6 +11596,7 @@ def _require_explicit_production_checkpoint_architecture(
     checkpoint_owned = (
         "value_categorical_bins",
         "public_card_count_features",
+        "public_card_exact_resource_residual",
         "public_card_count_residual_bias",
         "public_rule_state_features",
         "action_target_gather",
@@ -13049,6 +13070,54 @@ def _resolve_effective_public_card_count_features(
     if grow_checkpoint:
         inherited = _checkpoint_public_card_count_features(grow_checkpoint)
         return inherited if requested is None else requested
+    return False if requested is None else requested
+
+
+def _resolve_effective_public_card_exact_resource_residual(
+    args: argparse.Namespace,
+) -> bool:
+    """Resolve V8 topology from the exact parent/checkpoint contract.
+
+    This is intentionally configuration-owned rather than a public tuning
+    switch.  The canonical wrapper supplies the typed field; direct
+    checkpoint-backed training inherits the recorded architecture.
+    """
+
+    requested_raw = getattr(args, "public_card_exact_resource_residual", None)
+    requested = None if requested_raw is None else bool(requested_raw)
+    if str(args.arch) != "entity_graph":
+        if requested:
+            raise SystemExit(
+                "public_card_exact_resource_residual is supported only for "
+                "--arch entity_graph"
+            )
+        return False
+    init_checkpoint = str(getattr(args, "init_checkpoint", "") or "")
+    grow_checkpoint = str(getattr(args, "grow_from_checkpoint", "") or "")
+    if init_checkpoint:
+        inherited = _checkpoint_public_card_exact_resource_residual(init_checkpoint)
+        if requested is not None and requested != inherited:
+            raise SystemExit(
+                "public_card_exact_resource_residual does not match "
+                "--init-checkpoint; use the reviewed V8 migration or inherit "
+                "the checkpoint-owned topology"
+            )
+        return inherited
+    if grow_checkpoint:
+        inherited = _checkpoint_public_card_exact_resource_residual(grow_checkpoint)
+        return inherited if requested is None else requested
+    if requested and not bool(getattr(args, "public_card_count_features", False)):
+        raise SystemExit(
+            "public_card_exact_resource_residual requires "
+            "public_card_count_features"
+        )
+    if requested and not bool(
+        getattr(args, "v6_compatibility_preserving_inputs", False)
+    ):
+        raise SystemExit(
+            "public_card_exact_resource_residual requires "
+            "v6_compatibility_preserving_inputs"
+        )
     return False if requested is None else requested
 
 
@@ -14594,6 +14663,9 @@ def main(
     args.v6_compatibility_preserving_inputs = (
         _resolve_effective_v6_compatibility_preserving_inputs(checkpoint_args)
     )
+    args.public_card_exact_resource_residual = (
+        _resolve_effective_public_card_exact_resource_residual(checkpoint_args)
+    )
     args.topology_residual_adapter = (
         _resolve_effective_topology_residual_adapter(checkpoint_args)
     )
@@ -14620,6 +14692,7 @@ def main(
         "action_cross_attention_layers",
         "action_cross_attention_bottleneck",
         "v6_compatibility_preserving_inputs",
+        "public_card_exact_resource_residual",
         "topology_residual_adapter",
         "static_action_residual",
         "legal_action_value_residual",
@@ -15485,6 +15558,9 @@ def main(
                         args.public_card_count_features
                     ),
                     **_public_card_count_create_kwargs(args),
+                    public_card_exact_resource_residual=bool(
+                        args.public_card_exact_resource_residual
+                    ),
                     public_rule_state_features=bool(
                         args.public_rule_state_features
                     ),

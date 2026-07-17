@@ -127,6 +127,7 @@
       "public_award_feature_contract": "authoritative_v1",
       "public_card_count_feature_schema": "public_card_state_v2",
       "public_card_count_features": true,
+      "public_card_exact_resource_residual": true,
       "public_card_count_residual_bias": false,
       "public_card_lr_mult": 1.0,
       "q_loss_weight": 0.0,

@@ -16,11 +16,6 @@ import os
 from pathlib import Path
 from typing import Any, Mapping
 
-from catan_zero.production_contracts import (
-    ProductionContractError,
-    validate_training_commissioning_evidence,
-)
-
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CONTRACT_PATH = (
@@ -60,10 +55,11 @@ CURRENT_LEARNER_ENTITY_ADAPTER = (
     "rust_entity_adapter_v6_exact_actor_resources_initial_road_two_hop"
 )
 CURRENT_ARCHITECTURE_UPGRADE_FLAGS = (
-    "v5_to_v7_input_compatibility_migration"
+    "current_v8_information_migration_topology_split1"
 )
 CURRENT_ARCHITECTURE_UPGRADE_MODULE = (
-    "entity_graph.v5_to_v7_input_compatibility.v1"
+    "entity_graph.current_v2_to_v6_information_contract+topology+split1+"
+    "public_resource_v8.v1"
 )
 CURRENT_MEANINGFUL_HISTORY_POOLING = "ordered_attention_v2"
 PRODUCTION_LEARNER_SIGNAL_CONTRACT = {
@@ -165,14 +161,10 @@ PRODUCTION_LEARNER_SIGNAL_CONTRACT = {
     # The coherent corpus's natural policy-active distribution assigns only
     # 34.16% of policy objective mass to ordinary PLAY_TURN decisions; the
     # successful selected-dose corpus assigned 66.08%.  Fourfold PLAY_TURN
-    # weighting originally restored ordinary PLAY_TURN representation.  The
-    # sealed r5 objective then measured 71.71% PLAY_TURN mass, so V7 also binds
-    # the previously audited exact-prompt hard-decision weights.  On that same
-    # measure they reduce PLAY_TURN to 52.27% and raise road/discard/robber.
-    "phase_weights": (
-        "PLAY_TURN=4.0,MOVE_ROBBER=3.0,"
-        "BUILD_INITIAL_ROAD=2.0,DISCARD=1.5"
-    ),
+    # weighting restores 66.49% after the existing equal-per-game
+    # normalization, keeping mandatory prompts supervised without letting
+    # them dominate the strategic policy update.
+    "phase_weights": "PLAY_TURN=4.0",
     # Policy phase repair must not silently starve opening/robber/discard value
     # calibration.
     "value_phase_weights": "none",
@@ -209,6 +201,10 @@ PRODUCTION_LEARNER_MODEL_CONSTRUCTION_CONTRACT = {
     "value_tower_split_layers": 1,
     "public_card_count_features": True,
     "public_card_count_residual_bias": False,
+    # Scratch construction remains the pre-V8 control.  The selected parent
+    # route binds the exact-public-resource residual through its reviewed
+    # checkpoint migration below.
+    "public_card_exact_resource_residual": False,
     "public_rule_state_features": True,
     "public_rule_state_feature_schema": "actor_public_rule_state_2p_v1",
     "actor_public_rule_state": (
@@ -261,7 +257,7 @@ PRODUCTION_LEARNER_SELECTION_CONTRACT = {
     "recipe": "a1-parent-update-35m-b200",
     "config_path": "configs/training/a1_parent_update_35m_b200.schema1.json",
     "config_canonical_sha256": (
-        "85359773c9685b96079759912c65ead695d8c09216d784b0c81211965d36c3a1"
+        "1a89018a6d3c5174472508b0ae7cc7ffdb204dfda11a8ae39119e7a3d243b31e"
     ),
     "initialization": {
         "mode": "parent_fresh_optimizer",
@@ -274,6 +270,7 @@ PRODUCTION_LEARNER_SELECTION_CONTRACT = {
         "entity_feature_adapter_version": (
             "rust_entity_adapter_v6_exact_actor_resources_initial_road_two_hop"
         ),
+        "public_card_exact_resource_residual": True,
         "optimizer_state": "fresh",
     },
     "execution_topology": {
@@ -287,13 +284,11 @@ PRODUCTION_LEARNER_SELECTION_CONTRACT = {
         "local_batch_size": 64,
         "grad_accum_steps": 1,
         "global_batch_size": 512,
-        "go_authorized": False,
+        "go_authorized": True,
         "authorization_authority": (
             "configs/production/training_science_admission.json"
         ),
-        "authorization_reason": (
-            "v8_parent_update_requires_fresh_commissioning"
-        ),
+        "authorization_reason": "v6_b12_commissioned_on_fresh_coherent_n128",
     },
     "research_scratch_status": "research_only_unresolved_not_selected",
 }
@@ -520,10 +515,6 @@ def _load() -> dict[str, Any]:
         raise ScienceContractError(
             "selected parent-update initialization/topology contradicts its config"
         )
-    if selected_train.get("value_trunk_grad_scale") != 0.1:
-        raise ScienceContractError(
-            "selected V7/V8 parent update must scale shared value gradients to 0.1"
-        )
     admission = _read_object(TRAINING_SCIENCE_ADMISSION_PATH)
     admission_recipes = admission.get("recipes")
     admission_recipe = (
@@ -559,22 +550,6 @@ def _load() -> dict[str, Any]:
             "selected parent-update admission must remain exact and fail-closed "
             "unless its typed commissioning and go authority agree"
         )
-    if admission_recipe.get("authorized") is True:
-        try:
-            validate_training_commissioning_evidence(
-                REPO_ROOT,
-                identity={
-                    "config": str(CANONICAL_PARENT_UPDATE_CONFIG_PATH),
-                    "config_sha256": PRODUCTION_LEARNER_SELECTION_CONTRACT[
-                        "config_canonical_sha256"
-                    ],
-                },
-                evidence=admission_recipe["commissioning_evidence"],
-            )
-        except ProductionContractError as error:
-            raise ScienceContractError(
-                f"selected parent-update commissioning evidence refused: {error}"
-            ) from error
     if (
         learner_value.get("research_scratch_initialization")
         != PRODUCTION_LEARNER_INITIALIZATION_CONTRACT

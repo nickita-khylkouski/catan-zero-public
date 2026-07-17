@@ -41,12 +41,16 @@ TOOLS_DIR = REPO_ROOT / "tools"
 ALL_CONFIGS = (TrainConfig, GenerateConfig, EvalConfig, GateConfig)
 
 
-def test_train_v7_migration_fields_remain_append_only() -> None:
-    assert [field.name for field in dataclasses.fields(TrainConfig)[-3:]] == [
+def test_train_checkpoint_owned_architecture_fields_remain_append_only() -> None:
+    names = [field.name for field in dataclasses.fields(TrainConfig)]
+    assert names[-3:] == [
         "action_cross_attention_layers",
         "action_cross_attention_bottleneck",
         "v6_compatibility_preserving_inputs",
     ]
+    assert names.index("public_card_exact_resource_residual") == (
+        names.index("public_card_count_residual_bias") + 1
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -143,10 +147,7 @@ def test_current_canonical_train_recipe_does_not_inherit_policy_phase_weights() 
     )
     config, engine = _load_recipe(recipe)
 
-    assert config.phase_weights == (
-        "PLAY_TURN=4.0,MOVE_ROBBER=3.0,"
-        "BUILD_INITIAL_ROAD=2.0,DISCARD=1.5"
-    )
+    assert config.phase_weights == "PLAY_TURN=4.0"
     assert config.value_phase_weights == "none"
     assert config.value_player_outcome_balance_mode == "none"
     assert engine["base_sampler"] == "coverage_importance_v1"
