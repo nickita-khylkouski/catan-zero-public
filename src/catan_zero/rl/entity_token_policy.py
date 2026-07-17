@@ -551,6 +551,101 @@ class EntityGraphNet:
                 query = query + self.ff(self.norm_ff(query))
                 return query
 
+        class _BottleneckCrossAttention(nn.Module):
+            """Small action-to-state attention used by the warm-start adapter.
+
+            A full width-640 Transformer decoder block costs 4.9M parameters,
+            which silently turns the contracted 42.5M parent learner into a
+            47.5M model.  The action adapter only needs a relational join, not
+            another full state-processing tower.  Projecting queries, keys and
+            values through an 80-wide multi-head bottleneck retains that join
+            while keeping the complete model inside its existing size budget.
+            """
+
+            def __init__(self, width: int, heads: int, bottleneck: int) -> None:
+                super().__init__()
+                if bottleneck <= 0 or bottleneck % max(1, int(heads)):
+                    raise ValueError(
+                        "action cross-attention bottleneck must be positive and "
+                        f"divisible by heads: bottleneck={bottleneck} heads={heads}"
+                    )
+                self.heads = max(1, int(heads))
+                self.head_width = int(bottleneck) // self.heads
+                self.q_proj = nn.Linear(width, bottleneck)
+                self.k_proj = nn.Linear(width, bottleneck)
+                self.v_proj = nn.Linear(width, bottleneck)
+                self.out_proj = nn.Linear(bottleneck, width)
+
+            def forward(self, query, key, value, key_padding_mask=None):
+                batch, queries, _ = query.shape
+
+                def _split(projected):
+                    return projected.view(
+                        batch, -1, self.heads, self.head_width
+                    ).transpose(1, 2)
+
+                q = _split(self.q_proj(query))
+                k = _split(self.k_proj(key))
+                v = _split(self.v_proj(value))
+                scores = torch.matmul(q, k.transpose(-2, -1)) * (
+                    self.head_width**-0.5
+                )
+                if key_padding_mask is not None:
+                    mask = key_padding_mask[:, None, None, :].to(dtype=torch.bool)
+                    scores = scores.masked_fill(mask, torch.finfo(scores.dtype).min)
+                weights = torch.softmax(scores, dim=-1)
+                attended = torch.matmul(weights, v).transpose(1, 2).reshape(
+                    batch, queries, self.heads * self.head_width
+                )
+                return self.out_proj(attended), None
+
+        class _BottleneckCrossBlock(nn.Module):
+            """Parameter-efficient warm-start action decoder.
+
+            Its public surface intentionally matches ``_CrossBlock`` so the
+            training commissioner can open the two zero-output terminal
+            projections without special-casing the forward path.
+            """
+
+            def __init__(
+                self,
+                width: int,
+                heads: int,
+                dropout: float,
+                *,
+                identity_init: bool = True,
+            ) -> None:
+                super().__init__()
+                bottleneck = max(int(heads), (width // 8 // int(heads)) * int(heads))
+                self.norm_q = nn.LayerNorm(width)
+                self.norm_kv = nn.LayerNorm(width)
+                self.attn = _BottleneckCrossAttention(width, heads, bottleneck)
+                self.norm_ff = nn.LayerNorm(width)
+                self.ff = nn.Sequential(
+                    nn.Linear(width, bottleneck),
+                    nn.GELU(),
+                    nn.Dropout(float(dropout)),
+                    nn.Linear(bottleneck, width),
+                    nn.Dropout(float(dropout)),
+                )
+                if identity_init:
+                    nn.init.zeros_(self.attn.out_proj.weight)
+                    nn.init.zeros_(self.attn.out_proj.bias)
+                    nn.init.zeros_(self.ff[3].weight)
+                    nn.init.zeros_(self.ff[3].bias)
+
+            def forward(self, query, memory, key_padding_mask=None):
+                normalized_memory = self.norm_kv(memory)
+                attn_out, _ = self.attn(
+                    self.norm_q(query),
+                    normalized_memory,
+                    normalized_memory,
+                    key_padding_mask=key_padding_mask,
+                )
+                query = query + attn_out
+                query = query + self.ff(self.norm_ff(query))
+                return query
+
         class _Module(nn.Module):
             def __init__(self, cfg: EntityGraphConfig) -> None:
                 super().__init__()
@@ -1074,8 +1169,13 @@ class EntityGraphNet:
                     cross_dropout = (
                         dropout if self.uses_relational_topology else 0.0
                     )
+                    cross_block_type = (
+                        _CrossBlock
+                        if self.uses_relational_topology
+                        else _BottleneckCrossBlock
+                    )
                     self.action_cross_blocks = nn.ModuleList(
-                        _CrossBlock(
+                        cross_block_type(
                             h,
                             cfg.attention_heads,
                             cross_dropout,

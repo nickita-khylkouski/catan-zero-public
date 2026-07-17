@@ -21323,33 +21323,30 @@ def _initialize_cold_start_action_cross_attention_path(
     with torch.no_grad():
         for block in blocks:
             out_weight = block.attn.out_proj.weight
-            width = int(out_weight.shape[0])
-            if tuple(out_weight.shape) != (width, width):
+            width, inner_width = (int(v) for v in out_weight.shape)
+            if width <= 0 or inner_width <= 0:
                 raise RuntimeError(
-                    "unexpected action cross-attention output projection shape "
+                    "invalid action cross-attention output projection shape "
                     f"{tuple(out_weight.shape)}"
                 )
-            out_weight.copy_(
-                torch.eye(width, dtype=out_weight.dtype, device=out_weight.device)
-                * scale
-            )
+            out_weight.zero_()
+            diagonal_width = min(width, inner_width)
+            diagonal_ids = torch.arange(diagonal_width, device=out_weight.device)
+            out_weight[diagonal_ids, diagonal_ids] = scale
             if block.attn.out_proj.bias is not None:
                 block.attn.out_proj.bias.zero_()
 
             ff_weight = block.ff[3].weight
-            if tuple(ff_weight.shape) != (width, 4 * width):
+            if int(ff_weight.shape[0]) != width:
                 raise RuntimeError(
                     "unexpected action cross-attention FF terminal shape "
                     f"{tuple(ff_weight.shape)}"
                 )
             ff_weight.zero_()
-            identity = torch.eye(
-                width, dtype=ff_weight.dtype, device=ff_weight.device
-            )
-            for group in range(4):
-                ff_weight[:, group * width : (group + 1) * width].copy_(
-                    identity * (scale / 4.0)
-                )
+            ff_inner_width = int(ff_weight.shape[1])
+            diagonal_width = min(width, ff_inner_width)
+            diagonal_ids = torch.arange(diagonal_width, device=ff_weight.device)
+            ff_weight[diagonal_ids, diagonal_ids] = scale
             block.ff[3].bias.zero_()
     return {
         "enabled": True,

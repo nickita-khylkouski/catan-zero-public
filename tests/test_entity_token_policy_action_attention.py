@@ -272,10 +272,26 @@ def test_action_cross_cold_commissioning_opens_inner_gradients_first_backward():
     outputs = model(_to_torch(_real_entity_batch(n_states=2)))
     outputs["logits"].square().mean().backward()
 
-    assert block.attn.in_proj_weight.grad is not None
-    assert float(block.attn.in_proj_weight.grad.abs().sum()) > 0.0
+    for projection in (block.attn.q_proj, block.attn.k_proj, block.attn.v_proj):
+        assert projection.weight.grad is not None
+        assert float(projection.weight.grad.abs().sum()) > 0.0
     assert block.ff[0].weight.grad is not None
     assert float(block.ff[0].weight.grad.abs().sum()) > 0.0
+
+
+def test_transformer_action_cross_is_a_budgeted_adapter_not_a_second_tower():
+    from catan_zero.rl.entity_token_policy import EntityGraphNet
+
+    config = dataclasses.replace(_base_config(), action_cross_attention_layers=1)
+    model = EntityGraphNet(config)
+    cross_parameters = sum(
+        parameter.numel() for parameter in model.action_cross_blocks.parameters()
+    )
+
+    # One full Transformer decoder block is roughly 12*h^2 parameters.  The
+    # action-local join is deliberately a <=h^2 adapter so production V7 stays
+    # inside the inherited 42.5-43M learner contract.
+    assert cross_parameters <= config.hidden_size**2
 
 
 def test_action_cross_cold_commissioning_preserves_moved_checkpoint():
