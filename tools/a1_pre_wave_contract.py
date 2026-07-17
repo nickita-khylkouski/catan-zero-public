@@ -5511,6 +5511,11 @@ def _validate_recovery_s1_operator_binding(
     legacy_search["c_scale"] = operator_binding.RECOVERY_S1_OVERRIDE[
         "legacy_value"
     ]
+    # Replay the legacy source against its own calibrated sigma. The outer
+    # recovery bridge above is where the explicit 0.98 -> 0.79 migration is
+    # admitted; projecting today's sigma into the historical S1 would make the
+    # immutable source fail its own honest replay.
+    legacy_search["sigma_eval"] = selected["sigma_eval"]
     legacy_semantic = _validate_search_stage_evidence(
         _load_json(legacy_path),
         path=legacy_path,
