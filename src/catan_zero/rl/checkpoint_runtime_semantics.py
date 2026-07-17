@@ -158,6 +158,9 @@ _REVIEWED_LEGACY_POLICY_SEMANTIC_TRANSLATIONS = {
         # likewise gated to V7 checkpoints. Legacy topology-disabled models
         # still execute the same reviewed forward function.
         "sha256:911589137df1296d927feba059eaebb78704d8d5d41ffbf1dabb6e52016a9df9",
+        # Public-history exposure to the V7 action decoder is also gated off
+        # for legacy checkpoints, leaving their reviewed forward unchanged.
+        "sha256:166693b514e1feb5e73a3c7a23c1a5e0bc39c97884d959a29e9b1b7afb8935e9",
         # Rebasing the V7 decoder onto the final bit-exact input migration
         # changed the selected policy AST fingerprint once more. Every added
         # path remains behind the absent/false V7 compatibility flags for a
