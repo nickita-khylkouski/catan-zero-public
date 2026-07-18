@@ -10,6 +10,7 @@ import numpy as np
 import pytest
 
 from catan_zero.rl.production_recipe_catalog import production_recipes
+from catan_zero.rl.pipeline_configs import CONFIG_SCHEMA_VERSION
 from tools import train, train_bc
 
 
@@ -753,7 +754,7 @@ def test_parent_update_recipe_reproduces_split1_selected_step12() -> None:
     assert fields["init_checkpoint"] == ""
     assert fields["grow_from_checkpoint"] == ""
     assert engine["value_tower_split_layers"] == 1
-    assert payload["train_config"]["schema_version"] == 21
+    assert payload["train_config"]["schema_version"] == CONFIG_SCHEMA_VERSION
 
 
 def test_parent_update_requires_exact_parent_and_uses_corpus_target_identity() -> None:
