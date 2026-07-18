@@ -323,31 +323,69 @@ def test_stage_c_alignment_defaults_fund_game_first_breadth() -> None:
         ]
     )
 
-    assert args.subset_rows == 65_536
+    assert args.subset_rows is None
     assert args.max_rows_per_game == 16
 
 
-def test_production_plan_rejects_diagnostic_root_budget_before_loading_inputs() -> None:
-    args = alignment.build_parser().parse_args(
-        [
-            "plan",
-            "--coherent-corpus-admission",
-            "missing-admission.json",
-            "--target-operator-contract",
-            "missing-operator.json",
-            "--target-checkpoint",
-            "missing-checkpoint.pt",
-            "--output-root",
-            "output",
-            "--subset-rows",
-            "184",
-            "--write",
-            "plan.json",
-        ]
-    )
+def test_legacy_stage_c_root_budget_remains_exactly_65536() -> None:
+    population = np.arange(100, 200, dtype=np.int64)
+    validation = population[:5]
 
+    assert (
+        alignment._resolve_stage_c_root_budget(  # noqa: SLF001
+            requested_rows=None,
+            admission_schema=alignment.LEGACY_CORPUS_ADMISSION_SCHEMA,
+            population_game_seeds=population,
+            validation_game_seeds=validation,
+        )
+        == 65_536
+    )
     with pytest.raises(
         alignment.AlignmentError,
         match="require exactly 65,536 requested roots",
     ):
-        alignment._build_plan(args)  # noqa: SLF001
+        alignment._resolve_stage_c_root_budget(  # noqa: SLF001
+            requested_rows=91_208,
+            admission_schema=alignment.LEGACY_CORPUS_ADMISSION_SCHEMA,
+            population_game_seeds=population,
+            validation_game_seeds=validation,
+        )
+
+
+def test_post_wave_stage_c_root_budget_tracks_admitted_breadth() -> None:
+    population = np.arange(12_000, dtype=np.int64)
+    validation = population[:601]
+
+    minimum = alignment._minimum_stage_c_root_budget(  # noqa: SLF001
+        population_game_seeds=population,
+        validation_game_seeds=validation,
+    )
+    assert minimum == 91_208
+    assert (
+        alignment._resolve_stage_c_root_budget(  # noqa: SLF001
+            requested_rows=None,
+            admission_schema=alignment.POST_WAVE_CORPUS_ADMISSION_SCHEMA,
+            population_game_seeds=population,
+            validation_game_seeds=validation,
+        )
+        == 91_208
+    )
+    assert (
+        alignment._resolve_stage_c_root_budget(  # noqa: SLF001
+            requested_rows=100_000,
+            admission_schema=alignment.POST_WAVE_CORPUS_ADMISSION_SCHEMA,
+            population_game_seeds=population,
+            validation_game_seeds=validation,
+        )
+        == 100_000
+    )
+    with pytest.raises(
+        alignment.AlignmentError,
+        match="requested=91,207 required_at_least=91,208",
+    ):
+        alignment._resolve_stage_c_root_budget(  # noqa: SLF001
+            requested_rows=91_207,
+            admission_schema=alignment.POST_WAVE_CORPUS_ADMISSION_SCHEMA,
+            population_game_seeds=population,
+            validation_game_seeds=validation,
+        )

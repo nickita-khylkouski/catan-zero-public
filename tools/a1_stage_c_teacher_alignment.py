@@ -110,6 +110,8 @@ RELIABILITY_CLASS = {
 }
 ROOT_BREADTH_SCHEMA = "a1-stage-c-policy-root-breadth-v1"
 PRODUCTION_ROOT_COUNT = 65_536
+LEGACY_CORPUS_ADMISSION_SCHEMA = "a1-coherent-n128-corpus-admission-v1"
+POST_WAVE_CORPUS_ADMISSION_SCHEMA = "a1-post-wave-stage-c-corpus-admission-v1"
 LEARNER_VALIDATION_SCOPE_SCHEMA = "a1-stage-c-learner-validation-scope-v2"
 TRAINER_EXCLUSION_CONTRACT_SCHEMA = "a1-stage-c-trainer-exclusion-contract-v1"
 ROOT_BREADTH_REQUIRED_PHASES = (
@@ -144,6 +146,69 @@ ROOT_BREADTH_CONTRACT = {
     ],
     "required_scopes": ["training", "validation"],
 }
+
+
+def _minimum_stage_c_root_budget(
+    *,
+    population_game_seeds: np.ndarray,
+    validation_game_seeds: np.ndarray,
+) -> int:
+    """Return the deterministic breadth floor for this admitted game population."""
+    population = np.unique(np.asarray(population_game_seeds, dtype=np.int64))
+    validation = np.unique(np.asarray(validation_game_seeds, dtype=np.int64))
+    if not len(population) or not len(validation):
+        raise AlignmentError(
+            "Stage-C training and validation populations must be nonempty"
+        )
+    if np.setdiff1d(validation, population).size:
+        raise AlignmentError("Stage-C validation game is outside the corpus")
+    training = np.setdiff1d(population, validation)
+    if not len(training):
+        raise AlignmentError("Stage-C training game population is empty")
+    minimum_fraction = float(ROOT_BREADTH_CONTRACT["minimum_unique_game_fraction"])
+    minimum_roots = int(ROOT_BREADTH_CONTRACT["minimum_roots_per_represented_game"])
+    required_games = math.ceil(minimum_fraction * len(training)) + math.ceil(
+        minimum_fraction * len(validation)
+    )
+    return minimum_roots * required_games
+
+
+def _resolve_stage_c_root_budget(
+    *,
+    requested_rows: int | None,
+    admission_schema: str,
+    population_game_seeds: np.ndarray,
+    validation_game_seeds: np.ndarray,
+) -> int:
+    """Resolve the exact root count without changing the legacy production contract."""
+    if admission_schema == LEGACY_CORPUS_ADMISSION_SCHEMA:
+        resolved = (
+            PRODUCTION_ROOT_COUNT
+            if requested_rows is None
+            else int(requested_rows)
+        )
+        if resolved != PRODUCTION_ROOT_COUNT:
+            raise AlignmentError(
+                "legacy production Stage-C plans require exactly "
+                f"{PRODUCTION_ROOT_COUNT:,} requested roots"
+            )
+        return resolved
+    if admission_schema != POST_WAVE_CORPUS_ADMISSION_SCHEMA:
+        raise AlignmentError(
+            f"unsupported coherent corpus admission schema {admission_schema!r}"
+        )
+
+    minimum = _minimum_stage_c_root_budget(
+        population_game_seeds=population_game_seeds,
+        validation_game_seeds=validation_game_seeds,
+    )
+    resolved = minimum if requested_rows is None else int(requested_rows)
+    if resolved < minimum:
+        raise AlignmentError(
+            "post-wave production Stage-C root budget cannot satisfy admitted "
+            f"breadth: requested={resolved:,} required_at_least={minimum:,}"
+        )
+    return resolved
 SEARCH_FIELDS = (
     "n_full",
     "n_fast",
@@ -1554,10 +1619,9 @@ def _build_plan(args: argparse.Namespace) -> dict[str, Any]:
     from tools import a1_b200_active_policy_campaign as active_campaign
     from tools import a1_post_wave_stage_c_admission as post_wave_admission
 
-    if int(args.subset_rows) != PRODUCTION_ROOT_COUNT:
+    if args.subset_rows is not None and int(args.subset_rows) <= 0:
         raise AlignmentError(
-            "production Stage-C plans require exactly "
-            f"{PRODUCTION_ROOT_COUNT:,} requested roots"
+            "production Stage-C requested root count must be positive"
         )
 
     try:
@@ -1565,9 +1629,8 @@ def _build_plan(args: argparse.Namespace) -> dict[str, Any]:
             args.coherent_corpus_admission,
             where="coherent corpus admission",
         )
-        if candidate.get("schema_version") == (
-            "a1-post-wave-stage-c-corpus-admission-v1"
-        ):
+        admission_schema = str(candidate.get("schema_version", ""))
+        if admission_schema == POST_WAVE_CORPUS_ADMISSION_SCHEMA:
             admission_path, admission = post_wave_admission.verify_admission(
                 _candidate_path
             )
@@ -1628,6 +1691,13 @@ def _build_plan(args: argparse.Namespace) -> dict[str, Any]:
 
     data = train_bc.MemmapCorpus(corpus_root)
     rows = len(data)
+    population_game_seeds = np.asarray(data["game_seed"], dtype=np.int64)
+    requested_root_count = _resolve_stage_c_root_budget(
+        requested_rows=args.subset_rows,
+        admission_schema=admission_schema,
+        population_game_seeds=population_game_seeds,
+        validation_game_seeds=validation_game_seeds,
+    )
     policy_weight = np.asarray(data["policy_weight_multiplier"], dtype=np.float32)
     policy_active = policy_weight > 0.0
     legal_widths_all = np.asarray(data["legal_action_ids"].row_counts(), dtype=np.int64)
@@ -1674,17 +1744,17 @@ def _build_plan(args: argparse.Namespace) -> dict[str, Any]:
         surprise=surprise,
         reliability_class=candidate_reliability,
         policy_status=candidate_status,
-        population_game_seeds=np.asarray(data["game_seed"], dtype=np.int64),
+        population_game_seeds=population_game_seeds,
         validation_game_seeds=validation_game_seeds,
-        limit=int(args.subset_rows),
+        limit=requested_root_count,
         selection_seed=int(args.selection_seed),
         max_rows_per_game=int(args.max_rows_per_game),
     )
     selected_rows = candidate_rows[selected_positions]
-    if len(selected_rows) != PRODUCTION_ROOT_COUNT:
+    if len(selected_rows) != requested_root_count:
         raise AlignmentError(
             "production Stage-C selection did not realize exactly "
-            f"{PRODUCTION_ROOT_COUNT:,} roots: realized={len(selected_rows)}"
+            f"{requested_root_count:,} roots: realized={len(selected_rows)}"
         )
     chunks = int(args.chunks)
     if chunks <= 0:
@@ -1866,7 +1936,7 @@ def _build_plan(args: argparse.Namespace) -> dict[str, Any]:
             "artifact": _artifact_ref(subset_path),
             "selected_rows": len(selected_rows),
             "candidate_rows": len(candidate_rows),
-            "requested_rows": int(args.subset_rows),
+            "requested_rows": requested_root_count,
             "selection_seed": int(args.selection_seed),
             "max_rows_per_game": int(args.max_rows_per_game),
             "game_first_selection": game_first_selection,
@@ -1964,6 +2034,26 @@ def _verify_plan(path: Path) -> dict[str, Any]:
         or validation_scope.get("external_final_gate_authority") is not False
     ):
         raise AlignmentError("Stage-C learner validation scope drifted")
+    admission_ref = plan.get("source_corpus_admission")
+    if not isinstance(admission_ref, Mapping):
+        raise AlignmentError("Stage-C plan lacks source corpus admission")
+    admission_path, source_admission = _load_json(
+        Path(str(admission_ref["path"])), where="Stage-C source corpus admission"
+    )
+    admission_unsigned = dict(source_admission)
+    admission_stated = admission_unsigned.pop("admission_sha256", None)
+    admission_schema = str(source_admission.get("schema_version", ""))
+    if (
+        admission_schema
+        not in {
+            LEGACY_CORPUS_ADMISSION_SCHEMA,
+            POST_WAVE_CORPUS_ADMISSION_SCHEMA,
+        }
+        or admission_ref.get("file_sha256") != _file_sha256(admission_path)
+        or admission_ref.get("admission_sha256") != admission_stated
+        or admission_stated != _value_sha256(admission_unsigned)
+    ):
+        raise AlignmentError("Stage-C source corpus admission drifted")
     for identity_key in (
         "source_policy_target_identity",
         "target_policy_target_identity",
@@ -2030,6 +2120,7 @@ def _verify_plan(path: Path) -> dict[str, Any]:
         raise AlignmentError("Stage-C selected subset bytes drifted")
     with np.load(subset_path, allow_pickle=False) as arrays:
         count = len(arrays["row_index"])
+        requested_rows = int(plan["subset"].get("requested_rows", -1))
         selection = plan["subset"].get("game_first_selection")
         if not isinstance(selection, Mapping):
             raise AlignmentError("Stage-C game-first selection receipt is missing")
@@ -2037,9 +2128,7 @@ def _verify_plan(path: Path) -> dict[str, Any]:
         selection_stated = selection_unsigned.pop("selection_sha256", None)
         if (
             count != int(plan["subset"]["selected_rows"])
-            or count != PRODUCTION_ROOT_COUNT
-            or int(plan["subset"].get("requested_rows", -1))
-            != PRODUCTION_ROOT_COUNT
+            or count != requested_rows
             or any(len(arrays[name]) != count for name in arrays.files)
             or np.unique(arrays["identity_sha256"]).size != count
             or selection.get("schema_version")
@@ -2074,8 +2163,31 @@ def _verify_plan(path: Path) -> dict[str, Any]:
         source_data = train_bc.MemmapCorpus(
             Path(str(overlay["corpus"]["path"])).resolve(strict=True)
         )
+        population_game_seeds = np.asarray(
+            source_data["game_seed"], dtype=np.int64
+        )
+        resolved_root_count = _resolve_stage_c_root_budget(
+            requested_rows=requested_rows,
+            admission_schema=admission_schema,
+            population_game_seeds=population_game_seeds,
+            validation_game_seeds=np.asarray(
+                validation["game_seeds"], dtype=np.int64
+            ),
+        )
+        minimum_root_count = _minimum_stage_c_root_budget(
+            population_game_seeds=population_game_seeds,
+            validation_game_seeds=np.asarray(
+                validation["game_seeds"], dtype=np.int64
+            ),
+        )
+        if (
+            resolved_root_count != count
+            or int(selection.get("minimum_breadth_root_count", -1))
+            != minimum_root_count
+        ):
+            raise AlignmentError("Stage-C selected subset root budget drifted")
         replayed_breadth = _stage_c_root_breadth_inventory(
-            corpus_game_seeds=np.asarray(source_data["game_seed"], dtype=np.int64),
+            corpus_game_seeds=population_game_seeds,
             validation_game_seeds=np.asarray(validation["game_seeds"], dtype=np.int64),
             selected_game_seeds=np.asarray(arrays["game_seed"], dtype=np.int64),
             selected_decision_indices=np.asarray(
@@ -2095,7 +2207,15 @@ def build_parser() -> argparse.ArgumentParser:
     plan.add_argument("--coherent-corpus-admission", required=True, type=Path)
     plan.add_argument("--target-operator-contract", required=True, type=Path)
     plan.add_argument("--target-checkpoint", required=True, type=Path)
-    plan.add_argument("--subset-rows", type=int, default=65_536)
+    plan.add_argument(
+        "--subset-rows",
+        type=int,
+        default=None,
+        help=(
+            "exact root count; defaults to 65,536 for the legacy admission and "
+            "to the deterministic breadth minimum for a post-wave admission"
+        ),
+    )
     plan.add_argument("--selection-seed", type=int, default=20260715)
     plan.add_argument("--max-rows-per-game", type=int, default=16)
     plan.add_argument("--chunks", type=int, default=64)
