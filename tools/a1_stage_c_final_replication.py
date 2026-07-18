@@ -1431,6 +1431,7 @@ def build_final_corpus_admission(
         <= patch_columns
         or learner_projection.get("root_value_patch_consumed") is not True
         or learner_projection.get("target_reliability_patch_consumed") is not True
+        or learner_projection.get("completed_q_patch_consumed") is not True
         or learner_projection.get("completed_q_evidence_sidecar_preserved") is not True
         or merge.get("reliability", {}).get("schema_version")
         != reanalysis.TARGET_RELIABILITY_SCHEMA
@@ -1484,10 +1485,17 @@ def build_final_corpus_admission(
             "target_reliability_columns_materialized": sorted(
                 reanalysis.TARGET_RELIABILITY_COLUMNS
             ),
-            "completed_q_columns_preserved_in_immutable_patch_sidecar": [
+            "completed_q_columns_materialized_legal_aligned": [
+                "completed_q_mask",
+                "completed_q_values",
+            ],
+            "completed_q_source_columns_preserved_in_immutable_patch_sidecar": [
                 "completed_q_mask_flat",
                 "completed_q_values_flat",
             ],
+            "completed_q_binding": copy.deepcopy(
+                receipt["completed_q_binding"]
+            ),
             "reliability": copy.deepcopy(merge["reliability"]),
             "naive_root_blend_authorized": False,
             "terminal_target_remains_authoritative": True,

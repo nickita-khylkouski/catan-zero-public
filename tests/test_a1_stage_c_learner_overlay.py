@@ -13,6 +13,62 @@ def _write(path: Path, values: np.ndarray) -> None:
     values.tofile(path)
 
 
+def _completed_q_binding_fixture() -> tuple[dict, dict[str, np.ndarray], str]:
+    target_identity = "sha256:" + "a" * 64
+    arrays = {
+        "row_index": np.asarray([7], dtype=np.int64),
+        "game_seed": np.asarray([70], dtype=np.int64),
+        "decision_index": np.asarray([3], dtype=np.int64),
+        "identity_sha256": np.asarray(["sha256:" + "b" * 64]),
+        "legal_action_offsets": np.asarray([0, 2], dtype=np.int64),
+        "legal_action_ids_flat": np.asarray([10, 20], dtype=np.int64),
+        "completed_q_values_flat": np.asarray([0.25, -0.10], dtype=np.float32),
+        "completed_q_mask_flat": np.asarray([True, True]),
+        "target_policy_target_identity_sha256": np.asarray([target_identity]),
+        "target_reliability_version": np.asarray(
+            [overlay.TARGET_RELIABILITY_VERSION], dtype=np.uint8
+        ),
+        "target_reliability_audited": np.asarray([False]),
+        "target_reliability_js_divergence": np.asarray(
+            [np.nan], dtype=np.float32
+        ),
+        "target_reliability_policy_top1_agreement": np.asarray([False]),
+        "target_reliability_q_top1_agreement": np.asarray([False]),
+        "target_reliability_q_margin_primary": np.asarray(
+            [np.nan], dtype=np.float32
+        ),
+        "target_reliability_q_margin_duplicate": np.asarray(
+            [np.nan], dtype=np.float32
+        ),
+        "target_reliability_confidence": np.asarray([1.0], dtype=np.float32),
+    }
+    merge = {
+        "patch_schema_version": overlay.stage_c.PATCH_SCHEMA,
+        "target_policy_target_identity_sha256": target_identity,
+        "target_operator_contract": {
+            "path": "/sealed/operator.json",
+            "file_sha256": "sha256:" + "c" * 64,
+        },
+        "reliability": {
+            "schema_version": overlay.TARGET_RELIABILITY_SCHEMA,
+            "audited_rows": 0,
+            "unaudited_rows": 1,
+            "duplicate_selected_action_applied": False,
+        },
+    }
+    row_identity = overlay._value_sha256(  # noqa: SLF001
+        [
+            {
+                "row_index": 7,
+                "game_seed": 70,
+                "decision_index": 3,
+                "identity_sha256": "sha256:" + "b" * 64,
+            }
+        ]
+    )
+    return merge, arrays, row_identity
+
+
 def _broad_root_inventory(
     *,
     omitted_games: set[int] | None = None,
@@ -211,6 +267,10 @@ def test_policy_projection_disables_old_targets_and_maps_action_ids(
         "prior_policy_flat": np.asarray([0.5, 0.2, 0.3], dtype=np.float32),
         "target_scores_flat": np.asarray([3.0, 1.0, 2.0], dtype=np.float32),
         "target_scores_mask_flat": np.asarray([True, True, True]),
+        # Completed-Q covers every action and remains distinct from sparse/raw
+        # visited-Q target_scores.
+        "completed_q_values_flat": np.asarray([0.3, -0.1, 0.2], dtype=np.float32),
+        "completed_q_mask_flat": np.asarray([True, True, True]),
         "root_value": np.asarray([0.75], dtype=np.float32),
         "root_value_mask": np.asarray([True]),
         "root_prior_value": np.asarray([0.25], dtype=np.float32),
@@ -234,6 +294,12 @@ def test_policy_projection_disables_old_targets_and_maps_action_ids(
     target_mask = np.fromfile(derived / "target_policy_mask.dat", dtype=np.bool_)
     priors = np.fromfile(derived / "prior_policy.dat", dtype=np.float32)
     scores = np.fromfile(derived / "target_scores.dat", dtype=np.float32)
+    completed_q = np.fromfile(
+        derived / f"{overlay.COMPLETED_Q_VALUE_COLUMN}.dat", dtype=np.float32
+    )
+    completed_q_mask = np.fromfile(
+        derived / f"{overlay.COMPLETED_Q_MASK_COLUMN}.dat", dtype=np.bool_
+    )
     teacher_codes = np.fromfile(derived / "teacher_name.codes.dat", dtype=np.int32)
     root_values = np.fromfile(derived / "root_value.dat", dtype=np.float32)
     root_priors = np.fromfile(derived / "root_prior_value.dat", dtype=np.float32)
@@ -243,16 +309,80 @@ def test_policy_projection_disables_old_targets_and_maps_action_ids(
     assert target_mask[2:5].all()
     assert priors[2:5] == pytest.approx([0.2, 0.3, 0.5])
     assert scores[2:5] == pytest.approx([1.0, 2.0, 3.0])
+    assert completed_q[2:5] == pytest.approx([-0.1, 0.2, 0.3])
+    assert completed_q_mask[2:5].all()
     assert np.all(targets[:2] == 0.0) and np.all(targets[5:] == 0.0)
     assert np.isnan(scores[:2]).all() and np.isnan(scores[5:]).all()
+    assert np.isnan(completed_q[:2]).all() and np.isnan(completed_q[5:]).all()
+    assert not completed_q_mask[:2].any() and not completed_q_mask[5:].any()
+    assert not np.array_equal(scores[2:5], completed_q[2:5])
     assert teacher_codes.tolist() == [0, 1, 0]
     assert root_values.tolist() == pytest.approx([0.1, 0.75, 0.3])
     assert root_priors.tolist() == pytest.approx([-0.1, 0.25, -0.3])
     assert set(evidence["authoritative_search_fixed_columns"]) >= paired
+    assert evidence["completed_q_rows"] == 1
+    assert evidence["completed_q_legal_actions"] == 3
+    assert evidence["completed_q_target_scores_separate"] is True
+    assert meta["columns"][overlay.COMPLETED_Q_VALUE_COLUMN] == {
+        "kind": "ragged2d",
+        "dtype": "float32",
+    }
     assert meta["columns"]["teacher_name"]["categories"] == [
         "historical",
         overlay.POLICY_TEACHER,
     ]
+
+
+def test_completed_q_binding_is_operator_bound_and_objective_inert() -> None:
+    merge, arrays, row_identity = _completed_q_binding_fixture()
+
+    binding = overlay._completed_q_binding(  # noqa: SLF001
+        merge=merge,
+        arrays=arrays,
+        row_identity_sha256=row_identity,
+    )
+
+    assert binding["columns"] == {
+        "values": overlay.COMPLETED_Q_VALUE_COLUMN,
+        "mask": overlay.COMPLETED_Q_MASK_COLUMN,
+    }
+    assert binding["row_identity"]["ordered_row_identity_sha256"] == row_identity
+    assert binding["operator_identity"][
+        "target_policy_target_identity_sha256"
+    ] == merge["target_policy_target_identity_sha256"]
+    assert binding["operator_identity"]["legacy_or_unbound_q_allowed"] is False
+    assert binding["reliability_identity"]["schema_version"] == (
+        overlay.TARGET_RELIABILITY_SCHEMA
+    )
+    assert binding["semantics"]["target_scores_relation"] == (
+        "separate_raw_visited_q_column_never_overwritten"
+    )
+    assert binding["semantics"]["default_learner_objective"] == (
+        "none_evidence_only"
+    )
+
+
+@pytest.mark.parametrize("drift", ["operator", "mask", "legacy_patch"])
+def test_completed_q_binding_rejects_unbound_or_incomplete_q(drift: str) -> None:
+    merge, arrays, row_identity = _completed_q_binding_fixture()
+    if drift == "operator":
+        arrays["target_policy_target_identity_sha256"] = np.asarray(
+            ["sha256:" + "e" * 64]
+        )
+    elif drift == "mask":
+        arrays["completed_q_mask_flat"] = np.asarray([True, False])
+    else:
+        merge["patch_schema_version"] = overlay.stage_c.PATCH_SCHEMA_V2
+
+    with pytest.raises(
+        overlay.OverlayError,
+        match="row/operator/reliability authority",
+    ):
+        overlay._completed_q_binding(  # noqa: SLF001
+            merge=merge,
+            arrays=arrays,
+            row_identity_sha256=row_identity,
+        )
 
 
 def test_unique_source_row_count_is_exact_and_fail_closed() -> None:

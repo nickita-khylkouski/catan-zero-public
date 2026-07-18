@@ -43,6 +43,8 @@ MEMMAP_LAZY_COLUMNS = frozenset(
         "target_policy_mask",
         "target_scores",
         "target_scores_mask",
+        "completed_q_values",
+        "completed_q_mask",
         "afterstate_target",
         "afterstate_target_mask",
         "search_evidence_version",

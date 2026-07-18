@@ -9,6 +9,8 @@ letting historical policy targets remain active:
 * every base row remains available to the terminal-outcome/value objective;
 * policy weight and policy tensors are zero for every non-reanalysed row;
 * qualified rows receive the coherent-n128 target, prior and score evidence;
+* qualified rows receive distinct all-legal completed-Q values/masks, bound to
+  their row identities, coherent operator and duplicate-search reliability;
 * all other memmap payloads are hard-linked byte-for-byte from the base corpus.
 
 ``export`` runs beside the completed Stage-C merge, where the full receipt DAG
@@ -46,16 +48,21 @@ from tools import a1_stage_c_teacher_alignment as alignment  # noqa: E402
 from tools import train_bc  # noqa: E402
 from catan_zero.rl.target_reliability import (  # noqa: E402
     TARGET_RELIABILITY_COLUMNS,
+    TARGET_RELIABILITY_SCHEMA,
+    TARGET_RELIABILITY_VERSION,
 )
 
 
-EXPORT_SCHEMA = "a1-stage-c-learner-overlay-export-v3"
-MATERIALIZATION_SCHEMA = "a1-stage-c-policy-overlay-materialization-v3"
-ADMISSION_OVERLAY_SCHEMA = "a1-stage-c-policy-overlay-admission-binding-v3"
+EXPORT_SCHEMA = "a1-stage-c-learner-overlay-export-v4"
+MATERIALIZATION_SCHEMA = "a1-stage-c-policy-overlay-materialization-v4"
+ADMISSION_OVERLAY_SCHEMA = "a1-stage-c-policy-overlay-admission-binding-v4"
+COMPLETED_Q_BINDING_SCHEMA = "a1-stage-c-completed-q-binding-v1"
 SAMPLING_SCHEMA = "a1-stage-c-policy-sampling-distribution-v2"
 ROOT_BREADTH_SCHEMA = alignment.ROOT_BREADTH_SCHEMA
 POLICY_TEACHER = "stage_c_coherent_n128_reanalysis"
 SAMPLING_COLUMN = "stage_c_policy_sampling_weight"
+COMPLETED_Q_VALUE_COLUMN = "completed_q_values"
+COMPLETED_Q_MASK_COLUMN = "completed_q_mask"
 SAMPLING_ARMS = frozenset({"PRODUCTION_WEIGHTED", "STRATEGIC_BALANCED"})
 DEFAULT_PRODUCTION_WEIGHT_CAP = 4.0
 ROOT_BREADTH_REQUIRED_PHASES = alignment.ROOT_BREADTH_REQUIRED_PHASES
@@ -69,6 +76,8 @@ REWRITTEN_COLUMNS = frozenset(
         "target_policy_mask",
         "target_scores",
         "target_scores_mask",
+        COMPLETED_Q_VALUE_COLUMN,
+        COMPLETED_Q_MASK_COLUMN,
         "teacher_name",
     }
 )
@@ -78,6 +87,18 @@ POLICY_RAGGED_COLUMNS = {
     "target_policy_mask": ("target_policy_mask_flat", False),
     "target_scores": ("target_scores_flat", np.nan),
     "target_scores_mask": ("target_scores_mask_flat", False),
+}
+COMPLETED_Q_RAGGED_COLUMNS = {
+    COMPLETED_Q_VALUE_COLUMN: ("completed_q_values_flat", np.nan),
+    COMPLETED_Q_MASK_COLUMN: ("completed_q_mask_flat", False),
+}
+RAGGED_PATCH_COLUMNS = {
+    **POLICY_RAGGED_COLUMNS,
+    **COMPLETED_Q_RAGGED_COLUMNS,
+}
+COMPLETED_Q_COLUMN_SCHEMAS = {
+    COMPLETED_Q_VALUE_COLUMN: {"kind": "ragged2d", "dtype": "float32"},
+    COMPLETED_Q_MASK_COLUMN: {"kind": "ragged2d", "dtype": "bool"},
 }
 OPTIONAL_FIXED_PATCH_COLUMNS = {
     "simulations_used": "simulations_used",
@@ -390,6 +411,189 @@ def _load_json(path: Path, *, where: str) -> tuple[Path, dict[str, Any]]:
     return resolved, payload
 
 
+def _completed_q_binding(
+    *,
+    merge: Mapping[str, Any],
+    arrays: Mapping[str, np.ndarray],
+    row_identity_sha256: str,
+) -> dict[str, Any]:
+    """Bind learner-visible completed-Q bytes to rows and one sealed operator.
+
+    ``target_scores`` remains the sparse raw visited-Q column. This contract
+    gives the all-legal-action completed-Q vector a distinct name and authority
+    so a future learner objective cannot accidentally consume legacy/unbound Q.
+    """
+
+    required = {
+        "row_index",
+        "game_seed",
+        "decision_index",
+        "identity_sha256",
+        "legal_action_offsets",
+        "legal_action_ids_flat",
+        "completed_q_values_flat",
+        "completed_q_mask_flat",
+        "target_policy_target_identity_sha256",
+        *TARGET_RELIABILITY_COLUMNS,
+    }
+    missing = required - set(arrays)
+    row_count = int(np.asarray(arrays.get("row_index", ())).size)
+    offsets = np.asarray(arrays.get("legal_action_offsets", ()), dtype=np.int64)
+    values = np.asarray(
+        arrays.get("completed_q_values_flat", ()), dtype=np.float32
+    )
+    mask = np.asarray(arrays.get("completed_q_mask_flat", ()), dtype=np.bool_)
+    target_identity = str(merge.get("target_policy_target_identity_sha256", ""))
+    reliability = merge.get("reliability")
+    operator_contract = merge.get("target_operator_contract")
+    row_identities = np.asarray(arrays.get("identity_sha256", ())).astype(
+        str, copy=False
+    )
+    per_row_operator = np.asarray(
+        arrays.get("target_policy_target_identity_sha256", ())
+    ).astype(str, copy=False)
+    reliability_versions = np.asarray(
+        arrays.get("target_reliability_version", ()), dtype=np.int64
+    )
+    row_indices = np.asarray(arrays.get("row_index", ()), dtype=np.int64)
+    game_seeds = np.asarray(arrays.get("game_seed", ()), dtype=np.int64)
+    decision_indices = np.asarray(
+        arrays.get("decision_index", ()), dtype=np.int64
+    )
+    identity_shapes_valid = (
+        row_indices.shape
+        == game_seeds.shape
+        == decision_indices.shape
+        == row_identities.shape
+        == (row_count,)
+    )
+    ordered_row_identities = (
+        [
+            {
+                "row_index": int(row),
+                "game_seed": int(seed),
+                "decision_index": int(decision),
+                "identity_sha256": str(identity),
+            }
+            for row, seed, decision, identity in zip(
+                row_indices,
+                game_seeds,
+                decision_indices,
+                row_identities,
+                strict=True,
+            )
+        ]
+        if identity_shapes_valid
+        else []
+    )
+    computed_row_identity_sha256 = (
+        _value_sha256(ordered_row_identities) if identity_shapes_valid else ""
+    )
+    if (
+        missing
+        or merge.get("patch_schema_version") != stage_c.PATCH_SCHEMA
+        or row_count <= 0
+        or offsets.shape != (row_count + 1,)
+        or int(offsets[0]) != 0
+        or bool(np.any(offsets[1:] < offsets[:-1]))
+        or int(offsets[-1]) != int(values.size)
+        or mask.shape != values.shape
+        or not bool(np.all(mask))
+        or not bool(np.all(np.isfinite(values)))
+        or bool(np.any(values < -1.000001))
+        or bool(np.any(values > 1.000001))
+        or row_identities.shape != (row_count,)
+        or not identity_shapes_valid
+        or np.unique(row_identities).size != row_count
+        or any(
+            not identity.startswith("sha256:") or len(identity) != 71
+            for identity in row_identities.tolist()
+        )
+        or per_row_operator.shape != (row_count,)
+        or not target_identity.startswith("sha256:")
+        or len(target_identity) != 71
+        or not bool(np.all(per_row_operator == target_identity))
+        or not isinstance(operator_contract, Mapping)
+        or not isinstance(reliability, Mapping)
+        or reliability.get("schema_version") != TARGET_RELIABILITY_SCHEMA
+        or int(reliability.get("audited_rows", -1))
+        + int(reliability.get("unaudited_rows", -1))
+        != row_count
+        or reliability.get("duplicate_selected_action_applied") is not False
+        or reliability_versions.shape != (row_count,)
+        or not bool(np.all(reliability_versions == TARGET_RELIABILITY_VERSION))
+        or not str(row_identity_sha256).startswith("sha256:")
+        or len(str(row_identity_sha256)) != 71
+        or str(row_identity_sha256) != computed_row_identity_sha256
+    ):
+        detail = f"; missing={sorted(missing)}" if missing else ""
+        raise OverlayError(
+            "Stage-C completed-Q lacks current row/operator/reliability "
+            f"authority{detail}"
+        )
+    return {
+        "schema_version": COMPLETED_Q_BINDING_SCHEMA,
+        "columns": {
+            "values": COMPLETED_Q_VALUE_COLUMN,
+            "mask": COMPLETED_Q_MASK_COLUMN,
+        },
+        "source_patch_columns": {
+            "values": "completed_q_values_flat",
+            "mask": "completed_q_mask_flat",
+            "legal_action_ids": "legal_action_ids_flat",
+            "legal_action_offsets": "legal_action_offsets",
+        },
+        "semantics": {
+            "value": (
+                "root_actor_perspective_completed_q_after_configured_completion_"
+                "and_shrinkage_before_minmax_rescale_and_policy_sigma"
+            ),
+            "range": [-1.0, 1.0],
+            "support": "every_legal_action_on_selected_stage_c_rows",
+            "row_alignment": (
+                "corpus_row_offsets_and_legal_action_ids_exact_set_reordered"
+            ),
+            "nonselected_rows": "nan_values_and_false_mask",
+            "target_scores_relation": (
+                "separate_raw_visited_q_column_never_overwritten"
+            ),
+            "default_learner_objective": "none_evidence_only",
+        },
+        "row_identity": {
+            "ordered_row_identity_sha256": computed_row_identity_sha256,
+            "selected_rows": row_count,
+            "identity_column_in_immutable_patch": "identity_sha256",
+        },
+        "operator_identity": {
+            "target_policy_target_identity_sha256": target_identity,
+            "target_operator_contract": copy.deepcopy(dict(operator_contract)),
+            "q_values_root_perspective": True,
+            "legacy_or_unbound_q_allowed": False,
+        },
+        "reliability_identity": {
+            "schema_version": TARGET_RELIABILITY_SCHEMA,
+            "version": TARGET_RELIABILITY_VERSION,
+            "columns": list(TARGET_RELIABILITY_COLUMNS),
+            "receipt_sha256": _value_sha256(reliability),
+            "audited_rows": int(reliability["audited_rows"]),
+            "unaudited_rows": int(reliability["unaudited_rows"]),
+        },
+    }
+
+
+def _ensure_completed_q_columns(meta: dict[str, Any]) -> None:
+    columns = meta.get("columns")
+    if not isinstance(columns, dict):
+        raise OverlayError("base corpus column schema is malformed")
+    for name, expected in COMPLETED_Q_COLUMN_SCHEMAS.items():
+        current = columns.get(name)
+        if current is not None and current != expected:
+            raise OverlayError(
+                f"existing {name} column does not match Stage-C completed-Q ABI"
+            )
+        columns[name] = copy.deepcopy(expected)
+
+
 def _write_json_immutable(path: Path, value: Mapping[str, Any]) -> None:
     rendered = json.dumps(value, indent=2, sort_keys=True) + "\n"
     destination = path.expanduser().resolve(strict=False)
@@ -659,6 +863,12 @@ def _export(args: argparse.Namespace) -> dict[str, Any]:
             strict=True,
         )
     ]
+    row_identity_sha256 = _value_sha256(identities)
+    completed_q_binding = _completed_q_binding(
+        merge=merge,
+        arrays=arrays,
+        row_identity_sha256=row_identity_sha256,
+    )
     manifest: dict[str, Any] = {
         "schema_version": EXPORT_SCHEMA,
         "diagnostic_only": True,
@@ -685,7 +895,8 @@ def _export(args: argparse.Namespace) -> dict[str, Any]:
         "target_operator_contract": copy.deepcopy(merge["target_operator_contract"]),
         "patch": _artifact(patch_path),
         "counts": copy.deepcopy(merge["counts"]),
-        "row_identity_sha256": _value_sha256(identities),
+        "row_identity_sha256": row_identity_sha256,
+        "completed_q_binding": completed_q_binding,
         "sampling_population": sampling_population,
         "learner_projection": {
             "policy_rows": "exact_stage_c_reanalysed_rows_only",
@@ -704,7 +915,7 @@ def _export(args: argparse.Namespace) -> dict[str, Any]:
             <= set(OPTIONAL_FIXED_PATCH_COLUMNS) & set(arrays),
             "paired_root_value_patch_consumed": paired_root_columns
             <= set(OPTIONAL_FIXED_PATCH_COLUMNS) & set(arrays),
-            "completed_q_patch_consumed": False,
+            "completed_q_patch_consumed": True,
             "completed_q_evidence_sidecar_preserved": {
                 "completed_q_values_flat",
                 "completed_q_mask_flat",
@@ -738,6 +949,10 @@ def _load_export(
         != sorted(REWRITTEN_COLUMNS)
         or manifest.get("learner_projection", {}).get(
             "paired_root_value_patch_consumed"
+        )
+        is not True
+        or manifest.get("learner_projection", {}).get(
+            "completed_q_patch_consumed"
         )
         is not True
     ):
@@ -780,6 +995,13 @@ def _load_export(
     with np.load(patch, allow_pickle=False) as source:
         arrays = {name: np.asarray(source[name]) for name in source.files}
     stage_c._verify_patch_arrays(arrays, receipt=merge)  # noqa: SLF001
+    expected_completed_q_binding = _completed_q_binding(
+        merge=merge,
+        arrays=arrays,
+        row_identity_sha256=str(manifest.get("row_identity_sha256", "")),
+    )
+    if manifest.get("completed_q_binding") != expected_completed_q_binding:
+        raise OverlayError("exported Stage-C completed-Q binding drifted")
     with np.load(subset_path, allow_pickle=False) as source:
         subset = {name: np.asarray(source[name]) for name in source.files}
     return manifest_path, manifest, arrays, subset
@@ -859,8 +1081,9 @@ def _project_policy_patch(
     patch: Mapping[str, np.ndarray],
     selected_sampling_weights: np.ndarray | None = None,
 ) -> dict[str, Any]:
-    """Write the seven policy-only payloads and return projection evidence."""
+    """Write policy plus completed-Q payloads and return projection evidence."""
 
+    _ensure_completed_q_columns(meta)
     columns = meta.get("columns")
     if not isinstance(columns, dict) or not REWRITTEN_COLUMNS <= set(columns):
         raise OverlayError(
@@ -947,7 +1170,7 @@ def _project_policy_patch(
         sampling_weight.flush()
 
     outputs: dict[str, np.memmap] = {}
-    for name, (_patch_name, fill) in POLICY_RAGGED_COLUMNS.items():
+    for name, (_patch_name, fill) in RAGGED_PATCH_COLUMNS.items():
         output = _ragged_flat_memmap(
             output_root, name, columns[name], flat_count, mode="w+"
         )
@@ -972,7 +1195,7 @@ def _project_policy_patch(
         gather = np.asarray(
             [patch_position[int(action)] for action in base_ids], dtype=np.int64
         )
-        for name, (patch_name, _fill) in POLICY_RAGGED_COLUMNS.items():
+        for name, (patch_name, _fill) in RAGGED_PATCH_COLUMNS.items():
             source = np.asarray(patch[patch_name])[patch_start:patch_stop]
             outputs[name][base_start:base_stop] = source[gather]
     for output in outputs.values():
@@ -1022,6 +1245,8 @@ def _project_policy_patch(
 
     target_policy = outputs["target_policy"]
     target_mask = outputs["target_policy_mask"]
+    completed_q = outputs[COMPLETED_Q_VALUE_COLUMN]
+    completed_q_mask = outputs[COMPLETED_Q_MASK_COLUMN]
     selected_mass = np.asarray(
         [
             float(
@@ -1038,6 +1263,31 @@ def _project_policy_patch(
         np.count_nonzero(np.asarray(patch["target_policy_mask_flat"]))
     ):
         raise OverlayError("materialized Stage-C target mask lost support")
+    selected_completed_q = np.concatenate(
+        [
+            np.asarray(
+                completed_q[int(offsets[row]) : int(offsets[row + 1])],
+                dtype=np.float32,
+            )
+            for row in selected_rows
+        ]
+    )
+    selected_completed_q_mask = np.concatenate(
+        [
+            np.asarray(
+                completed_q_mask[int(offsets[row]) : int(offsets[row + 1])],
+                dtype=np.bool_,
+            )
+            for row in selected_rows
+        ]
+    )
+    if (
+        not bool(np.all(selected_completed_q_mask))
+        or not bool(np.all(np.isfinite(selected_completed_q)))
+        or int(np.count_nonzero(np.asarray(completed_q_mask)))
+        != int(np.count_nonzero(np.asarray(patch["completed_q_mask_flat"])))
+    ):
+        raise OverlayError("materialized Stage-C completed-Q lost exact support")
 
     return {
         "selected_rows": int(selected_rows.size),
@@ -1046,6 +1296,11 @@ def _project_policy_patch(
         "selected_policy_mass_min": float(selected_mass.min()),
         "selected_policy_mass_max": float(selected_mass.max()),
         "base_value_rows_retained": rows,
+        "completed_q_rows": int(selected_rows.size),
+        "completed_q_legal_actions": int(selected_completed_q.size),
+        "completed_q_value_min": float(selected_completed_q.min()),
+        "completed_q_value_max": float(selected_completed_q.max()),
+        "completed_q_target_scores_separate": True,
         "authoritative_search_fixed_columns": projected_search_columns,
     }
 
@@ -1269,6 +1524,7 @@ def _materialize(args: argparse.Namespace) -> dict[str, Any]:
         columns = meta.get("columns")
         if not isinstance(columns, dict):
             raise OverlayError("base corpus column schema is malformed")
+        _ensure_completed_q_columns(meta)
         columns[SAMPLING_COLUMN] = {
             "kind": "fixed",
             "dtype": "float32",
@@ -1334,6 +1590,19 @@ def _materialize(args: argparse.Namespace) -> dict[str, Any]:
             arm=str(args.sampling_arm),
             production_weight_cap=float(args.production_weight_cap),
         )
+        completed_q_binding = export.get("completed_q_binding")
+        if (
+            not isinstance(completed_q_binding, dict)
+            or completed_q_binding.get("schema_version")
+            != COMPLETED_Q_BINDING_SCHEMA
+            or completed_q_binding.get("row_identity", {}).get("selected_rows")
+            != len(patch["row_index"])
+            or completed_q_binding.get("operator_identity", {}).get(
+                "target_policy_target_identity_sha256"
+            )
+            != export["target_policy_target_identity_sha256"]
+        ):
+            raise OverlayError("Stage-C completed-Q export binding is missing")
         paired_root_columns = {
             "root_value",
             "root_value_mask",
@@ -1408,6 +1677,8 @@ def _materialize(args: argparse.Namespace) -> dict[str, Any]:
             "selected_policy_weight": 1.0,
             "base_value_rows_retained": True,
             "paired_root_value_patch_consumed": True,
+            "completed_q_patch_consumed": True,
+            "completed_q_binding": copy.deepcopy(completed_q_binding),
             "rewritten_columns": sorted(rewritten_columns),
             "sampling_distribution": sampling_report,
             "root_breadth": root_breadth,
@@ -1463,6 +1734,8 @@ def _materialize(args: argparse.Namespace) -> dict[str, Any]:
             "non_target_source_columns_mutated": False,
             "base_value_and_outcome_columns_retained": True,
             "paired_root_value_patch_consumed": True,
+            "completed_q_patch_consumed": True,
+            "completed_q_binding": copy.deepcopy(completed_q_binding),
         }
         receipt["receipt_sha256"] = _value_sha256(receipt)
         _write_json_immutable(temporary / final_receipt.name, receipt)
@@ -1493,6 +1766,8 @@ def _materialize(args: argparse.Namespace) -> dict[str, Any]:
         admission["stage_c_policy_overlay"] = {
             "schema_version": ADMISSION_OVERLAY_SCHEMA,
             "paired_root_value_patch_consumed": True,
+            "completed_q_patch_consumed": True,
+            "completed_q_binding": copy.deepcopy(completed_q_binding),
             "materialization_receipt": {
                 "path": str(final_receipt),
                 "file_sha256": _file_sha256(temporary / final_receipt.name),
@@ -1537,6 +1812,9 @@ def verify_overlay_admission(path: Path) -> dict[str, Any]:
     unsigned = dict(admission)
     stated = unsigned.pop("admission_sha256", None)
     overlay = admission.get("stage_c_policy_overlay")
+    completed_q_binding = (
+        overlay.get("completed_q_binding") if isinstance(overlay, dict) else None
+    )
     if (
         admission.get("schema_version") != active_campaign.ADMISSION_SCHEMA
         or stated != _value_sha256(unsigned)
@@ -1545,6 +1823,17 @@ def verify_overlay_admission(path: Path) -> dict[str, Any]:
         or overlay.get("historical_policy_targets_active") is not False
         or overlay.get("base_value_rows_retained") is not True
         or overlay.get("paired_root_value_patch_consumed") is not True
+        or overlay.get("completed_q_patch_consumed") is not True
+        or not isinstance(completed_q_binding, dict)
+        or completed_q_binding.get("schema_version") != COMPLETED_Q_BINDING_SCHEMA
+        or completed_q_binding.get("semantics", {}).get(
+            "default_learner_objective"
+        )
+        != "none_evidence_only"
+        or completed_q_binding.get("operator_identity", {}).get(
+            "legacy_or_unbound_q_allowed"
+        )
+        is not False
         or int(overlay.get("selected_policy_rows", 0)) <= 0
         or int(overlay.get("selected_training_policy_rows", 0)) <= 0
         or int(overlay.get("selected_validation_policy_rows", -1)) < 0
@@ -1582,6 +1871,8 @@ def verify_overlay_admission(path: Path) -> dict[str, Any]:
         != overlay.get("target_policy_target_identity_sha256")
         or receipt.get("root_breadth") != root_breadth
         or receipt.get("paired_root_value_patch_consumed") is not True
+        or receipt.get("completed_q_patch_consumed") is not True
+        or receipt.get("completed_q_binding") != completed_q_binding
         or admission.get("policy_distillation_contract", {}).get(
             "root_breadth_inventory_sha256"
         )
@@ -1601,6 +1892,16 @@ def verify_overlay_admission(path: Path) -> dict[str, Any]:
             "paired_root_value_patch_consumed"
         )
         is not True
+        or meta.get("stage_c_policy_overlay", {}).get(
+            "completed_q_patch_consumed"
+        )
+        is not True
+        or meta.get("stage_c_policy_overlay", {}).get("completed_q_binding")
+        != completed_q_binding
+        or any(
+            meta.get("columns", {}).get(name) != schema
+            for name, schema in COMPLETED_Q_COLUMN_SCHEMAS.items()
+        )
     ):
         raise OverlayError("Stage-C overlay admission differs from corpus bytes")
     return {

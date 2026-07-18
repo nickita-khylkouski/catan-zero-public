@@ -98,11 +98,19 @@ would cost 324 bytes per row, or 1,104,814,080 bytes on the same corpus.
 
 The CLI flag `--preserve-search-evidence` enables this payload. Default-off
 generation still drops the private transient arrays before buffering rows, so
-the historical shard schema and learner input are unchanged. The learner
-ignores the four optional arrays; posthoc tooling reads them from raw NPZ. They
-are deliberately not copied into the training memmap: current prefetch code
-would materialize every registered column per batch, turning audit-only
-evidence into a permanent learner I/O cost.
+the historical shard schema and learner input are unchanged. Ordinary corpus
+conversion keeps the compact arrays as evidence and the learner ignores them.
+
+The authoritative Stage-C overlay is the one bounded exception. Its current
+schema projects the freshly rerun, operator-bound
+`completed_q_values_flat`/`completed_q_mask_flat` evidence into legal-aligned
+`completed_q_values`/`completed_q_mask` memmap columns. Nonselected rows are
+NaN/false. The overlay receipt binds those bytes to the exact selected row
+identities, coherent operator identity, and duplicate-search reliability
+contract. `target_scores` remains the separate sparse raw visited-Q field and
+is not overwritten. No default learner loss consumes the new completed-Q
+columns yet; they are production-addressable evidence for a separately
+commissioned objective, never authority for legacy or unbound Q.
 
 Sufficiency is explicit and fail-closed. A single-world target can be
 recalibrated from completed-Q, visits, the existing prior/phase columns, and
