@@ -68,8 +68,21 @@ POLICY_TEACHER = "stage_c_coherent_n128_reanalysis"
 SAMPLING_COLUMN = "stage_c_policy_sampling_weight"
 COMPLETED_Q_VALUE_COLUMN = "completed_q_values"
 COMPLETED_Q_MASK_COLUMN = "completed_q_mask"
-SAMPLING_ARMS = frozenset({"PRODUCTION_WEIGHTED", "STRATEGIC_BALANCED"})
+SAMPLING_ARMS = frozenset(
+    {
+        "PRODUCTION_WEIGHTED",
+        "STRATEGIC_BALANCED",
+        "RARE_ACTION_BALANCED",
+    }
+)
 DEFAULT_PRODUCTION_WEIGHT_CAP = 4.0
+RARE_STRATEGIC_ACTION_TYPES = (
+    "PLAY_MONOPOLY",
+    "PLAY_ROAD_BUILDING",
+    "PLAY_YEAR_OF_PLENTY",
+    "PLAY_KNIGHT_CARD",
+)
+RARE_ACTION_TARGET_MASS_FRACTION = 0.02
 LEGACY_ADMISSION_SCHEMA = "a1-coherent-n128-corpus-admission-v1"
 SUPPORTED_BASE_ADMISSION_SCHEMAS = frozenset(
     {
@@ -1871,6 +1884,122 @@ def _effective_sample_size(weights: np.ndarray) -> float:
     return float(values.sum() ** 2 / np.square(values).sum())
 
 
+def _teacher_argmax_action_types(
+    patch: Mapping[str, np.ndarray],
+    *,
+    action_types_by_id: Sequence[str],
+) -> np.ndarray:
+    """Project each reanalysed soft target onto its teacher-argmax action type."""
+
+    rows = np.asarray(patch.get("row_index", ()), dtype=np.int64)
+    offsets = np.asarray(patch.get("legal_action_offsets", ()), dtype=np.int64)
+    legal_ids = np.asarray(patch.get("legal_action_ids_flat", ()), dtype=np.int64)
+    target = np.asarray(patch.get("target_policy_flat", ()), dtype=np.float64)
+    target_mask = np.asarray(
+        patch.get("target_policy_mask_flat", ()), dtype=np.bool_
+    )
+    action_types = tuple(str(value).upper() for value in action_types_by_id)
+    malformed = (
+        rows.ndim != 1
+        or rows.size == 0
+        or offsets.shape != (rows.size + 1,)
+        or int(offsets[0]) != 0
+        or bool(np.any(offsets[1:] <= offsets[:-1]))
+        or int(offsets[-1]) != int(legal_ids.size)
+        or target.shape != legal_ids.shape
+        or target_mask.shape != legal_ids.shape
+        or not action_types
+        or bool(np.any(legal_ids < 0))
+        or bool(np.any(legal_ids >= len(action_types)))
+        or bool(np.any(~np.isfinite(target)))
+        or bool(np.any(target < 0.0))
+    )
+    if malformed:
+        raise OverlayError("Stage-C teacher action-type projection is malformed")
+    labels: list[str] = []
+    for start, stop in zip(offsets[:-1], offsets[1:], strict=True):
+        lo, hi = int(start), int(stop)
+        support = target_mask[lo:hi]
+        values = target[lo:hi]
+        if not bool(np.any(support)) or float(values[support].sum()) <= 0.0:
+            raise OverlayError("Stage-C teacher target has no supported policy mass")
+        supported = np.where(support, values, -np.inf)
+        action_id = int(legal_ids[lo + int(np.argmax(supported))])
+        labels.append(action_types[action_id])
+    return np.asarray(labels, dtype=str)
+
+
+def _current_action_types_by_id() -> tuple[str, ...]:
+    """Rebuild and authenticate the exact 2p ActionCatalog type projection."""
+
+    env_config = train_bc.parse_track(
+        "2p_no_trade",
+        vps_to_win=10,
+        use_graph_history_features=True,
+    )
+    action_catalog = train_bc._action_catalog_for_env_config(env_config)  # noqa: SLF001
+    _, action_types = train_bc._action_catalog_type_projection(  # noqa: SLF001
+        action_catalog, {}
+    )
+    observed_abi = train_bc._action_catalog_abi_binding(action_catalog)  # noqa: SLF001
+    try:
+        expected_abi = alignment.current_science._load()["promotion"][  # noqa: SLF001
+            "maritime_behavioral_competence_negative_observation"
+        ]["action_catalog_abi"]
+    except (KeyError, TypeError) as error:
+        raise OverlayError(
+            "current science contract has no bound ActionCatalog ABI"
+        ) from error
+    if observed_abi != expected_abi:
+        raise OverlayError(
+            "runtime ActionCatalog differs from the current science contract"
+        )
+    return action_types
+
+
+def _rare_action_balance_weights(
+    labels: np.ndarray,
+    *,
+    selected: np.ndarray,
+    cap: float,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Give each observed rare teacher action a bounded objective-mass floor."""
+
+    action_types = np.asarray(labels).astype(str, copy=False)
+    scope = np.asarray(selected, dtype=np.bool_)
+    if action_types.ndim != 1 or scope.shape != action_types.shape or not np.any(scope):
+        raise OverlayError("rare-action balancing scope is empty or malformed")
+    raw = np.ones(action_types.size, dtype=np.float64)
+    target_mass = float(RARE_ACTION_TARGET_MASS_FRACTION * np.count_nonzero(scope))
+    counts: dict[str, int] = {}
+    requested_multipliers: dict[str, float] = {}
+    for action_type in RARE_STRATEGIC_ACTION_TYPES:
+        mask = scope & (action_types == action_type)
+        count = int(np.count_nonzero(mask))
+        counts[action_type] = count
+        multiplier = max(1.0, target_mass / count) if count else 1.0
+        requested_multipliers[action_type] = float(multiplier)
+        raw[mask] = multiplier
+    result = np.ones(action_types.size, dtype=np.float64)
+    result[scope] = _unit_mean_capped_weights(raw[scope], cap=cap)
+    realized_mass = {
+        action_type: float(result[scope & (action_types == action_type)].sum())
+        for action_type in RARE_STRATEGIC_ACTION_TYPES
+    }
+    return result, {
+        "critical_action_types": list(RARE_STRATEGIC_ACTION_TYPES),
+        "target_mass_fraction_per_observed_type": (
+            RARE_ACTION_TARGET_MASS_FRACTION
+        ),
+        "target_mass_per_type": target_mass,
+        "row_counts": counts,
+        "requested_multipliers": requested_multipliers,
+        "realized_weight_mass": realized_mass,
+        "cap": float(cap),
+        "missing_types_are_not_synthesized": True,
+    }
+
+
 def _selected_sampling_weights(
     *,
     export: Mapping[str, Any],
@@ -1879,6 +2008,7 @@ def _selected_sampling_weights(
     selected_validation: np.ndarray,
     arm: str,
     production_weight_cap: float,
+    action_types_by_id: Sequence[str] | None = None,
 ) -> tuple[np.ndarray, dict[str, Any]]:
     if arm not in SAMPLING_ARMS:
         raise OverlayError(f"unknown Stage-C sampling arm {arm!r}")
@@ -1924,6 +2054,14 @@ def _selected_sampling_weights(
         raise OverlayError("Stage-C selected training split is empty or misaligned")
     train = ~validation
     weights = np.ones(raw.size, dtype=np.float64)
+    teacher_action_types = None
+    rare_action_balance = None
+    if action_types_by_id is not None:
+        teacher_action_types = _teacher_argmax_action_types(
+            patch, action_types_by_id=action_types_by_id
+        )
+        if teacher_action_types.shape != raw.shape:
+            raise OverlayError("Stage-C teacher action types are row-misaligned")
     if arm == "PRODUCTION_WEIGHTED":
         weights[train] = _unit_mean_capped_weights(
             raw[train], cap=float(production_weight_cap)
@@ -1936,6 +2074,29 @@ def _selected_sampling_weights(
             weights[validation] = _unit_mean_capped_weights(
                 raw[validation], cap=float(production_weight_cap)
             )
+    elif arm == "RARE_ACTION_BALANCED":
+        if teacher_action_types is None:
+            raise OverlayError(
+                "rare-action-balanced Stage-C sampling requires ActionCatalog types"
+            )
+        train_weights, training_balance = _rare_action_balance_weights(
+            teacher_action_types,
+            selected=train,
+            cap=float(production_weight_cap),
+        )
+        weights[train] = train_weights[train]
+        validation_balance = None
+        if np.any(validation):
+            validation_weights, validation_balance = _rare_action_balance_weights(
+                teacher_action_types,
+                selected=validation,
+                cap=float(production_weight_cap),
+            )
+            weights[validation] = validation_weights[validation]
+        rare_action_balance = {
+            "training": training_balance,
+            "validation": validation_balance,
+        }
 
     def _mass_by(values: Sequence[str]) -> dict[str, float]:
         labels = np.asarray(values).astype(str)
@@ -1986,6 +2147,11 @@ def _selected_sampling_weights(
         "training_mass_by_phase": _mass_by(phases),
         "training_mass_by_legal_width_bucket": _mass_by(width_buckets),
     }
+    if teacher_action_types is not None:
+        report["training_mass_by_teacher_argmax_action_type"] = _mass_by(
+            teacher_action_types
+        )
+        report["rare_action_balance"] = rare_action_balance
     report["sampling_sha256"] = _value_sha256(report)
     return weights.astype(np.float32), report
 
@@ -2185,6 +2351,11 @@ def _materialize(args: argparse.Namespace) -> dict[str, Any]:
             selected_validation=selected_validation,
             arm=str(args.sampling_arm),
             production_weight_cap=float(args.production_weight_cap),
+            action_types_by_id=(
+                _current_action_types_by_id()
+                if str(args.sampling_arm) == "RARE_ACTION_BALANCED"
+                else None
+            ),
         )
         completed_q_binding = export.get("completed_q_binding")
         if (

@@ -736,6 +736,87 @@ def test_two_stage_c_sampling_arms_share_roots_but_not_measure() -> None:
     )
 
 
+def test_rare_action_balanced_sampling_raises_observed_teacher_mass() -> None:
+    rows = 100
+    subset = {
+        "row_index": np.arange(rows, dtype=np.int64),
+        "stratum": np.asarray(["common"] * rows),
+        "phase": np.asarray(["PLAY_TURN"] * rows),
+        "legal_width": np.full(rows, 2, dtype=np.int64),
+    }
+    # Action ids 0/1 are common BUILD_ROAD choices. Action ids 2..5 are the
+    # four rare strategic development-card plays, one teacher argmax each.
+    action_types = (
+        "BUILD_ROAD",
+        "BUILD_ROAD",
+        *overlay.RARE_STRATEGIC_ACTION_TYPES,
+    )
+    legal_ids: list[int] = []
+    target: list[float] = []
+    offsets = [0]
+    for row in range(rows):
+        rare_id = row + 2 if row < len(overlay.RARE_STRATEGIC_ACTION_TYPES) else 1
+        legal_ids.extend((0, rare_id))
+        target.extend((0.1, 0.9))
+        offsets.append(len(legal_ids))
+    patch = {
+        "row_index": subset["row_index"],
+        "legal_action_offsets": np.asarray(offsets, dtype=np.int64),
+        "legal_action_ids_flat": np.asarray(legal_ids, dtype=np.int64),
+        "target_policy_flat": np.asarray(target, dtype=np.float32),
+        "target_policy_mask_flat": np.ones(len(target), dtype=np.bool_),
+    }
+    export = {
+        "sampling_population": {
+            "candidate_counts_by_stratum": {"common": rows},
+            "selected_counts_by_stratum": {"common": rows},
+        }
+    }
+    validation = np.zeros(rows, dtype=np.bool_)
+    validation[-10:] = True
+
+    weights, report = overlay._selected_sampling_weights(  # noqa: SLF001
+        export=export,
+        subset=subset,
+        patch=patch,
+        selected_validation=validation,
+        arm="RARE_ACTION_BALANCED",
+        production_weight_cap=4.0,
+        action_types_by_id=action_types,
+    )
+
+    assert np.mean(weights[~validation]) == pytest.approx(1.0)
+    assert np.max(weights[~validation]) <= 4.0
+    for row, action_type in enumerate(overlay.RARE_STRATEGIC_ACTION_TYPES):
+        assert weights[row] > weights[10]
+        assert (
+            report["rare_action_balance"]["training"]["row_counts"][action_type]
+            == 1
+        )
+        assert (
+            report["training_mass_by_teacher_argmax_action_type"][action_type]
+            > 1.0
+        )
+    assert report["rare_action_balance"]["training"][
+        "missing_types_are_not_synthesized"
+    ]
+
+
+def test_teacher_action_type_projection_rejects_unbound_catalog_ids() -> None:
+    patch = {
+        "row_index": np.asarray([4], dtype=np.int64),
+        "legal_action_offsets": np.asarray([0, 2], dtype=np.int64),
+        "legal_action_ids_flat": np.asarray([0, 9], dtype=np.int64),
+        "target_policy_flat": np.asarray([0.1, 0.9], dtype=np.float32),
+        "target_policy_mask_flat": np.asarray([True, True]),
+    }
+    with pytest.raises(overlay.OverlayError, match="projection is malformed"):
+        overlay._teacher_argmax_action_types(  # noqa: SLF001
+            patch,
+            action_types_by_id=("BUILD_ROAD",),
+        )
+
+
 def test_production_stage_c_validation_preserves_its_weighted_measure() -> None:
     subset = {
         "row_index": np.asarray([10, 11, 12, 13, 14, 15], dtype=np.int64),
