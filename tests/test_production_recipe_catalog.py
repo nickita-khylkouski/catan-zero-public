@@ -127,6 +127,8 @@ def test_authenticated_catalog_listing_has_no_second_identity_registry() -> None
     assert [entry["name"] for entry in train] == [
         "a1-current-35m-b200",
         "a1-parent-update-35m-b200",
+        "a1-parent-update-shared-action25-35m-b200",
+        "a1-parent-update-active-p10-35m-b200",
         "a1-parent-update-active-p25-35m-b200",
     ]
     assert all(Path(entry["path"]).is_absolute() for entry in train)
