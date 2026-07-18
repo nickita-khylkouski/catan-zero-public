@@ -4466,46 +4466,54 @@ def bind_diagnostic_training_descriptor(
         isinstance(reporting_contract, dict)
         and reporting_contract.get("diagnostic_dose_curve") is True
     )
-    canonical_p10_recipe = (
+    canonical_parent_recipe = (
         reporting_contract.get("canonical_recipe")
         if isinstance(reporting_contract, dict)
         else None
     )
-    canonical_p10_binding: dict[str, Any] | None = None
-    if canonical_p10_recipe is not None:
+    canonical_parent_binding: dict[str, Any] | None = None
+    canonical_parent_binding_key: str | None = None
+    if canonical_parent_recipe is not None:
+        config_filename = (
+            train_bc.CANONICAL_PARENT_DIAGNOSTIC_RECIPE_CONFIG_FILENAMES.get(
+                canonical_parent_recipe
+            )
+        )
         if (
-            canonical_p10_recipe
-            != train_bc.CANONICAL_P10_DIAGNOSTIC_RECIPE_NAME
-            or not lr_dose_campaign
+            config_filename is None or not lr_dose_campaign
         ):
             raise ExecutorError(
-                "diagnostic canonical recipe must be the exact P10 dose-curve"
+                "diagnostic canonical recipe must be an explicitly admitted "
+                "parent dose-curve"
             )
-        config_path = (
-            _REPO_ROOT
-            / "configs/training/"
-            "a1_parent_update_active_p10_35m_b200.schema1.json"
-        )
+        config_path = _REPO_ROOT / "configs/training" / config_filename
         try:
-            canonical_p10_binding = (
-                train_bc._canonical_p10_diagnostic_config_binding(  # noqa: SLF001
+            canonical_parent_binding = (
+                train_bc._canonical_parent_diagnostic_config_binding(  # noqa: SLF001
                     config_path
                 )
             )
         except SystemExit as error:
             raise ExecutorError(
-                f"canonical P10 diagnostic binding refused: {error}"
+                f"canonical parent diagnostic binding refused: {error}"
             ) from error
+        canonical_parent_binding_key = (
+            "canonical_p10_config_binding"
+            if canonical_parent_recipe
+            == train_bc.CANONICAL_P10_DIAGNOSTIC_RECIPE_NAME
+            else "canonical_parent_config_binding"
+        )
         if (
             effective_recipe
-            != canonical_p10_binding["normalized_effective_recipe"]
+            != canonical_parent_binding["normalized_effective_recipe"]
         ):
             raise ExecutorError(
-                "diagnostic P10 effective recipe differs from its complete "
+                "diagnostic canonical parent effective recipe differs from its "
+                "complete "
                 "catalog/runtime projection"
             )
         derived_overrides = (
-            train_bc._canonical_p10_diagnostic_descriptor_overrides(  # noqa: SLF001
+            train_bc._canonical_parent_diagnostic_descriptor_overrides(  # noqa: SLF001
                 base_overrides,
                 effective_recipe,
             )
@@ -4515,7 +4523,7 @@ def bind_diagnostic_training_descriptor(
         # optimizer fields are absent from the immutable production composite,
         # so copy their exact effective values into the derived descriptor for
         # an independent train_bc replay instead of relying on argv alone.
-        if canonical_p10_binding is None:
+        if canonical_parent_binding is None:
             for key in (
                 "epochs",
                 "max_steps",
@@ -4594,9 +4602,10 @@ def bind_diagnostic_training_descriptor(
         "diagnostic_only": True,
         "promotion_eligible": False,
     }
-    if canonical_p10_binding is not None:
-        diagnostic_derivation_authority["canonical_p10_config_binding"] = (
-            copy.deepcopy(canonical_p10_binding)
+    if canonical_parent_binding is not None:
+        assert canonical_parent_binding_key is not None
+        diagnostic_derivation_authority[canonical_parent_binding_key] = (
+            copy.deepcopy(canonical_parent_binding)
         )
     derived["diagnostic_derivation_authority"] = diagnostic_derivation_authority
 

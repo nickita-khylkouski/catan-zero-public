@@ -5692,10 +5692,20 @@ FLYWHEEL_DIAGNOSTIC_DERIVATION_SCHEMA = (
 CANONICAL_P10_DIAGNOSTIC_RECIPE_NAME = (
     "a1-parent-update-active-p10-35m-b200"
 )
+CANONICAL_P0_DIAGNOSTIC_RECIPE_NAME = "a1-parent-update-35m-b200"
+CANONICAL_PARENT_DIAGNOSTIC_RECIPE_CONFIG_FILENAMES = {
+    CANONICAL_P0_DIAGNOSTIC_RECIPE_NAME: "a1_parent_update_35m_b200.schema1.json",
+    CANONICAL_P10_DIAGNOSTIC_RECIPE_NAME: (
+        "a1_parent_update_active_p10_35m_b200.schema1.json"
+    ),
+}
 CANONICAL_P10_DIAGNOSTIC_BINDING_SCHEMA = (
     "a1-canonical-p10-diagnostic-config-binding-v1"
 )
-_CANONICAL_P10_DYNAMIC_RUNTIME_FIELDS = {
+CANONICAL_PARENT_DIAGNOSTIC_BINDING_SCHEMA = (
+    "a1-canonical-parent-diagnostic-config-binding-v1"
+)
+_CANONICAL_PARENT_DYNAMIC_RUNTIME_FIELDS = {
     "data",
     "data_fingerprint",
     "grow_from_checkpoint",
@@ -5708,12 +5718,46 @@ _CANONICAL_P10_DYNAMIC_RUNTIME_FIELDS = {
     "validation_contract_file_sha256",
     "validation_game_seed_set_sha256",
 }
+_CANONICAL_PARENT_DIAGNOSTIC_BINDING_PROFILES = {
+    "canonical_p10_config_binding": {
+        "name": CANONICAL_P10_DIAGNOSTIC_RECIPE_NAME,
+        "binding_schema": CANONICAL_P10_DIAGNOSTIC_BINDING_SCHEMA,
+        "topology_schema": "a1-canonical-p10-diagnostic-topology-v1",
+    },
+    "canonical_parent_config_binding": {
+        "name": CANONICAL_P0_DIAGNOSTIC_RECIPE_NAME,
+        "binding_schema": CANONICAL_PARENT_DIAGNOSTIC_BINDING_SCHEMA,
+        "topology_schema": "a1-canonical-parent-diagnostic-topology-v1",
+    },
+}
 
 
-def _canonical_p10_diagnostic_config_binding(
+def _require_canonical_parent_diagnostic_binding_profile(
+    authority_key: str,
+    binding: object,
+) -> dict[str, object]:
+    """Refuse recipe bindings relabeled under another authority key."""
+
+    profile = _CANONICAL_PARENT_DIAGNOSTIC_BINDING_PROFILES.get(authority_key)
+    topology = binding.get("training_topology") if isinstance(binding, dict) else None
+    if (
+        profile is None
+        or not isinstance(binding, dict)
+        or binding.get("name") != profile["name"]
+        or binding.get("schema_version") != profile["binding_schema"]
+        or not isinstance(topology, dict)
+        or topology.get("schema_version") != profile["topology_schema"]
+        or binding.get("training_topology_sha256")
+        != _canonical_json_sha256(topology)
+    ):
+        raise SystemExit("canonical parent diagnostic binding profile drift")
+    return binding
+
+
+def _canonical_parent_diagnostic_config_binding(
     config_path: str | Path,
 ) -> dict[str, object]:
-    """Replay the complete cataloged P10 recipe for a diagnostic derivative."""
+    """Replay one explicitly admitted cataloged parent recipe in full."""
 
     try:
         from tools import train as canonical_train
@@ -5721,21 +5765,56 @@ def _canonical_p10_diagnostic_config_binding(
         path = Path(config_path).expanduser().resolve(strict=True)
         payload = json.loads(path.read_text(encoding="utf-8"))
         config, engine = canonical_train._load_recipe(path)  # noqa: SLF001
-    except (OSError, UnicodeError, json.JSONDecodeError, SystemExit) as error:
-        raise SystemExit(f"canonical P10 diagnostic config refused: {error}") from error
+    except (
+        TypeError,
+        OSError,
+        UnicodeError,
+        json.JSONDecodeError,
+        SystemExit,
+    ) as error:
+        raise SystemExit(
+            f"canonical parent diagnostic config refused: {error}"
+        ) from error
+    recipe_name = payload.get("name") if isinstance(payload, dict) else None
+    expected_filename = (
+        CANONICAL_PARENT_DIAGNOSTIC_RECIPE_CONFIG_FILENAMES.get(recipe_name)
+        if isinstance(recipe_name, str)
+        else None
+    )
+    expected_path = (
+        (
+            Path(__file__).resolve().parents[1]
+            / "configs/training"
+            / expected_filename
+        ).resolve(strict=True)
+        if expected_filename is not None
+        else None
+    )
     if (
         not isinstance(payload, dict)
-        or payload.get("name") != CANONICAL_P10_DIAGNOSTIC_RECIPE_NAME
+        or expected_path is None
+        or path != expected_path
         or engine.get("initialization_mode") != "parent_fresh_optimizer"
     ):
-        raise SystemExit("canonical P10 diagnostic config identity drift")
+        raise SystemExit("canonical parent diagnostic config identity drift")
+    p10_compatibility = recipe_name == CANONICAL_P10_DIAGNOSTIC_RECIPE_NAME
+    placeholder_root = (
+        "/canonical-p10-diagnostic"
+        if p10_compatibility
+        else "/canonical-parent-diagnostic"
+    )
+    topology_schema = (
+        "a1-canonical-p10-diagnostic-topology-v1"
+        if p10_compatibility
+        else "a1-canonical-parent-diagnostic-topology-v1"
+    )
     public_args = argparse.Namespace(
-        data="/canonical-p10-diagnostic/composite.json",
-        checkpoint="/canonical-p10-diagnostic/candidate.pt",
-        report="/canonical-p10-diagnostic/train.report.json",
-        init_checkpoint="/canonical-p10-diagnostic/initializer.pt",
+        data=f"{placeholder_root}/composite.json",
+        checkpoint=f"{placeholder_root}/candidate.pt",
+        report=f"{placeholder_root}/train.report.json",
+        init_checkpoint=f"{placeholder_root}/initializer.pt",
         device="cuda",
-        host_lock_file="/canonical-p10-diagnostic/train.lock",
+        host_lock_file=f"{placeholder_root}/train.lock",
         allow_concurrent_bc=False,
     )
     namespace = canonical_train._engine_namespace(  # noqa: SLF001
@@ -5744,7 +5823,7 @@ def _canonical_p10_diagnostic_config_binding(
         public_args=public_args,
     )
     runtime_topology = {
-        "schema_version": "a1-canonical-p10-diagnostic-topology-v1",
+        "schema_version": topology_schema,
         "name": "b200-8gpu-ddp",
         "world_size": 8,
         "local_batch_size": int(namespace.batch_size),
@@ -5754,14 +5833,14 @@ def _canonical_p10_diagnostic_config_binding(
         ),
     }
     if runtime_topology != {
-        "schema_version": "a1-canonical-p10-diagnostic-topology-v1",
+        "schema_version": topology_schema,
         "name": "b200-8gpu-ddp",
         "world_size": 8,
         "local_batch_size": 64,
         "grad_accum_steps": 1,
         "global_batch_size": 512,
     }:
-        raise SystemExit("canonical P10 diagnostic topology drift")
+        raise SystemExit("canonical parent diagnostic topology drift")
     runtime_effective = _effective_a1_learner_training_recipe(
         namespace,
         {
@@ -5788,7 +5867,7 @@ def _canonical_p10_diagnostic_config_binding(
             | set(engine_settings)
             | set(canonical_train._CANONICAL_RUNTIME_DEFAULTS)  # noqa: SLF001
         )
-        if name not in _CANONICAL_P10_DYNAMIC_RUNTIME_FIELDS
+        if name not in _CANONICAL_PARENT_DYNAMIC_RUNTIME_FIELDS
         and hasattr(namespace, name)
     }
     normalized_catalog_recipe = copy.deepcopy(train_config)
@@ -5825,8 +5904,12 @@ def _canonical_p10_diagnostic_config_binding(
         }
     )
     result = {
-        "schema_version": CANONICAL_P10_DIAGNOSTIC_BINDING_SCHEMA,
-        "name": CANONICAL_P10_DIAGNOSTIC_RECIPE_NAME,
+        "schema_version": (
+            CANONICAL_P10_DIAGNOSTIC_BINDING_SCHEMA
+            if p10_compatibility
+            else CANONICAL_PARENT_DIAGNOSTIC_BINDING_SCHEMA
+        ),
+        "name": recipe_name,
         "config": str(path),
         "config_file_sha256": _sha256_existing_file(path),
         "config_canonical_sha256": _canonical_json_sha256(payload),
@@ -5854,17 +5937,29 @@ def _canonical_p10_diagnostic_config_binding(
             normalized_runtime_effective
         ),
         "training_topology": runtime_topology,
+        "training_topology_sha256": _canonical_json_sha256(runtime_topology),
         "launcher_sha256": _sha256_existing_file(Path(canonical_train.__file__)),
         "trainer_sha256": _sha256_existing_file(Path(__file__)),
     }
     return result
 
 
-def _canonical_p10_diagnostic_descriptor_overrides(
+def _canonical_p10_diagnostic_config_binding(
+    config_path: str | Path,
+) -> dict[str, object]:
+    """Compatibility wrapper retaining the exact P10-only contract."""
+
+    binding = _canonical_parent_diagnostic_config_binding(config_path)
+    if binding.get("name") != CANONICAL_P10_DIAGNOSTIC_RECIPE_NAME:
+        raise SystemExit("canonical P10 diagnostic config identity drift")
+    return binding
+
+
+def _canonical_parent_diagnostic_descriptor_overrides(
     base_overrides: Mapping[str, object],
     normalized_effective_recipe: Mapping[str, object],
 ) -> dict[str, object]:
-    """Project only descriptor-owned fields from the complete P10 authority."""
+    """Project descriptor-owned fields from one complete canonical authority."""
 
     required_additions = (
         "forced_row_value_action_type_weights",
@@ -5882,7 +5977,7 @@ def _canonical_p10_diagnostic_descriptor_overrides(
     missing = [key for key in required if key not in normalized_effective_recipe]
     if missing:
         raise SystemExit(
-            "canonical P10 effective recipe lost descriptor fields: "
+            "canonical parent effective recipe lost descriptor fields: "
             f"{sorted(missing)}"
         )
     return {
@@ -5891,30 +5986,55 @@ def _canonical_p10_diagnostic_descriptor_overrides(
     }
 
 
-def _validate_canonical_p10_diagnostic_runtime(
+def _canonical_p10_diagnostic_descriptor_overrides(
+    base_overrides: Mapping[str, object],
+    normalized_effective_recipe: Mapping[str, object],
+) -> dict[str, object]:
+    """Compatibility wrapper for existing P10 descriptor construction."""
+
+    return _canonical_parent_diagnostic_descriptor_overrides(
+        base_overrides, normalized_effective_recipe
+    )
+
+
+def _validate_canonical_parent_diagnostic_runtime(
     args: argparse.Namespace,
     ddp: Mapping[str, int | bool],
     composite_meta: Mapping[str, object] | None,
 ) -> None:
-    """Cross-bind live argv/DDP semantics to the authenticated P10 derivative."""
+    """Cross-bind live argv/DDP semantics to a canonical parent derivative."""
 
     derivation = (
         composite_meta.get("diagnostic_derivation_authority")
         if isinstance(composite_meta, Mapping)
         else None
     )
-    binding = (
-        derivation.get("canonical_p10_config_binding")
+    binding_keys = (
+        "canonical_parent_config_binding",
+        "canonical_p10_config_binding",
+    )
+    present_binding_keys = (
+        [key for key in binding_keys if derivation.get(key) is not None]
         if isinstance(derivation, Mapping)
+        else []
+    )
+    if len(present_binding_keys) > 1:
+        raise SystemExit("canonical parent diagnostic runtime binding is ambiguous")
+    binding = (
+        derivation.get(present_binding_keys[0])
+        if isinstance(derivation, Mapping) and present_binding_keys
         else None
     )
     if binding is None:
         return
-    if not isinstance(binding, dict):
-        raise SystemExit("canonical P10 diagnostic runtime binding is malformed")
-    expected_binding = _canonical_p10_diagnostic_config_binding(
+    binding = _require_canonical_parent_diagnostic_binding_profile(
+        present_binding_keys[0], binding
+    )
+    expected_binding = _canonical_parent_diagnostic_config_binding(
         binding.get("config", "")
     )
+    if binding != expected_binding:
+        raise SystemExit("canonical parent diagnostic runtime binding drift")
     expected_runtime_authority = {
         "schema_version": "a1-canonical-parent-update-runtime-authority-v1",
         "config": expected_binding["config"],
@@ -5957,7 +6077,7 @@ def _validate_canonical_p10_diagnostic_runtime(
         or set(initializer_ref) != {"path", "sha256"}
     ):
         raise SystemExit(
-            "canonical P10 diagnostic execution requires the exact compact "
+            "canonical parent diagnostic execution requires the exact compact "
             "tools/train.py runtime and parent-initializer authorities"
         )
     try:
@@ -5966,7 +6086,7 @@ def _validate_canonical_p10_diagnostic_runtime(
         )
     except OSError as error:
         raise SystemExit(
-            f"canonical P10 diagnostic initializer cannot be resolved: {error}"
+            f"canonical parent diagnostic initializer cannot be resolved: {error}"
         ) from error
     try:
         live_parent_path = Path(
@@ -5976,7 +6096,7 @@ def _validate_canonical_p10_diagnostic_runtime(
         ).expanduser().resolve(strict=True)
     except OSError as error:
         raise SystemExit(
-            f"canonical P10 diagnostic parent cannot be resolved: {error}"
+            f"canonical parent diagnostic parent cannot be resolved: {error}"
         ) from error
     migration = initialization["information_contract_migration"]
     migration_receipt = (
@@ -5996,7 +6116,8 @@ def _validate_canonical_p10_diagnostic_runtime(
         )
     except (OSError, SystemExit) as error:
         raise SystemExit(
-            f"canonical P10 diagnostic parent-initializer replay refused: {error}"
+            "canonical parent diagnostic parent-initializer replay refused: "
+            f"{error}"
         ) from error
     if (
         replayed_initialization != initialization
@@ -6007,7 +6128,7 @@ def _validate_canonical_p10_diagnostic_runtime(
         != _sha256_existing_file(live_initializer_path)
     ):
         raise SystemExit(
-            "canonical P10 diagnostic execution requires the exact compact "
+            "canonical parent diagnostic execution requires the exact compact "
             "tools/train.py runtime and parent-initializer authorities"
         )
     expected_runtime_settings = binding["runtime_semantic_settings"]
@@ -6016,7 +6137,7 @@ def _validate_canonical_p10_diagnostic_runtime(
     ]
     if missing_runtime_settings:
         raise SystemExit(
-            "live P10 diagnostic runtime is missing catalog settings: "
+            "live canonical parent diagnostic runtime is missing catalog settings: "
             f"{missing_runtime_settings}"
         )
     observed_runtime_settings = {
@@ -6028,7 +6149,7 @@ def _validate_canonical_p10_diagnostic_runtime(
     )
     expected_topology = binding["training_topology"]
     observed_topology = {
-        "schema_version": "a1-canonical-p10-diagnostic-topology-v1",
+        "schema_version": expected_topology.get("schema_version"),
         "name": "b200-8gpu-ddp",
         "world_size": int(ddp["world_size"]),
         "local_batch_size": int(args.batch_size),
@@ -6040,15 +6161,38 @@ def _validate_canonical_p10_diagnostic_runtime(
         ),
     }
     if (
-        binding != expected_binding
-        or observed_runtime_settings != expected_runtime_settings
+        observed_runtime_settings != expected_runtime_settings
         or runtime_effective != binding["runtime_effective_recipe"]
         or observed_topology != expected_topology
     ):
         raise SystemExit(
-            "live P10 diagnostic argv/DDP semantics differ from the complete "
+            "live canonical parent diagnostic argv/DDP semantics differ from "
+            "the complete "
             "catalog-bound runtime recipe"
         )
+
+
+def _validate_canonical_p10_diagnostic_runtime(
+    args: argparse.Namespace,
+    ddp: Mapping[str, int | bool],
+    composite_meta: Mapping[str, object] | None,
+) -> None:
+    """Compatibility wrapper for existing P10 runtime callers."""
+
+    derivation = (
+        composite_meta.get("diagnostic_derivation_authority")
+        if isinstance(composite_meta, Mapping)
+        else None
+    )
+    if isinstance(derivation, Mapping):
+        present = [
+            key
+            for key in _CANONICAL_PARENT_DIAGNOSTIC_BINDING_PROFILES
+            if derivation.get(key) is not None
+        ]
+        if present and present != ["canonical_p10_config_binding"]:
+            raise SystemExit("canonical P10 diagnostic binding profile drift")
+    _validate_canonical_parent_diagnostic_runtime(args, ddp, composite_meta)
 
 
 def _preflight_flywheel_diagnostic_derivative(
@@ -6077,13 +6221,30 @@ def _preflight_flywheel_diagnostic_derivative(
         "diagnostic_only",
         "promotion_eligible",
     }
-    p10_config_binding = (
-        authority.get("canonical_p10_config_binding")
+    canonical_binding_keys = (
+        "canonical_parent_config_binding",
+        "canonical_p10_config_binding",
+    )
+    present_canonical_binding_keys = (
+        [key for key in canonical_binding_keys if authority.get(key) is not None]
         if isinstance(authority, dict)
+        else []
+    )
+    if len(present_canonical_binding_keys) > 1:
+        raise SystemExit("flywheel diagnostic derivation authority is ambiguous")
+    canonical_config_binding = (
+        authority.get(present_canonical_binding_keys[0])
+        if isinstance(authority, dict) and present_canonical_binding_keys
         else None
     )
-    if p10_config_binding is not None:
-        expected_authority_keys.add("canonical_p10_config_binding")
+    if present_canonical_binding_keys:
+        expected_authority_keys.add(present_canonical_binding_keys[0])
+        canonical_config_binding = (
+            _require_canonical_parent_diagnostic_binding_profile(
+                present_canonical_binding_keys[0],
+                canonical_config_binding,
+            )
+        )
     base_ref = authority.get("base_descriptor") if isinstance(authority, dict) else None
     semantic_delta = authority.get("semantic_delta") if isinstance(authority, dict) else None
     if (
@@ -6164,7 +6325,7 @@ def _preflight_flywheel_diagnostic_derivative(
         typed_key = "forced_row_value_action_type_weights"
         public_card_key = "public_card_lr_mult"
         surprise_key = "per_game_policy_surprise_weighting"
-        p10_extra_override_keys = {
+        canonical_parent_extra_override_keys = {
             "trunk_lr_mult",
             "policy_aux_sampling_mode",
         }
@@ -6185,7 +6346,11 @@ def _preflight_flywheel_diagnostic_derivative(
             *science_profile_keys,
             *lr_dose_keys,
             *optional_lr_dose_keys,
-            *(p10_extra_override_keys if p10_config_binding is not None else set()),
+            *(
+                canonical_parent_extra_override_keys
+                if canonical_config_binding is not None
+                else set()
+            ),
         }
         science_profile_present = bool(changed & science_profile_keys)
         science_profile_valid = True
@@ -6206,8 +6371,8 @@ def _preflight_flywheel_diagnostic_derivative(
             # A campaign descriptor carries the complete optimizer profile so
             # LR/warmup/dose can never be authenticated piecemeal.  Values are
             # the preregistered four short arms plus the selected 256-step
-            # replay. P10 is admitted only through the complete catalog/code
-            # binding below, never from an argv-inspired tuple.
+            # replay. Canonical parent arms are admitted only through the
+            # complete catalog/code binding below, never from argv.
             campaign_lr_dose_valid = (
                 lr_dose_keys.issubset(effective_overrides)
                 and not (lr_dose_keys | optional_lr_dose_keys).intersection(
@@ -6245,23 +6410,27 @@ def _preflight_flywheel_diagnostic_derivative(
                     and type(policy_aux_loss_weight) is float
                     and 0.0 < policy_aux_loss_weight <= 4.0
                 )
-            p10_lr_dose_valid = False
-            if isinstance(p10_config_binding, dict):
-                expected_p10_binding = _canonical_p10_diagnostic_config_binding(
-                    p10_config_binding.get("config", "")
+            canonical_parent_dose_valid = False
+            if isinstance(canonical_config_binding, dict):
+                expected_canonical_binding = (
+                    _canonical_parent_diagnostic_config_binding(
+                        canonical_config_binding.get("config", "")
+                    )
                 )
-                normalized = expected_p10_binding[
+                normalized = expected_canonical_binding[
                     "normalized_effective_recipe"
                 ]
-                p10_lr_dose_valid = (
-                    p10_config_binding == expected_p10_binding
+                canonical_parent_dose_valid = (
+                    canonical_config_binding == expected_canonical_binding
                     and effective_overrides
-                    == _canonical_p10_diagnostic_descriptor_overrides(
+                    == _canonical_parent_diagnostic_descriptor_overrides(
                         base_overrides,
                         normalized,
                     )
                 )
-            lr_dose_valid = campaign_lr_dose_valid or p10_lr_dose_valid
+            lr_dose_valid = (
+                campaign_lr_dose_valid or canonical_parent_dose_valid
+            )
         if (
             set(base_overrides) - set(effective_overrides)
             or set(effective_overrides) - set(base_overrides) - allowed_additions
@@ -6273,7 +6442,7 @@ def _preflight_flywheel_diagnostic_derivative(
                 *science_profile_keys,
                 *lr_dose_keys,
                 *optional_lr_dose_keys,
-                *p10_extra_override_keys,
+                *canonical_parent_extra_override_keys,
             }
             or (
                 "per_game_policy_weight" in changed
@@ -15288,7 +15457,9 @@ def main(
     # requires tools/train.py's structured canonical runtime authority and
     # independently catalog-replays that config against the live argv/DDP
     # projection. Calling train_bc directly therefore remains fail-closed.
-    _validate_canonical_p10_diagnostic_runtime(args, ddp, a1_preflight_meta)
+    _validate_canonical_parent_diagnostic_runtime(
+        args, ddp, a1_preflight_meta
+    )
     checkpoint_load_path, _authenticated_initializer_snapshot = (
         _snapshot_authenticated_production_initializer(args, a1_preflight_meta)
     )
