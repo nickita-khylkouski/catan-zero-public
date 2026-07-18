@@ -34,7 +34,7 @@ NATIVE_REQUIRED_CAPABILITIES = frozenset(
 
 DEFAULT_RECIPES = {
     "generate": "coherent-public-n128",
-    "train": "a1-current-35m-b200",
+    "train": "a1-parent-update-35m-b200",
     "evaluate": "coherent-public-n128",
 }
 PIPELINE_LAUNCHERS = {
@@ -53,7 +53,10 @@ TRAIN_ACCELERATOR_MODEL = "NVIDIA B200"
 TRAINING_SCIENCE_ADMISSION = Path("configs/production/training_science_admission.json")
 TRAINING_SCIENCE_ADMISSION_SCHEMA = "catan-zero-training-science-admission-v1"
 PRIMARY_TRAINING_EVIDENCE_SCHEMAS = frozenset(
-    {"a1-coherent-v6-b12-commissioning-evidence-v1"}
+    {
+        "a1-coherent-v6-b12-commissioning-evidence-v1",
+        "a1-parent-update-production-authorization-v1",
+    }
 )
 SUPPORTING_TRAINING_EVIDENCE_SCHEMAS = frozenset(
     {

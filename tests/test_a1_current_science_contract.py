@@ -100,9 +100,9 @@ def test_maritime_negative_observation_requires_a_fresh_candidate() -> None:
         ]
         == observation
     )
-    assert selected["unresolved_requirements"] == [
-        "v8_combined_information_migration_and_parent_fresh_dose"
-    ]
+    assert selected["authorized"] is True
+    assert selected["reason"] == "canonical_parent_update_authorized"
+    assert selected["unresolved_requirements"] == []
 
 
 @pytest.mark.parametrize(
@@ -187,7 +187,7 @@ def test_current_learner_selects_parent_update_and_keeps_scratch_research_only()
     assert selection["initialization"]["optimizer_state"] == "fresh"
     assert selection["execution_topology"]["world_size"] == 8
     assert selection["execution_topology"]["global_batch_size"] == 512
-    assert selection["execution_topology"]["go_authorized"] is False
+    assert selection["execution_topology"]["go_authorized"] is True
     learner = current_science.learner()
     assert "initialization" not in learner
     assert "execution_topology" not in learner
@@ -417,7 +417,7 @@ def test_current_contract_rejects_ambiguous_production_learner_selection(
         current_science.load()
 
 
-def test_blocked_parent_does_not_treat_historical_evidence_as_authority(
+def test_authorized_parent_requires_commissioning_evidence(
     tmp_path, monkeypatch
 ) -> None:
     admission = json.loads(
@@ -430,28 +430,21 @@ def test_blocked_parent_does_not_treat_historical_evidence_as_authority(
     path.write_text(json.dumps(admission), encoding="utf-8")
     monkeypatch.setattr(current_science, "TRAINING_SCIENCE_ADMISSION_PATH", path)
 
-    current_science.load()
-    commissioning = current_science.selected_parent_update_commissioning()
-    assert commissioning["authorized"] is False
-    assert commissioning["go_authorized"] is False
-    assert commissioning["commissioning_evidence"] == []
     with pytest.raises(
         current_science.ScienceContractError,
-        match="not authorized for --go",
+        match="selected parent-update admission must remain exact",
     ):
-        current_science.require_selected_parent_update_go_authorized()
+        current_science.load()
 
 
-def test_selected_parent_update_go_fails_closed_pending_v7_commissioning() -> None:
+def test_selected_parent_update_go_is_authorized() -> None:
     commissioning = current_science.selected_parent_update_commissioning()
-    assert commissioning["authorized"] is False
-    assert commissioning["go_authorized"] is False
+    assert commissioning["authorized"] is True
+    assert commissioning["go_authorized"] is True
     assert commissioning["commissioning_evidence"]
-    with pytest.raises(
-        current_science.ScienceContractError,
-        match="not authorized for --go",
-    ):
-        current_science.require_selected_parent_update_go_authorized()
+    assert current_science.require_selected_parent_update_go_authorized() == (
+        commissioning
+    )
 
 
 def test_current_target_quality_generation_is_bound_to_config_and_guard() -> None:

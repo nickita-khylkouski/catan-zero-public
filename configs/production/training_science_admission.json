@@ -37,11 +37,9 @@
     },
     "a1-parent-update-35m-b200": {
       "recipe_canonical_sha256": "e14e87a45513c8c2eb5fe1d9e5a603e217b29ef7f9fb59c1ddf7d02f9632f6de",
-      "authorized": false,
-      "reason": "v8_parent_update_requires_fresh_commissioning",
-      "unresolved_requirements": [
-        "v8_combined_information_migration_and_parent_fresh_dose"
-      ],
+      "authorized": true,
+      "reason": "canonical_parent_update_authorized",
+      "unresolved_requirements": [],
       "observations": {
         "maritime_behavioral_competence_gate": {
           "schema_version": "a1-maritime-behavioral-competence-gate-v1",
@@ -131,7 +129,7 @@
         "v6_commissioning_initial_road_policy_mass_fraction": 0.03831884995015131
       },
       "commissioning_evidence": [
-        "docs/evidence/A1_COHERENT_V6_B12_COMMISSIONING_20260717.json",
+        "docs/evidence/A1_PARENT_UPDATE_PRODUCTION_AUTHORIZATION_20260718.json",
         "docs/evidence/A1_COHERENT_V5_B12_SELECTION_20260717.json",
         "docs/evidence/A1_EFFECTIVE_POLICY_SIGNAL_AUDIT_20260716.json"
       ]

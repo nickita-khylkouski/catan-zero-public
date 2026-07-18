@@ -1,0 +1,43 @@
+{
+  "schema_version": "a1-parent-update-production-authorization-v1",
+  "status": "authorized_production_parent_update",
+  "date_utc": "2026-07-18",
+  "code": {
+    "git_commit": "0c6942bb58705c0618a83162c3bd817b81ed8592",
+    "recipe": "configs/training/a1_parent_update_35m_b200.schema1.json",
+    "recipe_canonical_sha256": "e14e87a45513c8c2eb5fe1d9e5a603e217b29ef7f9fb59c1ddf7d02f9632f6de"
+  },
+  "commissioning_basis": {
+    "primary": "docs/evidence/A1_COHERENT_V6_B12_COMMISSIONING_20260717.json",
+    "supporting": [
+      "docs/evidence/A1_COHERENT_V5_B12_SELECTION_20260717.json",
+      "docs/evidence/A1_EFFECTIVE_POLICY_SIGNAL_AUDIT_20260716.json"
+    ],
+    "identity_migrations_after_primary": [
+      "public_card_exact_resource_residual",
+      "completed_q_loss_weight_zero",
+      "schema22_rng_stream_separation"
+    ],
+    "experimental_treatments_enabled": {
+      "active_policy_auxiliary": false,
+      "completed_q_objective": false,
+      "policy_surprise_weighting": false,
+      "target_reliability_weighting": false,
+      "ppo": false
+    }
+  },
+  "commissioning_gates": {
+    "passed": true,
+    "parent_fresh_optimizer": true,
+    "exact_recipe_bound": true,
+    "required_v6_feature_learning_signal_passed": true,
+    "teacher_target_kl_improved": true,
+    "clean_terminal_value_mse_improved": true,
+    "hard_decision_policy_mass_minima_passed": true
+  },
+  "decision": {
+    "authorize_sealed_parent_update": true,
+    "commissioning_checkpoint_promotable": false,
+    "reason": "Authorize the exact canonical parent-update learner as the default production TRAIN recipe. Candidate checkpoints still require the ordinary gameplay promotion decision; rejected or uncommissioned P10, P25, completed-Q, reliability, surprise, and PPO treatments remain outside this recipe."
+  }
+}

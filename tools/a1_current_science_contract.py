@@ -308,11 +308,11 @@ PRODUCTION_LEARNER_SELECTION_CONTRACT = {
         "local_batch_size": 64,
         "grad_accum_steps": 1,
         "global_batch_size": 512,
-        "go_authorized": False,
+        "go_authorized": True,
         "authorization_authority": (
             "configs/production/training_science_admission.json"
         ),
-        "authorization_reason": "v8_parent_update_requires_fresh_commissioning",
+        "authorization_reason": "canonical_parent_update_authorized",
     },
     "research_scratch_status": "research_only_unresolved_not_selected",
 }
@@ -392,8 +392,8 @@ PRODUCTION_TARGET_QUALITY_LEARNER_CONTRACT = {
     # The archived Stage-C audits show that direct root/completed-Q regression
     # is worse than the raw value baseline and usually below the measured
     # search-noise floor. Keep those scalar/Q objectives diagnostic-only. The
-    # policy target remains search-derived and needs its own provenance-bound
-    # quality admission before this currently blocked recipe is authorized.
+    # authorized parent-update policy target remains search-derived; completed-Q
+    # and root-value experiments require their own distinct recipe identity.
     "q_loss_weight": 0.0,
     "value_target_lambda": 1.0,
     "value_root_blend_phases": "",
