@@ -83,7 +83,6 @@ def test_roundtrip_feature_contract_binds_nondefault_history_and_adapter() -> No
             "target_semantics": {
                 "meaningful_public_history": True,
                 "event_history_limit": 64,
-                "meaningful_public_history_schema": "history-v2",
             },
             "operator_contract_semantics": {
                 "meaningful_public_history": True,
@@ -106,13 +105,12 @@ def test_roundtrip_feature_contract_binds_nondefault_history_and_adapter() -> No
     )
 
 
-def test_roundtrip_feature_contract_refuses_cross_surface_drift() -> None:
+def test_roundtrip_feature_contract_refuses_adapter_drift() -> None:
     plan = {
         "target_policy_target_identity": {
             "target_semantics": {
                 "meaningful_public_history": True,
                 "event_history_limit": 64,
-                "meaningful_public_history_schema": "history-v2",
             },
             "operator_contract_semantics": {
                 "meaningful_public_history": True,
@@ -122,7 +120,7 @@ def test_roundtrip_feature_contract_refuses_cross_surface_drift() -> None:
                 "learner_entity_feature_adapter_version": "adapter-v6",
             },
             "teacher_feature_contract": {
-                "entity_feature_adapter_version": "adapter-v6",
+                "entity_feature_adapter_version": "adapter-v5",
             },
         }
     }

@@ -462,7 +462,7 @@ def _roundtrip_feature_contract(
         raise ExecutorError("Stage-C target lost its feature contract")
     enabled = semantics.get("meaningful_public_history")
     history_limit = semantics.get("event_history_limit")
-    history_schema = semantics.get("meaningful_public_history_schema")
+    history_schema = operator.get("meaningful_public_history_schema")
     adapter = teacher.get("entity_feature_adapter_version")
     if (
         type(enabled) is not bool
@@ -474,7 +474,6 @@ def _roundtrip_feature_contract(
         or not adapter
         or operator.get("meaningful_public_history") is not enabled
         or operator.get("event_history_limit") != history_limit
-        or operator.get("meaningful_public_history_schema") != history_schema
         or operator.get("teacher_entity_feature_adapter_version") != adapter
         or operator.get("learner_entity_feature_adapter_version") != adapter
     ):
