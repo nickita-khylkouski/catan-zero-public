@@ -6048,11 +6048,14 @@ def _validate_canonical_parent_diagnostic_runtime(
     )
     if binding != expected_binding:
         raise SystemExit("canonical parent diagnostic runtime binding drift")
+    selected_production_recipe = expected_binding.get("name") == (
+        "a1-parent-update-35m-b200"
+    )
     expected_runtime_authority = {
         "schema_version": "a1-canonical-parent-update-runtime-authority-v1",
         "config": expected_binding["config"],
         "config_file_sha256": expected_binding["config_file_sha256"],
-        "diagnostic_only": True,
+        "diagnostic_only": not selected_production_recipe,
         "promotion_eligible": False,
     }
     runtime_authority = getattr(
@@ -13082,6 +13085,14 @@ def _validate_a1_learner_training_recipe(
             projected_effective["policy_kl_anchor_direction"] = str(
                 getattr(projected_args, "policy_kl_anchor_direction", "forward")
             )
+        try:
+            selected_production_config = (
+                canonical_train.current_science.require_selected_parent_update(
+                    config_path
+                )
+            )
+        except canonical_train.current_science.ScienceContractError:
+            selected_production_config = None
         if (
             not isinstance(canonical_parent_authority, dict)
             or set(canonical_parent_authority) != expected_authority_fields
@@ -13090,7 +13101,8 @@ def _validate_a1_learner_training_recipe(
             or str(config_path) != canonical_parent_authority.get("config")
             or _sha256_existing_file(config_path)
             != canonical_parent_authority.get("config_file_sha256")
-            or canonical_parent_authority.get("diagnostic_only") is not True
+            or canonical_parent_authority.get("diagnostic_only")
+            is not (selected_production_config is None)
             or canonical_parent_authority.get("promotion_eligible") is not False
             or projected_effective != effective
         ):

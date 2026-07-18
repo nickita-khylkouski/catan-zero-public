@@ -41,6 +41,7 @@ from catan_zero.production_contracts import (  # noqa: E402
     ProductionContractError,
     training_initialization_mode,
 )
+from tools import a1_current_science_contract as current_science  # noqa: E402
 
 
 CANONICAL_TRAIN_LAUNCH_SCHEMA = 1
@@ -728,11 +729,10 @@ def _bind_parent_report(
     initialization: Mapping[str, Any],
     canonical_authority: Mapping[str, Any],
 ) -> None:
-    """Stamp diagnostic canonical runs with exact lineage, never eligibility.
+    """Stamp canonical parent updates with exact lineage, never auto-promotion.
 
     Promotion requires the sealed receipt emitted by ``a1_one_dose_train.py``;
-    this report binding makes standalone commissioning scientifically legible
-    without creating a second promotion receipt format.
+    direct production training remains distinct from passing the strength gates.
     """
 
     from tools import a1_lineage_dose as lineage
@@ -794,11 +794,7 @@ def _bind_parent_report(
     payload["a1_parent_update_initialization"] = dict(initialization)
     payload["a1_canonical_parent_update_authority"] = dict(canonical_authority)
     payload["promotion_eligible"] = False
-    payload["promotion_block_reason"] = (
-        "information_contract_migration_uncommissioned"
-        if initialization.get("mode") == "information_contract_migration"
-        else "requires_sealed_a1_one_dose_execution_receipt"
-    )
+    payload["promotion_block_reason"] = "requires_candidate_strength_gates"
     temporary = path.with_name(f".{path.name}.tmp.{os.getpid()}.{time.time_ns()}")
     try:
         with temporary.open("x", encoding="utf-8") as handle:
@@ -825,6 +821,21 @@ def main(argv: Sequence[str] | None = None) -> None:
             "that same command with --go only after the plan is commissioned."
         )
     _require_production_hard_decision_policy_mass_contract(engine_settings)
+    config_path = Path(str(public_args.config)).expanduser().resolve(strict=True)
+    is_selected_parent_recipe = (
+        config_path == current_science.CANONICAL_PARENT_UPDATE_CONFIG_PATH.resolve()
+    )
+    if is_selected_parent_recipe:
+        selected_parent_config = current_science.require_selected_parent_update(
+            config_path
+        )
+    else:
+        selected_parent_config = None
+    if selected_parent_config is not None:
+        try:
+            current_science.require_selected_parent_update_go_authorized()
+        except current_science.ScienceContractError as error:
+            raise SystemExit(str(error)) from error
     initialization = _parent_initializer_binding(public_args)
     engine_args = _engine_namespace(
         config=config,
@@ -836,12 +847,11 @@ def main(argv: Sequence[str] | None = None) -> None:
     # distinguish a function-preserving architecture expansion from candidate
     # chaining. This is an internal attribute, not a public bypass flag.
     engine_args.a1_parent_update_initialization = initialization
-    config_path = Path(str(public_args.config)).expanduser().resolve(strict=True)
     engine_args.a1_canonical_parent_update_authority = {
         "schema_version": "a1-canonical-parent-update-runtime-authority-v1",
         "config": str(config_path),
         "config_file_sha256": _sha256(config_path),
-        "diagnostic_only": True,
+        "diagnostic_only": selected_parent_config is None,
         "promotion_eligible": False,
     }
     from tools import train_bc

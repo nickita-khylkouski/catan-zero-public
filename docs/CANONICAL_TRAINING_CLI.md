@@ -63,12 +63,14 @@ Inspect and commission that exact plan, then rerun the same command with
 `--go`. Do not add `--go` to an unreviewed plan and do not invoke
 `tools/train.py` directly for this recipe.
 
-The independently commissioned split1 FULL parent update is launched with the
-separate parent recipe and an exact parent checkpoint:
+The authorized split1 parent update is launched directly with the thin
+eight-GPU topology adapter below. The adapter accepts one homogeneous 8×H100 or
+8×B200 host while preserving the commissioned 8×64 global batch and exact
+dose. This is the production execution path; it is not a diagnostic arm and
+does not require the one-dose dry-run authority:
 
 ```bash
-torchrun --standalone --nproc-per-node=8 tools/train.py \
-  --config configs/training/a1_parent_update_35m_b200.schema1.json \
+python tools/a1_train_parent_update.py \
   --data /path/to/authenticated_memmap_or_composite.json \
   --parent-checkpoint /path/to/exact-incumbent-parent.pt \
   --init-checkpoint /path/to/reviewed-information-contract-initializer.pt \
@@ -77,11 +79,15 @@ torchrun --standalone --nproc-per-node=8 tools/train.py \
   --report /path/to/report.json
 ```
 
+The adapter verifies the live authorization and exact eight-H100/B200 inventory,
+then replaces itself with `torch.distributed.run`. It does not contain a second
+trainer or expose any science overrides.
+
 If the initializer bytes are identical to the parent, omit the migration
 receipt. If they differ, the receipt is mandatory and must connect those exact
 checkpoint identities.
 
-That recipe reproduces the commissioned 8×64 global batch, fresh AdamW,
+That one command reproduces the authorized 8×64 global batch, fresh AdamW,
 12-step exact dose, flat `6e-5` learning rate with 16 warmup steps, scaled
 value-to-shared-trunk routing, split1 value topology, and authenticated coherent
 teacher semantics. It retains model-only review snapshots at steps 8 and 10;

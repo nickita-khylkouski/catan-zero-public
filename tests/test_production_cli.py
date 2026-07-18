@@ -276,21 +276,22 @@ def test_authorized_training_evidence_rejects_support_only_and_unsafe_paths(
         )
 
 
-def test_status_exposes_v7_parent_and_scratch_as_fail_closed() -> None:
+def test_status_exposes_parent_update_ready_and_scratch_fail_closed() -> None:
     status = production_status(ROOT)
 
     assert status["supported_operator_interface"] == "catan-zero"
     assert status["pipelines"]["generate"]["authorized"] is True
     assert status["pipelines"]["evaluate"]["authorized"] is True
     train = status["pipelines"]["train"]
-    assert train["authorized"] is False
+    assert train["authorized"] is True
+    assert train["status"] == "ready"
     assert train["reason"] == "recipe_specific_authorization"
     assert train["recipes"]["a1-current-35m-b200"]["authorized"] is False
     parent = train["recipes"]["a1-parent-update-35m-b200"]
-    assert parent["authorized"] is False
-    assert parent["status"] == "blocked"
-    assert parent["reason"] == ("v8_parent_update_requires_fresh_commissioning")
-    assert len(parent["unresolved_requirements"]) == 1
+    assert parent["authorized"] is True
+    assert parent["status"] == "ready"
+    assert parent["reason"] == "canonical_parent_update_authorized"
+    assert parent["unresolved_requirements"] == []
     shared_action = train["recipes"]["a1-parent-update-shared-action25-35m-b200"]
     assert shared_action["authorized"] is False
     assert shared_action["status"] == "blocked"
@@ -332,8 +333,8 @@ def test_status_exposes_v7_parent_and_scratch_as_fail_closed() -> None:
         entry["name"] for entry in contracts.production_recipes("train")
     }
     assert all(
-        readiness["authorized"] is False
-        for readiness in train["recipes"].values()
+        readiness["authorized"] is (name == "a1-parent-update-35m-b200")
+        for name, readiness in train["recipes"].items()
     )
     assert status["pipelines"]["ppo"]["authorized"] is False
 
@@ -484,14 +485,16 @@ def test_other_pipelines_resolve_through_compact_launchers(
         if entry["name"] != "a1-current-35m-b200"
     ],
 )
-def test_cataloged_parent_update_uses_exact_blocked_recipe_and_parent(
+def test_cataloged_parent_update_uses_exact_recipe_and_parent(
     tmp_path: Path, recipe: str
 ) -> None:
     plan = cli.build_plan(
         _write_job(tmp_path, "train", recipe=recipe)
     )
 
-    assert plan["readiness"]["authorized"] is False
+    assert plan["readiness"]["authorized"] is (
+        recipe == "a1-parent-update-35m-b200"
+    )
     assert plan["contract"]["recipe"] == recipe
     assert str((ROOT / "tools/train.py").resolve()) in plan["command"]
     assert "--init-checkpoint" in plan["command"]
@@ -582,8 +585,8 @@ def test_training_science_admission_keeps_v5_quarantine_after_v6_commissioning()
         expected_adapter in requirement
         for requirement in scratch["unresolved_requirements"]
     )
-    assert parent["authorized"] is False
-    assert len(parent["unresolved_requirements"]) == 1
+    assert parent["authorized"] is True
+    assert parent["unresolved_requirements"] == []
 
     for admission in (scratch, parent):
         observations = admission["observations"]
@@ -1334,7 +1337,7 @@ def _parent_update_admissible_report(
             "schema_version": "a1-canonical-parent-update-runtime-authority-v1",
             "config": str(config_path.resolve()),
             "config_file_sha256": f"sha256:{cli._file_sha256(config_path)}",  # noqa: SLF001
-            "diagnostic_only": True,
+            "diagnostic_only": False,
             "promotion_eligible": False,
         },
         "optimizer_lr_dose": {

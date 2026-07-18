@@ -160,7 +160,7 @@ def test_parent_report_retains_canonical_launch_authority(tmp_path) -> None:
         "schema_version": "a1-canonical-parent-update-runtime-authority-v1",
         "config": str(PARENT_RECIPE),
         "config_file_sha256": "sha256:" + ("b" * 64),
-        "diagnostic_only": True,
+        "diagnostic_only": False,
         "promotion_eligible": False,
     }
 
@@ -229,7 +229,7 @@ def test_parent_report_refuses_inconsistent_objective_counters(
                 "initializer": {"sha256": checkpoint_sha},
                 "information_contract_migration": None,
             },
-            canonical_authority={"diagnostic_only": True},
+            canonical_authority={"diagnostic_only": False},
         )
 
 
@@ -238,7 +238,7 @@ def test_parent_report_refuses_inconsistent_objective_counters(
     (
         ("a1_lineage_dose", {"forged": True}),
         ("a1_parent_update_initialization", {"mode": "other"}),
-        ("a1_canonical_parent_update_authority", {"diagnostic_only": False}),
+        ("a1_canonical_parent_update_authority", {"diagnostic_only": True}),
         ("promotion_eligible", True),
     ),
 )
@@ -279,7 +279,7 @@ def test_parent_report_refuses_conflicting_child_provenance(
                 "initializer": {"sha256": checkpoint_sha},
                 "information_contract_migration": None,
             },
-            canonical_authority={"diagnostic_only": True},
+            canonical_authority={"diagnostic_only": False},
         )
 
 

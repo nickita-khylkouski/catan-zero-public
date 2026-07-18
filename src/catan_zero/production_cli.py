@@ -1161,7 +1161,7 @@ def _require_parent_echoes(
         "schema_version": "a1-canonical-parent-update-runtime-authority-v1",
         "config": engine["_config_path"],
         "config_file_sha256": f"sha256:{engine['_config_file_sha256']}",
-        "diagnostic_only": True,
+        "diagnostic_only": False,
         "promotion_eligible": False,
     }:
         raise ProductionCLIError("parent-update report lost canonical config authority")
