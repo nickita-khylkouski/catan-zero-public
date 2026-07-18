@@ -42,7 +42,6 @@ for root in (REPO_ROOT, REPO_ROOT / "tools"):
     if str(root) not in sys.path:
         sys.path.insert(0, str(root))
 
-from tools import a1_b200_active_policy_campaign as active_campaign  # noqa: E402
 from tools import a1_post_wave_stage_c_admission as post_wave_admission  # noqa: E402
 from tools import a1_stage_c_reanalysis_executor as stage_c  # noqa: E402
 from tools import a1_stage_c_teacher_alignment as alignment  # noqa: E402
@@ -481,22 +480,25 @@ def _load_base_admission(
 
     candidate_path, candidate = _load_json(path, where="Stage-C base admission")
     schema = candidate.get("schema_version")
-    try:
-        if schema == LEGACY_ADMISSION_SCHEMA:
+    if schema == LEGACY_ADMISSION_SCHEMA:
+        # Import the legacy verifier only for legacy payloads. Importing it at
+        # module load creates a cycle through one-dose/final-replication back to
+        # this overlay before the campaign has defined its schema constants.
+        from tools import a1_b200_active_policy_campaign as active_campaign
+
+        try:
             resolved, admission = active_campaign._load_admission(  # noqa: SLF001
                 candidate_path
             )
-        elif schema == post_wave_admission.ADMISSION_SCHEMA:
+        except active_campaign.CampaignError as error:
+            raise OverlayError(f"Stage-C base admission refused: {error}") from error
+    elif schema == post_wave_admission.ADMISSION_SCHEMA:
+        try:
             resolved, admission = post_wave_admission.verify_admission(candidate_path)
-        else:
-            raise OverlayError(
-                f"unsupported Stage-C base admission schema: {schema!r}"
-            )
-    except (
-        active_campaign.CampaignError,
-        post_wave_admission.AdmissionError,
-    ) as error:
-        raise OverlayError(f"Stage-C base admission refused: {error}") from error
+        except post_wave_admission.AdmissionError as error:
+            raise OverlayError(f"Stage-C base admission refused: {error}") from error
+    else:
+        raise OverlayError(f"unsupported Stage-C base admission schema: {schema!r}")
     return resolved, admission, _source_policy_semantics(admission)
 
 
