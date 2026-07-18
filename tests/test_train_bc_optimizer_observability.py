@@ -157,8 +157,15 @@ def test_max_grad_norm_two_and_explicit_off_have_distinct_semantics() -> None:
     assert pre_clip.item() == pytest.approx(3.0)
     assert clipped_policy.model.weight.grad.item() == pytest.approx(2.0)
     assert clipped["pre_clip_total_grad_norm"] == pytest.approx(3.0)
+    assert clipped["post_clip_total_grad_norm"] == pytest.approx(2.0)
+    assert clipped["global_grad_clip_coefficient"] == pytest.approx(2.0 / 3.0)
     assert clipped["max_grad_norm"] == pytest.approx(2.0)
     assert clipped["gradient_clipping_enabled"] is True
+    assert (
+        clipped["gradient_clip_scope"]
+        == "all_trainable_parameters_one_global_norm"
+    )
+    assert clipped["gradient_clip_preserves_combined_direction"] is True
     assert clipped["clipped"] is True
 
     off_policy = policy_with_grad()
@@ -166,6 +173,8 @@ def test_max_grad_norm_two_and_explicit_off_have_distinct_semantics() -> None:
     off = train_bc._optimizer_clip_observability(pre_clip, max_grad_norm=0.0)
     assert pre_clip.item() == pytest.approx(3.0)
     assert off_policy.model.weight.grad.item() == pytest.approx(3.0)
+    assert off["post_clip_total_grad_norm"] == pytest.approx(3.0)
+    assert off["global_grad_clip_coefficient"] == pytest.approx(1.0)
     assert off["gradient_clipping_enabled"] is False
     assert off["clipped"] is False
 
@@ -197,6 +206,10 @@ def test_optimizer_observability_reports_preclip_norm_clip_and_module_updates() 
     )
 
     assert observed["pre_clip_total_grad_norm"] == pytest.approx(expected_total)
+    assert observed["post_clip_total_grad_norm"] == pytest.approx(1.0)
+    assert observed["global_grad_clip_coefficient"] == pytest.approx(
+        1.0 / expected_total
+    )
     assert observed["max_grad_norm"] == pytest.approx(1.0)
     assert observed["clipped"] is True
     assert observed["module_norm_scope"] == "global_replicated"
@@ -546,6 +559,7 @@ def test_checkpoint_dose_telemetry_binds_exposure_and_feature_paths() -> None:
         train_diagnostic_cadence_batches=8,
         public_card_enabled=True,
         meaningful_history_enabled=True,
+        max_grad_norm=1.0,
     )
 
     assert dose["schema_version"] == train_bc.CHECKPOINT_DOSE_TELEMETRY_SCHEMA
@@ -562,6 +576,20 @@ def test_checkpoint_dose_telemetry_binds_exposure_and_feature_paths() -> None:
         "aux_denominator": 9.0,
     }
     assert dose["optimizer"]["clipped_fraction"] == pytest.approx(0.25)
+    assert dose["optimizer"]["max_grad_norm"] == pytest.approx(1.0)
+    assert dose["optimizer"]["gradient_clipping_enabled"] is True
+    assert (
+        dose["optimizer"]["gradient_clip_scope"]
+        == "all_trainable_parameters_one_global_norm"
+    )
+    assert (
+        dose["optimizer"]["minimum_observed_global_grad_clip_coefficient"]
+        == pytest.approx(1.0)
+    )
+    assert dose["optimizer"]["cross_objective_coupling"] == (
+        "policy_value_and_private_tower_gradients_share_the_same_per_step_"
+        "global_clip_coefficient"
+    )
     assert dose["policy_objective_dose"]["interpretation"] == {
         "schema_version": "policy-dose-clipping-interpretation-v1",
         "raw_exposure_authority": "training_row_draws_and_active_rows",
@@ -573,6 +601,14 @@ def test_checkpoint_dose_telemetry_binds_exposure_and_feature_paths() -> None:
         "realized_update_amplitude_status": "partially_clip_limited",
         "realized_update_amplitude_semantics": (
             "global_grad_clip_limited_on_a_subset_of_observed_steps"
+        ),
+        "clip_scope": "all_trainable_parameters_one_global_norm",
+        "clip_transform": (
+            "one_uniform_scalar_preserves_combined_gradient_direction"
+        ),
+        "cross_objective_coupling": (
+            "a_policy_dominated_global_norm_scales_value_and_private_tower_"
+            "gradients_by_the_same_clip_coefficient"
         ),
         "optimizer_observed_steps": 8,
         "optimizer_clipped_steps": 2,

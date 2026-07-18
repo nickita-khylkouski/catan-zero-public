@@ -3288,6 +3288,12 @@ def _policy_dose_clipping_interpretation(
         ),
         "realized_update_amplitude_status": status,
         "realized_update_amplitude_semantics": amplitude,
+        "clip_scope": "all_trainable_parameters_one_global_norm",
+        "clip_transform": "one_uniform_scalar_preserves_combined_gradient_direction",
+        "cross_objective_coupling": (
+            "a_policy_dominated_global_norm_scales_value_and_private_tower_"
+            "gradients_by_the_same_clip_coefficient"
+        ),
         "optimizer_observed_steps": observed,
         "optimizer_clipped_steps": clipped,
         "clipped_fraction": fraction,
@@ -20674,6 +20680,7 @@ def main(
                     meaningful_history_enabled=bool(
                         args.meaningful_public_history
                     ),
+                    max_grad_norm=float(args.max_grad_norm),
                     v7_compatibility_inputs_enabled=bool(
                         getattr(
                             policy.config,
@@ -22464,6 +22471,7 @@ def main(
             ),
             public_card_enabled=bool(args.public_card_count_features),
             meaningful_history_enabled=bool(args.meaningful_public_history),
+            max_grad_norm=float(args.max_grad_norm),
             v7_compatibility_inputs_enabled=bool(
                 getattr(
                     policy.config,
@@ -36686,14 +36694,11 @@ def _finish_optimizer_observability(
     else:
         total_norm = float(pre_clip_total_grad_norm)
     delta_norms = _norms_from_squared_sums(delta_squared_sums)
-    return {
-        "pre_clip_total_grad_norm": total_norm,
-        "max_grad_norm": float(max_grad_norm),
-        "gradient_clipping_enabled": bool(max_grad_norm > 0.0),
-        "clipped": bool(
-            max_grad_norm > 0.0
-            and (not math.isfinite(total_norm) or total_norm > max_grad_norm)
-        ),
+    result = _optimizer_clip_observability(
+        total_norm,
+        max_grad_norm=max_grad_norm,
+    )
+    result.update({
         "module_pre_clip_grad_norms": state["module_pre_clip_grad_norms"],
         "module_parameter_delta_norms": delta_norms,
         "module_parameter_update_rms": {
@@ -36712,7 +36717,8 @@ def _finish_optimizer_observability(
         },
         "module_parameter_counts": state["module_parameter_counts"],
         "module_norm_scope": state["module_norm_scope"],
-    }
+    })
+    return result
 
 
 def _suppress_inactive_policy_only_gradients(
@@ -36816,10 +36822,31 @@ def _optimizer_clip_observability(
     else:
         total_norm = float(pre_clip_total_grad_norm)
     enabled = bool(max_grad_norm > 0.0)
+    # torch.nn.utils.clip_grad_norm_ uses max_norm / (total_norm + 1e-6),
+    # clamped to at most one, as one global multiplier for every trainable
+    # gradient. Record that scalar explicitly: merely reporting ``clipped``
+    # hides how strongly a policy-dominated total norm also attenuated
+    # value-only/private-tower gradients before Adam.
+    clip_coefficient = (
+        min(1.0, float(max_grad_norm) / (total_norm + 1.0e-6))
+        if enabled and math.isfinite(total_norm)
+        else 1.0
+        if not enabled and math.isfinite(total_norm)
+        else None
+    )
+    post_clip_total_norm = (
+        total_norm * clip_coefficient
+        if clip_coefficient is not None
+        else None
+    )
     return {
         "pre_clip_total_grad_norm": total_norm,
+        "post_clip_total_grad_norm": post_clip_total_norm,
+        "global_grad_clip_coefficient": clip_coefficient,
         "max_grad_norm": float(max_grad_norm),
         "gradient_clipping_enabled": enabled,
+        "gradient_clip_scope": "all_trainable_parameters_one_global_norm",
+        "gradient_clip_preserves_combined_direction": True,
         "clipped": bool(
             enabled
             and (not math.isfinite(total_norm) or total_norm > max_grad_norm)
@@ -46587,6 +46614,7 @@ def _checkpoint_dose_telemetry(
     public_card_enabled: bool,
     meaningful_history_enabled: bool,
     v7_compatibility_inputs_enabled: bool = False,
+    max_grad_norm: float | None = None,
 ) -> dict[str, object]:
     """Build the exact cumulative learning dose at one saved checkpoint.
 
@@ -46876,6 +46904,29 @@ def _checkpoint_dose_telemetry(
             optimizer_clipped_steps=optimizer_clipped_steps,
         )
     )
+    optimizer_clip_summary: dict[str, object] = {}
+    if max_grad_norm is not None:
+        threshold = _validate_max_grad_norm(max_grad_norm)
+        optimizer_clip_summary = {
+            "max_grad_norm": threshold,
+            "gradient_clipping_enabled": bool(threshold > 0.0),
+            "gradient_clip_scope": (
+                "all_trainable_parameters_one_global_norm"
+            ),
+            "gradient_clip_preserves_combined_direction": True,
+            "minimum_observed_global_grad_clip_coefficient": (
+                _optimizer_clip_observability(
+                    optimizer_pre_clip_grad_norm_max,
+                    max_grad_norm=threshold,
+                )["global_grad_clip_coefficient"]
+                if observed_steps > 0
+                else None
+            ),
+            "cross_objective_coupling": (
+                "policy_value_and_private_tower_gradients_share_the_same_"
+                "per_step_global_clip_coefficient"
+            ),
+        }
     return {
         "schema_version": CHECKPOINT_DOSE_TELEMETRY_SCHEMA,
         "optimizer_step": int(optimizer_step),
@@ -46895,6 +46946,7 @@ def _checkpoint_dose_telemetry(
         "policy_stream_objective": policy_stream_objective,
         "objective_effective_weight_sums": denominators,
         "optimizer": {
+            **optimizer_clip_summary,
             "observed_steps": observed_steps,
             "clipped_steps": int(optimizer_clipped_steps),
             "clipped_fraction": (
