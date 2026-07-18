@@ -1459,14 +1459,26 @@ def _one_dose_command(plan: Mapping[str, Any]) -> list[str]:
     ]
 
 
-def _plan(args: argparse.Namespace) -> dict[str, Any]:
+def _load_overlay_admission(path: Path) -> tuple[dict[str, Any], Path, dict[str, Any]]:
+    """Use the overlay verifier as the sole admission-schema authority."""
+
     try:
-        overlay_evidence = overlay.verify_overlay_admission(args.overlay_admission)
-        admission_path, admission = stage_a._load_admission(  # noqa: SLF001
-            args.overlay_admission
-        )
-    except (overlay.OverlayError, stage_a.CampaignError) as error:
+        evidence = overlay.verify_overlay_admission(path)
+        admission_path = Path(str(evidence["path"])).resolve(strict=True)
+        admission = evidence["admission"]
+        if not isinstance(admission, dict):
+            raise overlay.OverlayError(
+                "Stage-C overlay verifier lost its derived admission"
+            )
+    except (KeyError, OSError, overlay.OverlayError) as error:
         raise CampaignError(f"Stage-C overlay admission refused: {error}") from error
+    return evidence, admission_path, admission
+
+
+def _plan(args: argparse.Namespace) -> dict[str, Any]:
+    overlay_evidence, admission_path, admission = _load_overlay_admission(
+        args.overlay_admission
+    )
     corpus = admission["corpus"]
     arm = str(args.arm)
     sampling = overlay_evidence["receipt"].get("sampling_distribution")

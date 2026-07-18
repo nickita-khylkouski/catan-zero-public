@@ -1983,6 +1983,55 @@ def _verify_coherent_search_evidence_memmap(
         )
 
 
+def _coherent_admission_population_authority(
+    payload: Mapping[str, Any],
+    *,
+    overlay_evidence: Mapping[str, Any] | None,
+) -> dict[str, int]:
+    """Return authenticated game/root counts for legacy or Stage-C overlays."""
+
+    corpus = payload.get("corpus")
+    policy = payload.get("policy_distillation_contract")
+    if not isinstance(corpus, Mapping) or not isinstance(policy, Mapping):
+        raise ExecutorError("coherent corpus admission sections are malformed")
+    try:
+        selected_games = int(corpus.get("selected_games", -1))
+        selected_policy_roots = int(policy.get("policy_active_rows", -1))
+    except (TypeError, ValueError) as error:
+        raise ExecutorError("coherent corpus admission counts are malformed") from error
+    if overlay_evidence is None:
+        # This is the original diagnostic corpus contract. Keep its exact
+        # historical population invariant rather than generalizing it.
+        if (
+            payload.get("schema_version")
+            != "a1-coherent-n128-corpus-admission-v1"
+            or selected_games != 8_192
+        ):
+            raise ExecutorError("legacy coherent corpus population drifted")
+    else:
+        overlay_payload = overlay_evidence.get("admission")
+        receipt = overlay_evidence.get("receipt")
+        if (
+            overlay_payload != payload
+            or not isinstance(receipt, Mapping)
+            or selected_games <= 0
+            or selected_policy_roots <= 0
+            or int(receipt.get("projection", {}).get("selected_rows", -1))
+            != selected_policy_roots
+            or int(
+                payload.get("stage_c_policy_overlay", {}).get(
+                    "selected_policy_rows", -1
+                )
+            )
+            != selected_policy_roots
+        ):
+            raise ExecutorError("Stage-C overlay game/root authority drifted")
+    return {
+        "selected_games": selected_games,
+        "selected_policy_roots": selected_policy_roots,
+    }
+
+
 def _verify_coherent_direct_training_inputs(
     *,
     admission_path: Path,
@@ -2009,6 +2058,7 @@ def _verify_coherent_direct_training_inputs(
     if not isinstance(payload, dict):
         raise ExecutorError("coherent corpus admission must be a JSON object")
     final_admission: dict[str, Any] | None = None
+    overlay_evidence: dict[str, Any] | None = None
     if payload.get("schema_version") == stage_c_final.FINAL_CORPUS_ADMISSION_SCHEMA:
         try:
             verified_final = stage_c_final.verify_final_corpus_admission(
@@ -2025,10 +2075,30 @@ def _verify_coherent_direct_training_inputs(
                 "Stage-C final admission lost its low-level coherent corpus"
             )
         payload = coherent_payload
+    elif isinstance(payload.get("stage_c_policy_overlay"), dict):
+        try:
+            overlay_evidence = stage_c_final.overlay.verify_overlay_admission(
+                admission_path
+            )
+        except stage_c_final.overlay.OverlayError as error:
+            raise ExecutorError(
+                f"Stage-C overlay admission refused: {error}"
+            ) from error
+        verified_overlay = overlay_evidence.get("admission")
+        if not isinstance(verified_overlay, dict):
+            raise ExecutorError("Stage-C overlay verifier lost its admission")
+        payload = copy.deepcopy(verified_overlay)
     unsigned = dict(payload)
     stated = unsigned.pop("admission_sha256", None)
+    accepted_schema = (
+        payload.get("schema_version")
+        in stage_c_final.overlay.SUPPORTED_BASE_ADMISSION_SCHEMAS
+        if overlay_evidence is not None
+        else payload.get("schema_version")
+        == "a1-coherent-n128-corpus-admission-v1"
+    )
     if (
-        payload.get("schema_version") != "a1-coherent-n128-corpus-admission-v1"
+        not accepted_schema
         or payload.get("status") != "admitted_for_diagnostic_policy_distillation"
         or payload.get("diagnostic_only") is not True
         or payload.get("promotion_eligible") is not False
@@ -2040,6 +2110,9 @@ def _verify_coherent_direct_training_inputs(
     contract = payload.get("contract")
     if not all(isinstance(value, dict) for value in (corpus, policy, contract)):
         raise ExecutorError("coherent corpus admission sections are malformed")
+    population = _coherent_admission_population_authority(
+        payload, overlay_evidence=overlay_evidence
+    )
     search_evidence_schema = corpus.get("search_evidence_schema")
     producer = _producer(lock)
     if (
@@ -2050,7 +2123,7 @@ def _verify_coherent_direct_training_inputs(
         .resolve(strict=True)
         != validation_path
         or corpus.get("producer_checkpoint_sha256") != producer.get("sha256")
-        or corpus.get("selected_games") != 8_192
+        or int(corpus.get("selected_games", -1)) != population["selected_games"]
         or not isinstance(corpus.get("selected_game_seed_set_sha256"), str)
         or corpus.get("target_information_regime") != "public_belief_single_tree_v1"
         or search_evidence_schema not in SUPPORTED_SEARCH_EVIDENCE_SCHEMAS
@@ -2091,8 +2164,25 @@ def _verify_coherent_direct_training_inputs(
         raise ExecutorError(
             f"coherent corpus bytes/holdout refused: {error}"
         ) from error
+    post_wave_overlay = (
+        overlay_evidence is not None
+        and payload.get("schema_version")
+        == stage_c_final.overlay.post_wave_admission.ADMISSION_SCHEMA
+    )
+    validation_contract_matches = (
+        (
+            validation.get("manifest_sha256")
+            == payload.get("post_wave_evidence", {}).get(
+                "validation_manifest_sha256"
+            )
+            and validation.get("file_sha256")
+            == corpus.get("validation_manifest", {}).get("file_sha256")
+        )
+        if post_wave_overlay
+        else validation["a1_contract_sha256"] == contract.get("contract_sha256")
+    )
     if (
-        validation["a1_contract_sha256"] != contract.get("contract_sha256")
+        not validation_contract_matches
         or validation["file_sha256"] != corpus["validation_manifest"]["file_sha256"]
     ):
         raise ExecutorError("coherent holdout binds a different target contract")
@@ -2124,6 +2214,18 @@ def _verify_coherent_direct_training_inputs(
         raise ExecutorError("coherent holdout row count differs from actual memmap")
     training_seeds = selected[~np.isin(selected, validation_seeds)]
     training_row_count = int(observed.size) - validation_row_count
+    if overlay_evidence is not None:
+        policy_weight = np.asarray(
+            data["policy_weight_multiplier"], dtype=np.float32
+        ).reshape(-1)
+        if (
+            policy_weight.shape != observed.shape
+            or int(np.count_nonzero(policy_weight > 0.0))
+            != population["selected_policy_roots"]
+        ):
+            raise ExecutorError(
+                "Stage-C overlay policy-active root count differs from corpus"
+            )
     selected_sha = train_bc._game_seed_set_sha256(selected)  # noqa: SLF001
     training_sha = train_bc._game_seed_set_sha256(training_seeds)  # noqa: SLF001
     corpus_binding = {
@@ -2131,8 +2233,9 @@ def _verify_coherent_direct_training_inputs(
         "corpus_meta_file_sha256": _file_sha256(meta_path),
         "payload_inventory_sha256": meta["payload_inventory_sha256"],
         "selected_game_count": int(selected.size),
-        "seed_start": int(corpus["seed_start"]),
-        "seed_end": int(corpus["seed_end"]),
+        "selected_policy_root_count": population["selected_policy_roots"],
+        "seed_start": int(corpus.get("seed_start", selected.min())),
+        "seed_end": int(corpus.get("seed_end", selected.max() + 1)),
         "selected_game_seed_set_sha256": selected_sha,
         "training_game_count": int(training_seeds.size),
         "training_game_seed_set_sha256": training_sha,
@@ -2159,7 +2262,7 @@ def _verify_coherent_direct_training_inputs(
                 else stated
             ),
         },
-        "target_contract_sha256": contract["contract_sha256"],
+        "target_contract_sha256": validation["a1_contract_sha256"],
         "producer_checkpoint_sha256": producer["sha256"],
         # Filled only after the independently authorized f7 architecture
         # upgrade is replayed.  Keeping the slot in the first binding makes the
@@ -2188,7 +2291,7 @@ def _verify_coherent_direct_training_inputs(
         "lock_file_sha256": _file_sha256(lock_path),
         "reviewed_lock_file_sha256": reviewed_lock_file_sha256,
         "lock_verifier_authority": lock_verifier_authority,
-        "contract_sha256": contract["contract_sha256"],
+        "contract_sha256": validation["a1_contract_sha256"],
         "learner_lock_contract_sha256": lock["contract_sha256"],
         "recipe": recipe,
         "objective": objective,

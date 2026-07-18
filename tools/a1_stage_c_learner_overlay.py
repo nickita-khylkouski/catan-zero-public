@@ -67,9 +67,10 @@ COMPLETED_Q_VALUE_COLUMN = "completed_q_values"
 COMPLETED_Q_MASK_COLUMN = "completed_q_mask"
 SAMPLING_ARMS = frozenset({"PRODUCTION_WEIGHTED", "STRATEGIC_BALANCED"})
 DEFAULT_PRODUCTION_WEIGHT_CAP = 4.0
+LEGACY_ADMISSION_SCHEMA = "a1-coherent-n128-corpus-admission-v1"
 SUPPORTED_BASE_ADMISSION_SCHEMAS = frozenset(
     {
-        active_campaign.ADMISSION_SCHEMA,
+        LEGACY_ADMISSION_SCHEMA,
         post_wave_admission.ADMISSION_SCHEMA,
     }
 )
@@ -429,7 +430,7 @@ def _source_policy_semantics(admission: Mapping[str, Any]) -> dict[str, Any]:
     corpus = admission.get("corpus")
     if not isinstance(corpus, Mapping):
         raise OverlayError("Stage-C base admission has no corpus semantics")
-    if schema == active_campaign.ADMISSION_SCHEMA:
+    if schema == LEGACY_ADMISSION_SCHEMA:
         policy = admission.get("policy_distillation_contract")
         if (
             not isinstance(policy, Mapping)
@@ -481,7 +482,7 @@ def _load_base_admission(
     candidate_path, candidate = _load_json(path, where="Stage-C base admission")
     schema = candidate.get("schema_version")
     try:
-        if schema == active_campaign.ADMISSION_SCHEMA:
+        if schema == LEGACY_ADMISSION_SCHEMA:
             resolved, admission = active_campaign._load_admission(  # noqa: SLF001
                 candidate_path
             )
@@ -2118,7 +2119,7 @@ def _verify_overlay_source_authority(
     # Preserve verification compatibility for already materialized legacy
     # overlays. New exports of either schema always carry the stronger source
     # binding below.
-    if schema == active_campaign.ADMISSION_SCHEMA and source_ref is None:
+    if schema == LEGACY_ADMISSION_SCHEMA and source_ref is None:
         return
     if not isinstance(source_ref, Mapping) or not isinstance(
         source_semantics, Mapping
