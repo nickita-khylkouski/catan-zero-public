@@ -188,6 +188,7 @@ def test_authenticated_catalog_listing_has_no_second_identity_registry() -> None
         "a1-parent-update-35m-b200",
         "a1-parent-update-shared-action25-35m-b200",
         "a1-parent-update-value25-35m-b200",
+        "a1-parent-update-shared-action25-value25-35m-b200",
         "a1-parent-update-active-p10-35m-b200",
         "a1-parent-update-active-p25-35m-b200",
     ]
