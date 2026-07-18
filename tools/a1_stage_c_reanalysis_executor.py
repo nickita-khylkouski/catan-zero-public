@@ -1162,6 +1162,7 @@ def _effective_search_config(
         in {
             alignment.OPERATOR_IDENTITY_SCHEMA_V2,
             alignment.OPERATOR_IDENTITY_SCHEMA_V3,
+            alignment.OPERATOR_IDENTITY_SCHEMA_V4,
         }
         and target.get("effective_gumbel_config") != effective
     ):
@@ -1218,14 +1219,27 @@ def _expected_forced_full_simulations(
 def _evaluator_from_plan(plan: Mapping[str, Any], *, device: str) -> Any:
     fields = _sealed_typed_fields(plan)
     target = plan["target_policy_target_identity"]
+    explicit_adapter = (
+        str(
+            target["teacher_feature_contract"][
+                "entity_feature_adapter_version"
+            ]
+        )
+        if target.get("schema_version") == alignment.OPERATOR_IDENTITY_SCHEMA_V4
+        else None
+    )
     if (
         target.get("schema_version")
         in {
             alignment.OPERATOR_IDENTITY_SCHEMA_V2,
             alignment.OPERATOR_IDENTITY_SCHEMA_V3,
+            alignment.OPERATOR_IDENTITY_SCHEMA_V4,
         }
         and target.get("effective_evaluator_config")
-        != alignment._complete_effective_evaluator_config(fields)  # noqa: SLF001
+        != alignment._complete_effective_evaluator_config(  # noqa: SLF001
+            fields,
+            entity_feature_adapter_version=explicit_adapter,
+        )
     ):
         raise ExecutorError("Stage-C effective evaluator identity drifted")
     if fields.get("public_observation") is not True:
@@ -1243,6 +1257,7 @@ def _evaluator_from_plan(plan: Mapping[str, Any], *, device: str) -> Any:
             value_readout=str(fields.get("value_readout", "scalar")),
             public_observation=True,
             rust_featurize=True,
+            entity_feature_adapter_version=explicit_adapter,
         ),
     )
 
@@ -1520,13 +1535,17 @@ def _execute_partition(args: argparse.Namespace) -> dict[str, Any]:
         target.get("operator_contract_semantics", {}),
     )
     if (
-        target.get("schema_version") != alignment.OPERATOR_IDENTITY_SCHEMA_V3
+        target.get("schema_version")
+        not in {
+            alignment.OPERATOR_IDENTITY_SCHEMA_V3,
+            alignment.OPERATOR_IDENTITY_SCHEMA_V4,
+        }
         or target.get("target_execution") != alignment.STAGE_C_TARGET_EXECUTION
         or target.get("root_value_output_contract")
         != expected_output_contract
     ):
         raise ExecutorError(
-            "new Stage-C execution requires the complete paired-root v3 target identity"
+            "new Stage-C execution requires a complete paired-root target identity"
         )
     checkpoint_sha = str(target["producer_checkpoint"]["sha256"])
     operator_contract_sha = str(target["authority"]["contract"]["file_sha256"])

@@ -65,6 +65,10 @@ from catan_zero.search.neural_rust_mcts import (  # noqa: E402
     EntityGraphRustEvaluatorConfig,
 )
 from catan_zero.rl.gumbel_self_play import ACTION_MASK_VERSION  # noqa: E402
+from catan_zero.rl.entity_feature_adapter import (  # noqa: E402
+    ENTITY_FEATURE_ADAPTER_CHECKPOINT_SCHEMA,
+    RUST_ENTITY_ADAPTER_V6,
+)
 
 
 PLAN_SCHEMA = "a1-stage-c-teacher-alignment-plan-v3"
@@ -74,6 +78,8 @@ COHERENT_REGIME = "public_belief_single_tree_v1"
 OPERATOR_IDENTITY_SCHEMA_V1 = "a1-operator-bound-policy-target-identity-v1"
 OPERATOR_IDENTITY_SCHEMA_V2 = "a1-operator-bound-policy-target-identity-v2"
 OPERATOR_IDENTITY_SCHEMA_V3 = "a1-operator-bound-policy-target-identity-v3"
+OPERATOR_IDENTITY_SCHEMA_V4 = "a1-operator-bound-policy-target-identity-v4"
+RD_TEACHER_TRANSITION_BINDING_SCHEMA = "a1-rd-teacher-transition-binding-v1"
 PAIRED_ROOT_VALUE_OUTPUT_SCHEMA = "a1-paired-root-value-output-contract-v1"
 STAGE_C_ROW_SEED_SCHEMA = "a1-stage-c-coherent-reanalysis-root-seed-v1"
 STAGE_C_TARGET_EXECUTION = {
@@ -360,6 +366,8 @@ def _complete_effective_search_config(fields: Mapping[str, Any]) -> dict[str, An
 
 def _complete_effective_evaluator_config(
     fields: Mapping[str, Any],
+    *,
+    entity_feature_adapter_version: str | None = None,
 ) -> dict[str, Any]:
     """Resolve target-changing evaluator fields and document the cache exclusion."""
 
@@ -370,6 +378,7 @@ def _complete_effective_evaluator_config(
         "value_readout": str(fields.get("value_readout", "scalar")),
         "public_observation": bool(fields.get("public_observation", False)),
         "rust_featurize": bool(fields.get("rust_featurize", True)),
+        "entity_feature_adapter_version": entity_feature_adapter_version,
     }
     resolved = dataclasses.asdict(EntityGraphRustEvaluatorConfig(**kwargs))
     # Cache capacity changes storage/layout only.  Every other resolved field
@@ -424,6 +433,153 @@ def _paired_root_value_output_contract(
     }
 
 
+def _rd_teacher_transition_authority(
+    binding_path: Path,
+    binding: Mapping[str, Any],
+    checkpoint: Path,
+) -> tuple[dict[str, Any], Path, dict[str, Any]]:
+    """Resolve one non-promotable V6 checkpoint into a Stage-C authority.
+
+    The production coherent-n128 contract remains the authority for search
+    semantics.  This binding replaces only the producer network and its
+    explicitly checked feature adapter for root reanalysis.  It cannot be used
+    by the production generation executor because it has a distinct schema and
+    carries no seed/fleet schedule.
+    """
+
+    unsigned = dict(binding)
+    stated = unsigned.pop("binding_sha256", None)
+    if (
+        binding.get("schema_version") != RD_TEACHER_TRANSITION_BINDING_SCHEMA
+        or stated != _value_sha256(unsigned)
+        or binding.get("diagnostic_only") is not True
+        or binding.get("promotion_eligible") is not False
+        or binding.get("production_authority") is not False
+        or binding.get("status") != "ready_nonpromotable_reanalysis_teacher"
+    ):
+        raise AlignmentError("R&D teacher-transition binding is not fail-closed")
+
+    base_ref = binding.get("base_operator_contract")
+    typed_ref = binding.get("typed_generation_config")
+    producer = binding.get("producer_checkpoint")
+    feature_contract = binding.get("teacher_feature_contract")
+    if not all(
+        isinstance(value, Mapping)
+        for value in (base_ref, typed_ref, producer, feature_contract)
+    ):
+        raise AlignmentError("R&D teacher-transition binding is incomplete")
+
+    base_path = _regular_file(
+        Path(str(base_ref.get("path", ""))),
+        where="R&D teacher base operator contract",
+    )
+    if _file_sha256(base_path) != base_ref.get("file_sha256"):
+        raise AlignmentError("R&D teacher base operator contract bytes drifted")
+    try:
+        inspected = target_inventory.inspect_rd_contract(base_path)
+    except (target_inventory.InventoryError, OSError, ValueError) as error:
+        raise AlignmentError(f"R&D teacher base operator refused: {error}") from error
+    if (
+        inspected.get("contract_sha256") != base_ref.get("contract_sha256")
+        or inspected.get("target_information_regime") != COHERENT_REGIME
+    ):
+        raise AlignmentError("R&D teacher base operator identity drifted")
+    _base_path, base = _load_json(base_path, where="R&D teacher base operator")
+
+    config_path = _regular_file(
+        Path(str(typed_ref.get("path", ""))),
+        where="R&D teacher typed generation config",
+    )
+    if _file_sha256(config_path) != typed_ref.get("file_sha256"):
+        raise AlignmentError("R&D teacher typed generation config bytes drifted")
+    _config_path, config = _load_json(
+        config_path, where="R&D teacher typed generation config"
+    )
+    fields = config.get("fields")
+    if (
+        config.get("pipeline") != "generate"
+        or config.get("schema_version") != 13
+        or not isinstance(fields, Mapping)
+    ):
+        raise AlignmentError("R&D teacher typed generation config is malformed")
+
+    checkpoint = _regular_file(checkpoint, where="R&D teacher checkpoint")
+    producer_path = _regular_file(
+        Path(str(producer.get("path", ""))),
+        where="bound R&D teacher checkpoint",
+    )
+    checkpoint_sha = _file_sha256(checkpoint)
+    if (
+        producer_path != checkpoint
+        or producer.get("sha256") != checkpoint_sha
+    ):
+        raise AlignmentError("R&D teacher checkpoint bytes/path drifted")
+    try:
+        checkpoint_adapter = train_bc._checkpoint_entity_feature_adapter_version(  # noqa: SLF001
+            str(checkpoint)
+        )
+    except (OSError, RuntimeError, SystemExit, ValueError) as error:
+        raise AlignmentError(
+            f"cannot authenticate R&D teacher checkpoint adapter: {error}"
+        ) from error
+    declared_adapter = feature_contract.get("entity_feature_adapter_version")
+    if (
+        feature_contract.get("schema_version")
+        != ENTITY_FEATURE_ADAPTER_CHECKPOINT_SCHEMA
+        or declared_adapter != RUST_ENTITY_ADAPTER_V6
+        or checkpoint_adapter != declared_adapter
+        or fields.get("teacher_entity_feature_adapter_version") != declared_adapter
+        or fields.get("learner_entity_feature_adapter_version") != declared_adapter
+    ):
+        raise AlignmentError(
+            "R&D teacher requires one exact V6 checkpoint/config adapter binding"
+        )
+
+    operator = base.get("operator")
+    if not isinstance(operator, Mapping):
+        raise AlignmentError("R&D teacher base operator has no semantic block")
+    overlap_drift = {
+        key: {"base_contract": value, "typed_config": fields.get(key)}
+        for key, value in operator.items()
+        if key in fields and fields.get(key) != value
+    }
+    if overlap_drift:
+        raise AlignmentError(
+            "R&D teacher typed config changes the base search operator: "
+            + json.dumps(overlap_drift, sort_keys=True)
+        )
+
+    synthetic = {
+        "schema_version": binding["schema_version"],
+        "contract_sha256": binding["binding_sha256"],
+        "target_information_regime": base["target_information_regime"],
+        "producer_checkpoint": dict(producer),
+        "operator": dict(operator),
+        "acceptance": dict(base.get("acceptance", {})),
+        "artifacts": {
+            "typed_generation_config": {
+                "path": str(config_path),
+                "sha256": _file_sha256(config_path),
+            }
+        },
+    }
+    authority = {
+        "kind": "nonpromotable_rd_teacher_transition",
+        "binding": {
+            "path": str(binding_path),
+            "file_sha256": _file_sha256(binding_path),
+            "binding_sha256": binding["binding_sha256"],
+        },
+        "base_operator_contract": {
+            "path": str(base_path),
+            "file_sha256": _file_sha256(base_path),
+            "contract_sha256": inspected["contract_sha256"],
+        },
+        "teacher_feature_contract": dict(feature_contract),
+    }
+    return synthetic, config_path, authority
+
+
 def _operator_identity(
     contract_path: Path,
     checkpoint: Path,
@@ -434,22 +590,30 @@ def _operator_identity(
 ) -> dict[str, Any]:
     """Build the scientific identity of policy targets, excluding fleet layout."""
 
-    if require_current_target:
-        try:
-            target_inventory.inspect_rd_contract(contract_path)
-        except (target_inventory.InventoryError, OSError, ValueError) as error:
-            raise AlignmentError(
-                f"current coherent operator contract refused: {error}"
-            ) from error
     contract_path, contract = _load_json(
         contract_path, where="coherent target operator contract"
     )
-    config_ref = contract.get("artifacts", {}).get("typed_generation_config")
-    if not isinstance(config_ref, Mapping):
-        raise AlignmentError("operator contract has no typed generation config")
-    config_path = _resolve_artifact(contract_path, str(config_ref.get("path", "")))
-    if _file_sha256(config_path) != config_ref.get("sha256"):
-        raise AlignmentError("typed generation config bytes drifted")
+    transition_authority: dict[str, Any] | None = None
+    if contract.get("schema_version") == RD_TEACHER_TRANSITION_BINDING_SCHEMA:
+        contract, config_path, transition_authority = (
+            _rd_teacher_transition_authority(contract_path, contract, checkpoint)
+        )
+    else:
+        if require_current_target:
+            try:
+                target_inventory.inspect_rd_contract(contract_path)
+            except (target_inventory.InventoryError, OSError, ValueError) as error:
+                raise AlignmentError(
+                    f"current coherent operator contract refused: {error}"
+                ) from error
+        config_ref = contract.get("artifacts", {}).get("typed_generation_config")
+        if not isinstance(config_ref, Mapping):
+            raise AlignmentError("operator contract has no typed generation config")
+        config_path = _resolve_artifact(
+            contract_path, str(config_ref.get("path", ""))
+        )
+        if _file_sha256(config_path) != config_ref.get("sha256"):
+            raise AlignmentError("typed generation config bytes drifted")
     _config_path, config = _load_json(config_path, where="typed generation config")
     fields = config.get("fields")
     operator = contract.get("operator")
@@ -458,8 +622,15 @@ def _operator_identity(
     contract_unsigned = dict(contract)
     contract_digest = contract_unsigned.pop("contract_sha256", None)
     if (
-        contract.get("schema_version") not in target_inventory.RD_CONTRACT_SCHEMAS
-        or contract_digest != _value_sha256(contract_unsigned)
+        (
+            transition_authority is None
+            and contract.get("schema_version")
+            not in target_inventory.RD_CONTRACT_SCHEMAS
+        )
+        or (
+            transition_authority is None
+            and contract_digest != _value_sha256(contract_unsigned)
+        )
         or config.get("schema_version") != 13
         or config.get("pipeline") != "generate"
         or not isinstance(fields, Mapping)
@@ -510,6 +681,7 @@ def _operator_identity(
         OPERATOR_IDENTITY_SCHEMA_V1,
         OPERATOR_IDENTITY_SCHEMA_V2,
         OPERATOR_IDENTITY_SCHEMA_V3,
+        OPERATOR_IDENTITY_SCHEMA_V4,
     }:
         raise AlignmentError(
             f"unsupported policy-target identity schema {identity_schema!r}"
@@ -553,9 +725,33 @@ def _operator_identity(
             "operator_semantic_sha256": _value_sha256(operator),
         },
     }
+    if identity_schema == OPERATOR_IDENTITY_SCHEMA_V4:
+        try:
+            teacher_adapter = train_bc._checkpoint_entity_feature_adapter_version(  # noqa: SLF001
+                str(checkpoint)
+            )
+        except (OSError, RuntimeError, SystemExit, ValueError) as error:
+            raise AlignmentError(
+                f"cannot authenticate target checkpoint adapter: {error}"
+            ) from error
+        if (
+            teacher_adapter != RUST_ENTITY_ADAPTER_V6
+            or fields.get("teacher_entity_feature_adapter_version")
+            != teacher_adapter
+        ):
+            raise AlignmentError(
+                "v4 target identity requires explicit checkpoint-matched V6 adapter"
+            )
+        value["teacher_feature_contract"] = {
+            "schema_version": ENTITY_FEATURE_ADAPTER_CHECKPOINT_SCHEMA,
+            "entity_feature_adapter_version": teacher_adapter,
+        }
+        if transition_authority is not None:
+            value["authority"].update(transition_authority)
     if identity_schema in {
         OPERATOR_IDENTITY_SCHEMA_V2,
         OPERATOR_IDENTITY_SCHEMA_V3,
+        OPERATOR_IDENTITY_SCHEMA_V4,
     }:
         execution = (
             dict(target_execution)
@@ -573,7 +769,14 @@ def _operator_identity(
             raise AlignmentError("Stage-C target execution override drifted")
         value["effective_gumbel_config"] = _complete_effective_search_config(fields)
         value["effective_evaluator_config"] = _complete_effective_evaluator_config(
-            fields
+            fields,
+            entity_feature_adapter_version=(
+                value["teacher_feature_contract"][
+                    "entity_feature_adapter_version"
+                ]
+                if identity_schema == OPERATOR_IDENTITY_SCHEMA_V4
+                else None
+            ),
         )
         value["target_execution"] = _json_normalized(execution)
         value["identity_exclusions"] = {
@@ -587,7 +790,10 @@ def _operator_identity(
                 "operator input"
             ),
         }
-    if identity_schema == OPERATOR_IDENTITY_SCHEMA_V3:
+    if identity_schema in {
+        OPERATOR_IDENTITY_SCHEMA_V3,
+        OPERATOR_IDENTITY_SCHEMA_V4,
+    }:
         value["root_value_output_contract"] = _paired_root_value_output_contract(
             fields,
             operator,
@@ -616,6 +822,7 @@ def _operator_identity(
     if identity_schema in {
         OPERATOR_IDENTITY_SCHEMA_V2,
         OPERATOR_IDENTITY_SCHEMA_V3,
+        OPERATOR_IDENTITY_SCHEMA_V4,
     }:
         scientific_keys.extend(
             (
@@ -625,13 +832,21 @@ def _operator_identity(
                 "identity_exclusions",
             )
         )
-    if identity_schema == OPERATOR_IDENTITY_SCHEMA_V3:
+    if identity_schema in {
+        OPERATOR_IDENTITY_SCHEMA_V3,
+        OPERATOR_IDENTITY_SCHEMA_V4,
+    }:
         scientific_keys.append("root_value_output_contract")
+    if identity_schema == OPERATOR_IDENTITY_SCHEMA_V4:
+        scientific_keys.append("teacher_feature_contract")
     scientific = {key: value[key] for key in scientific_keys}
     scientific["producer_checkpoint"] = {
         "sha256": value["producer_checkpoint"]["sha256"]
     }
-    if identity_schema == OPERATOR_IDENTITY_SCHEMA_V3:
+    if identity_schema in {
+        OPERATOR_IDENTITY_SCHEMA_V3,
+        OPERATOR_IDENTITY_SCHEMA_V4,
+    }:
         scientific_output = dict(scientific["root_value_output_contract"])
         scientific_authority = dict(scientific_output["authority"])
         scientific_authority.pop("path")
@@ -1326,7 +1541,7 @@ def _build_plan(args: argparse.Namespace) -> dict[str, Any]:
         args.target_operator_contract,
         args.target_checkpoint,
         require_current_target=True,
-        identity_schema=OPERATOR_IDENTITY_SCHEMA_V3,
+        identity_schema=OPERATOR_IDENTITY_SCHEMA_V4,
         target_execution=STAGE_C_TARGET_EXECUTION,
     )
     if (
@@ -1700,6 +1915,7 @@ def _verify_plan(path: Path) -> dict[str, Any]:
                 in {
                     OPERATOR_IDENTITY_SCHEMA_V2,
                     OPERATOR_IDENTITY_SCHEMA_V3,
+                    OPERATOR_IDENTITY_SCHEMA_V4,
                 }
                 and identity_key == "target_policy_target_identity"
                 else None
