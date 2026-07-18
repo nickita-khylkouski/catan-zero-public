@@ -639,6 +639,138 @@ def test_forced_full_simulation_accounting_replays_width_dependent_sh() -> None:
     assert executor._expected_forced_full_simulations(54, effective) == 154
 
 
+def test_cost_balanced_execution_assignment_is_deterministic_complete_and_disjoint() -> None:
+    rows = 48
+    partitions = 4
+    # Put every expensive root in the legacy partition zero.  This mirrors the
+    # production failure mode where selection/chunk order correlates with phase.
+    legal_width = np.asarray(
+        [24 if ordinal % partitions == 0 else 8 for ordinal in range(rows)],
+        dtype=np.int16,
+    )
+    subset = {
+        "identity_sha256": np.asarray(
+            [f"sha256:{ordinal:064x}" for ordinal in range(rows)]
+        ),
+        "ready_ordinal": np.arange(rows, dtype=np.int64),
+        "chunk_index": np.arange(rows, dtype=np.int32),
+        "legal_width": legal_width,
+    }
+    effective = {
+        "symmetry_averaged_eval": True,
+        "symmetry_averaged_eval_threshold": 20,
+        "wide_candidates_threshold": 20,
+    }
+
+    owners, costs, contract = executor._cost_balanced_partition_assignment(  # noqa: SLF001
+        subset,
+        partitions=partitions,
+        effective_config=effective,
+    )
+    repeated, repeated_costs, repeated_contract = (  # noqa: SLF001
+        executor._cost_balanced_partition_assignment(
+            subset,
+            partitions=partitions,
+            effective_config=effective,
+        )
+    )
+
+    assert np.array_equal(owners, repeated)
+    assert np.array_equal(costs, repeated_costs)
+    assert contract == repeated_contract
+    assigned = [
+        np.flatnonzero(owners == partition) for partition in range(partitions)
+    ]
+    assert sorted(np.concatenate(assigned).tolist()) == list(range(rows))
+    assert len(set(np.concatenate(assigned).tolist())) == rows
+    assert all(len(positions) > 0 for positions in assigned)
+    assert contract["partition_cost_units"] == [45, 45, 45, 45]
+
+
+def test_cost_balancing_removes_skew_from_legacy_chunk_assignment() -> None:
+    rows = 48
+    partitions = 4
+    subset = {
+        "identity_sha256": np.asarray(
+            [f"sha256:{ordinal:064x}" for ordinal in range(rows)]
+        ),
+        "ready_ordinal": np.arange(rows, dtype=np.int64),
+        "chunk_index": np.arange(rows, dtype=np.int32),
+        "legal_width": np.asarray(
+            [24 if ordinal % partitions == 0 else 8 for ordinal in range(rows)],
+            dtype=np.int16,
+        ),
+    }
+    effective = {
+        "symmetry_averaged_eval": True,
+        "symmetry_averaged_eval_threshold": 20,
+        "wide_candidates_threshold": 20,
+    }
+    _owners, costs, contract = executor._cost_balanced_partition_assignment(  # noqa: SLF001
+        subset,
+        partitions=partitions,
+        effective_config=effective,
+    )
+    legacy_loads = [
+        int(
+            costs[
+                executor._legacy_partition_positions(  # noqa: SLF001
+                    subset,
+                    partition_index=partition,
+                    partitions=partitions,
+                )
+            ].sum()
+        )
+        for partition in range(partitions)
+    ]
+    balanced_loads = contract["partition_cost_units"]
+
+    assert legacy_loads == [144, 12, 12, 12]
+    assert max(balanced_loads) - min(balanced_loads) == 0
+    assert max(balanced_loads) < max(legacy_loads) / 3
+
+
+def test_execution_cost_contract_replays_explicit_and_legacy_d6_gates() -> None:
+    widths = np.asarray([19, 20, 21], dtype=np.int16)
+
+    explicit, explicit_contract = executor._root_execution_costs(  # noqa: SLF001
+        widths,
+        {
+            "symmetry_averaged_eval": True,
+            "symmetry_averaged_eval_threshold": 20,
+            "wide_candidates_threshold": 20,
+        },
+    )
+    legacy, legacy_contract = executor._root_execution_costs(  # noqa: SLF001
+        widths,
+        {
+            "symmetry_averaged_eval": True,
+            "symmetry_averaged_eval_threshold": None,
+            "wide_candidates_threshold": 20,
+        },
+    )
+    disabled, _ = executor._root_execution_costs(  # noqa: SLF001
+        widths,
+        {
+            "symmetry_averaged_eval": False,
+            "symmetry_averaged_eval_threshold": 20,
+            "wide_candidates_threshold": 20,
+        },
+    )
+
+    assert explicit.tolist() == [1, 12, 12]
+    assert legacy.tolist() == [1, 1, 12]
+    assert disabled.tolist() == [1, 1, 1]
+    assert (
+        explicit_contract["symmetry_gate"]
+        == "legal_width_gte_explicit_threshold"
+    )
+    assert (
+        legacy_contract["symmetry_gate"]
+        == "legal_width_gt_legacy_wide_candidates_threshold"
+    )
+
+
 def test_portable_runtime_verifies_historical_git_blobs_not_current_tree(
     monkeypatch, tmp_path
 ) -> None:

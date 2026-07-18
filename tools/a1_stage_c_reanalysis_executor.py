@@ -72,7 +72,13 @@ QUALIFICATION_PARTITION_RECEIPT_SCHEMA = (
     "a1-stage-c-sparse-reconstruction-partition-receipt-v1"
 )
 QUALIFICATION_PARTITION_SCHEMA = "a1-stage-c-sparse-reconstruction-partition-v1"
-EXECUTION_RECEIPT_SCHEMA = "a1-stage-c-coherent-reanalysis-chunk-receipt-v1"
+EXECUTION_RECEIPT_SCHEMA_V1 = "a1-stage-c-coherent-reanalysis-chunk-receipt-v1"
+EXECUTION_RECEIPT_SCHEMA = "a1-stage-c-coherent-reanalysis-chunk-receipt-v2"
+EXECUTION_PARTITION_ASSIGNMENT_SCHEMA = (
+    "a1-stage-c-cost-balanced-execution-assignment-v1"
+)
+EXECUTION_PARTITION_ASSIGNMENT = "deterministic_lpt_d6_cost_v1"
+LEGACY_EXECUTION_PARTITION_ASSIGNMENT = "sealed_chunk_index_mod_partitions"
 PATCH_SCHEMA_V1 = "a1-stage-c-coherent-reanalysis-target-patch-v1"
 PATCH_SCHEMA_V2 = "a1-stage-c-coherent-reanalysis-target-patch-v2"
 PATCH_SCHEMA = "a1-stage-c-coherent-reanalysis-target-patch-v3"
@@ -1453,13 +1459,176 @@ def _search_patch(
     }
 
 
-def _partition_positions(
-    subset: Mapping[str, np.ndarray], *, partition_index: int, partitions: int
-) -> np.ndarray:
+def _validate_partition_request(
+    *, row_count: int, partition_index: int, partitions: int
+) -> None:
     if partitions < 1 or not 0 <= partition_index < partitions:
         raise ExecutorError("partition_index must be in [0, partitions)")
+    if row_count < partitions:
+        raise ExecutorError(
+            "execution partition count exceeds qualified reconstructable roots"
+        )
+
+
+def _legacy_partition_positions(
+    subset: Mapping[str, np.ndarray], *, partition_index: int, partitions: int
+) -> np.ndarray:
+    _validate_partition_request(
+        row_count=len(subset["identity_sha256"]),
+        partition_index=partition_index,
+        partitions=partitions,
+    )
     chunks = np.asarray(subset["chunk_index"], dtype=np.int64)
     return np.flatnonzero((chunks % int(partitions)) == int(partition_index))
+
+
+def _execution_cost_contract(
+    effective_config: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Return the sealed, pre-search root-cost proxy used by the scheduler.
+
+    Wide roots selected for root D6 averaging perform twelve neural forward
+    rows where an ordinary root performs one.  Legal width and the sealed
+    search config are known before execution, so this proxy can balance the
+    expensive roots without observing or changing any target/search output.
+    """
+
+    enabled = bool(effective_config.get("symmetry_averaged_eval", False))
+    explicit_threshold = effective_config.get("symmetry_averaged_eval_threshold")
+    legacy_threshold = int(effective_config.get("wide_candidates_threshold", 20))
+    if explicit_threshold is not None:
+        explicit_threshold = int(explicit_threshold)
+        gate = "legal_width_gte_explicit_threshold"
+    else:
+        gate = "legal_width_gt_legacy_wide_candidates_threshold"
+    return {
+        "schema_version": EXECUTION_PARTITION_ASSIGNMENT_SCHEMA,
+        "algorithm": "longest_processing_time_greedy_v1",
+        "sort": "descending_cost_then_ready_ordinal",
+        "destination_tie_break": "current_cost_then_row_count_then_partition_index",
+        "cost_proxy": "root_neural_forward_row_equivalents",
+        "plain_root_cost_units": 1,
+        "d6_root_cost_units": 12,
+        "symmetry_averaged_eval": enabled,
+        "symmetry_gate": gate,
+        "symmetry_averaged_eval_threshold": explicit_threshold,
+        "legacy_wide_candidates_threshold": legacy_threshold,
+    }
+
+
+def _root_execution_costs(
+    legal_widths: np.ndarray, effective_config: Mapping[str, Any]
+) -> tuple[np.ndarray, dict[str, Any]]:
+    widths = np.asarray(legal_widths, dtype=np.int64)
+    if widths.ndim != 1 or np.any(widths < 2):
+        raise ExecutorError(
+            "cost-balanced Stage-C execution requires multi-action legal widths"
+        )
+    contract = _execution_cost_contract(effective_config)
+    d6 = np.zeros(widths.shape, dtype=np.bool_)
+    if contract["symmetry_averaged_eval"]:
+        threshold = contract["symmetry_averaged_eval_threshold"]
+        if threshold is None:
+            d6 = widths > int(contract["legacy_wide_candidates_threshold"])
+        else:
+            d6 = widths >= int(threshold)
+    costs = np.where(
+        d6,
+        int(contract["d6_root_cost_units"]),
+        int(contract["plain_root_cost_units"]),
+    ).astype(np.int64)
+    return costs, contract
+
+
+def _cost_balanced_partition_assignment(
+    subset: Mapping[str, np.ndarray],
+    *,
+    partitions: int,
+    effective_config: Mapping[str, Any],
+) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+    """Assign every qualified root exactly once using deterministic LPT."""
+
+    count = len(subset["identity_sha256"])
+    _validate_partition_request(
+        row_count=count, partition_index=0, partitions=partitions
+    )
+    legal_width_column = subset.get("legal_width")
+    if legal_width_column is None:
+        raise ExecutorError(
+            "cost-balanced Stage-C execution requires row-aligned legal_width"
+        )
+    legal_widths = np.asarray(legal_width_column, dtype=np.int64)
+    if legal_widths.shape != (count,):
+        raise ExecutorError(
+            "cost-balanced Stage-C execution requires row-aligned legal_width"
+        )
+    ready_ordinals = np.asarray(subset["ready_ordinal"], dtype=np.int64)
+    if (
+        ready_ordinals.shape != (count,)
+        or not np.array_equal(ready_ordinals, np.arange(count, dtype=np.int64))
+    ):
+        raise ExecutorError(
+            "cost-balanced Stage-C execution requires canonical ready ordinals"
+        )
+    costs, cost_contract = _root_execution_costs(legal_widths, effective_config)
+    order = np.lexsort((ready_ordinals, -costs))
+    owners = np.full(count, -1, dtype=np.int32)
+    partition_costs = np.zeros(partitions, dtype=np.int64)
+    partition_rows = np.zeros(partitions, dtype=np.int64)
+    for ordinal in order.tolist():
+        destination = min(
+            range(partitions),
+            key=lambda index: (
+                int(partition_costs[index]),
+                int(partition_rows[index]),
+                index,
+            ),
+        )
+        owners[ordinal] = destination
+        partition_costs[destination] += int(costs[ordinal])
+        partition_rows[destination] += 1
+    if np.any(owners < 0) or int(partition_rows.sum()) != count:
+        raise ExecutorError("cost-balanced Stage-C assignment lost roots")
+    assignment_identity = {
+        "schema_version": EXECUTION_PARTITION_ASSIGNMENT_SCHEMA,
+        "assignment": EXECUTION_PARTITION_ASSIGNMENT,
+        "partitions": int(partitions),
+        "cost_contract": cost_contract,
+        "ready_ordinal_partition": owners.tolist(),
+    }
+    contract = {
+        **assignment_identity,
+        "assignment_sha256": _value_sha256(assignment_identity),
+        "total_rows": count,
+        "total_cost_units": int(costs.sum()),
+        "partition_rows": partition_rows.tolist(),
+        "partition_cost_units": partition_costs.tolist(),
+    }
+    return owners, costs, contract
+
+
+def _partition_positions(
+    subset: Mapping[str, np.ndarray],
+    *,
+    partition_index: int,
+    partitions: int,
+    effective_config: Mapping[str, Any],
+) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+    _validate_partition_request(
+        row_count=len(subset["identity_sha256"]),
+        partition_index=partition_index,
+        partitions=partitions,
+    )
+    owners, costs, contract = _cost_balanced_partition_assignment(
+        subset,
+        partitions=partitions,
+        effective_config=effective_config,
+    )
+    return (
+        np.flatnonzero(owners == int(partition_index)),
+        costs,
+        contract,
+    )
 
 
 def _patch_arrays(
@@ -1566,10 +1735,12 @@ def _execute_partition(args: argparse.Namespace) -> dict[str, Any]:
         Path(str(qualification["stage_c_plan"]["path"]))
     )
     subset = _load_ready_subset(qualification)
-    positions = _partition_positions(
+    effective = plan["target_policy_target_identity"]["effective_gumbel_config"]
+    positions, root_costs, assignment_contract = _partition_positions(
         subset,
         partition_index=int(args.partition_index),
         partitions=int(args.partitions),
+        effective_config=effective,
     )
     if positions.size == 0:
         raise ExecutorError("requested Stage-C execution partition is empty")
@@ -1771,7 +1942,6 @@ def _execute_partition(args: argparse.Namespace) -> dict[str, Any]:
         alignment._npz_bytes(arrays),  # noqa: SLF001
     )
     qualification_path = Path(str(qualification["path"]))
-    effective = target["effective_gumbel_config"]
     receipt: dict[str, Any] = {
         "schema_version": EXECUTION_RECEIPT_SCHEMA,
         "patch_schema_version": PATCH_SCHEMA,
@@ -1818,7 +1988,20 @@ def _execute_partition(args: argparse.Namespace) -> dict[str, Any]:
         "partition": {
             "partition_index": int(args.partition_index),
             "partitions": int(args.partitions),
-            "assignment": "sealed_chunk_index_mod_partitions",
+            "assignment": EXECUTION_PARTITION_ASSIGNMENT,
+            "assignment_schema_version": (
+                EXECUTION_PARTITION_ASSIGNMENT_SCHEMA
+            ),
+            "assignment_sha256": assignment_contract["assignment_sha256"],
+            "cost_contract": assignment_contract["cost_contract"],
+            "assigned_rows": int(len(positions)),
+            "assigned_cost_units": int(root_costs[positions].sum()),
+            "total_rows": assignment_contract["total_rows"],
+            "total_cost_units": assignment_contract["total_cost_units"],
+            "partition_rows": assignment_contract["partition_rows"],
+            "partition_cost_units": assignment_contract[
+                "partition_cost_units"
+            ],
             "chunk_indices": sorted(
                 set(int(value) for value in arrays["chunk_index"].tolist())
             ),
@@ -2007,6 +2190,71 @@ def _verify_patch_arrays(
             raise ExecutorError("Stage-C patch contains invalid search evidence")
 
 
+def _verify_execution_partition(
+    *,
+    receipt: Mapping[str, Any],
+    qualification: Mapping[str, Any],
+    arrays: Mapping[str, np.ndarray],
+    effective_config: Mapping[str, Any],
+) -> None:
+    partition = receipt.get("partition")
+    if not isinstance(partition, Mapping):
+        raise ExecutorError("Stage-C execution partition contract is malformed")
+    index = int(partition.get("partition_index", -1))
+    partitions = int(partition.get("partitions", 0))
+    ready = _load_ready_subset(qualification)
+    assignment = partition.get("assignment")
+    if receipt.get("schema_version") == EXECUTION_RECEIPT_SCHEMA_V1:
+        if assignment != LEGACY_EXECUTION_PARTITION_ASSIGNMENT:
+            raise ExecutorError("legacy Stage-C execution assignment drifted")
+        expected_positions = _legacy_partition_positions(
+            ready,
+            partition_index=index,
+            partitions=partitions,
+        )
+    else:
+        if (
+            receipt.get("schema_version") != EXECUTION_RECEIPT_SCHEMA
+            or assignment != EXECUTION_PARTITION_ASSIGNMENT
+            or partition.get("assignment_schema_version")
+            != EXECUTION_PARTITION_ASSIGNMENT_SCHEMA
+        ):
+            raise ExecutorError("Stage-C execution assignment contract drifted")
+        expected_positions, costs, contract = _partition_positions(
+            ready,
+            partition_index=index,
+            partitions=partitions,
+            effective_config=effective_config,
+        )
+        expected_partition = {
+            "assignment_sha256": contract["assignment_sha256"],
+            "cost_contract": contract["cost_contract"],
+            "assigned_rows": int(len(expected_positions)),
+            "assigned_cost_units": int(costs[expected_positions].sum()),
+            "total_rows": contract["total_rows"],
+            "total_cost_units": contract["total_cost_units"],
+            "partition_rows": contract["partition_rows"],
+            "partition_cost_units": contract["partition_cost_units"],
+        }
+        if any(
+            partition.get(name) != value
+            for name, value in expected_partition.items()
+        ):
+            raise ExecutorError("Stage-C cost-balanced assignment digest drifted")
+    actual_ordinals = np.asarray(arrays["ready_ordinal"], dtype=np.int64)
+    expected_ordinals = np.asarray(
+        ready["ready_ordinal"][expected_positions], dtype=np.int64
+    )
+    if not np.array_equal(actual_ordinals, expected_ordinals):
+        raise ExecutorError("Stage-C execution partition root ownership drifted")
+    if (
+        int(receipt["counts"]["rows"]) != len(expected_positions)
+        or int(partition.get("assigned_rows", len(expected_positions)))
+        != len(expected_positions)
+    ):
+        raise ExecutorError("Stage-C execution partition row count drifted")
+
+
 def _verify_execution_receipt(path: Path) -> dict[str, Any]:
     receipt_path, receipt = alignment._load_json(  # noqa: SLF001
         path, where="Stage-C execution receipt"
@@ -2015,7 +2263,8 @@ def _verify_execution_receipt(path: Path) -> dict[str, Any]:
     stated = unsigned.pop("receipt_sha256", None)
     patch_schema = receipt.get("patch_schema_version")
     if (
-        receipt.get("schema_version") != EXECUTION_RECEIPT_SCHEMA
+        receipt.get("schema_version")
+        not in {EXECUTION_RECEIPT_SCHEMA_V1, EXECUTION_RECEIPT_SCHEMA}
         or patch_schema not in {PATCH_SCHEMA_V1, PATCH_SCHEMA_V2, PATCH_SCHEMA}
         or stated != _value_sha256(unsigned)
     ):
@@ -2081,6 +2330,12 @@ def _verify_execution_receipt(path: Path) -> dict[str, Any]:
     with np.load(patch_path, allow_pickle=False) as source:
         arrays = {name: np.asarray(source[name]) for name in source.files}
     _verify_patch_arrays(arrays, receipt=receipt)
+    _verify_execution_partition(
+        receipt=receipt,
+        qualification=qualification,
+        arrays=arrays,
+        effective_config=effective,
+    )
     if not isinstance(receipt.get("reliability"), Mapping):
         receipt = copy.deepcopy(receipt)
         receipt["reliability"] = _neutral_reliability_receipt(
@@ -2127,6 +2382,34 @@ def _reliability_identity(value: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _execution_partitioning_identity(
+    execution: Mapping[str, Any],
+) -> dict[str, Any]:
+    partition = execution["partition"]
+    identity = {
+        "execution_receipt_schema_version": execution["schema_version"],
+        "assignment": partition["assignment"],
+        "partitions": int(partition["partitions"]),
+    }
+    if execution["schema_version"] == EXECUTION_RECEIPT_SCHEMA:
+        identity.update(
+            {
+                "assignment_schema_version": partition[
+                    "assignment_schema_version"
+                ],
+                "assignment_sha256": partition["assignment_sha256"],
+                "cost_contract": partition["cost_contract"],
+                "total_rows": int(partition["total_rows"]),
+                "total_cost_units": int(partition["total_cost_units"]),
+                "partition_rows": list(partition["partition_rows"]),
+                "partition_cost_units": list(
+                    partition["partition_cost_units"]
+                ),
+            }
+        )
+    return identity
+
+
 def _merge_executions(args: argparse.Namespace) -> dict[str, Any]:
     executions = [_verify_execution_receipt(path) for path in args.receipt]
     if not executions:
@@ -2142,10 +2425,12 @@ def _merge_executions(args: argparse.Namespace) -> dict[str, Any]:
     plan_sha = first["stage_c_plan"]["plan_sha256"]
     qualification_sha = first["qualification_receipt"]["receipt_sha256"]
     target_sha = first["target_policy_target_identity_sha256"]
+    partitioning_identity = _execution_partitioning_identity(first)
     if any(
         execution["stage_c_plan"]["plan_sha256"] != plan_sha
         or execution["qualification_receipt"]["receipt_sha256"] != qualification_sha
         or execution["target_policy_target_identity_sha256"] != target_sha
+        or _execution_partitioning_identity(execution) != partitioning_identity
         or _reliability_identity(execution["reliability"])
         != _reliability_identity(first["reliability"])
         for execution in executions[1:]
@@ -2231,6 +2516,7 @@ def _merge_executions(args: argparse.Namespace) -> dict[str, Any]:
         "reliability": merged_reliability,
         "evaluator": first["evaluator"],
         "runtime": first["runtime"],
+        "execution_partitioning": partitioning_identity,
         "execution_receipts": receipt_refs,
         "counts": {
             "partitions": partitions,
@@ -2521,6 +2807,15 @@ def _verify_merge_receipt(path: Path) -> dict[str, Any]:
         raise ExecutorError("Stage-C merge contains no execution receipts")
     first = executions[0]
     partitions = int(first["partition"]["partitions"])
+    expected_partitioning = _execution_partitioning_identity(first)
+    stated_partitioning = receipt.get("execution_partitioning")
+    if stated_partitioning is None:
+        if first["schema_version"] != EXECUTION_RECEIPT_SCHEMA_V1:
+            raise ExecutorError(
+                "Stage-C merge lost cost-balanced execution partitioning"
+            )
+    elif stated_partitioning != expected_partitioning:
+        raise ExecutorError("Stage-C merge execution partitioning drifted")
     expected_reliability = copy.deepcopy(first["reliability"])
     expected_reliability["audited_rows"] = sum(
         int(execution["reliability"]["audited_rows"]) for execution in executions
@@ -2533,6 +2828,11 @@ def _verify_merge_receipt(path: Path) -> dict[str, Any]:
         != list(range(partitions))
         or any(
             int(item["partition"]["partitions"]) != partitions for item in executions
+        )
+        or any(
+            _execution_partitioning_identity(execution)
+            != expected_partitioning
+            for execution in executions[1:]
         )
         or receipt.get("stage_c_plan") != first["stage_c_plan"]
         or receipt.get("qualification_receipt") != first["qualification_receipt"]
