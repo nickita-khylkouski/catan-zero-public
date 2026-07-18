@@ -271,6 +271,7 @@ A1_LEARNER_ABLATION_FIELDS = frozenset(
         "lr",
         "lr_warmup_steps",
         "lr_schedule",
+        "max_grad_norm",
         "optimizer",
         "weight_decay",
         "fused_optimizer",
@@ -4134,6 +4135,7 @@ def bind_learner_ablation(
                 "policy_kl_dual_lr",
                 "policy_kl_max_weight",
                 "target_reliability_confidence_floor",
+                "max_grad_norm",
             }
             else bool
             if key
@@ -4172,6 +4174,7 @@ def bind_learner_ablation(
         "max_steps": (1.0, None, True),
         "lr": (0.0, None, False),
         "lr_warmup_steps": (0.0, None, True),
+        "max_grad_norm": (0.0, None, True),
         "weight_decay": (0.0, None, True),
         "value_lr_mult": (0.0, None, False),
         "action_module_lr_mult": (0.0, 1.0, False),
@@ -6444,6 +6447,11 @@ def _build_direct_train_command(
             str(recipe["lr_warmup_steps"]),
             "--lr-schedule",
             str(recipe["lr_schedule"]),
+            *(
+                ["--max-grad-norm", str(recipe["max_grad_norm"])]
+                if "max_grad_norm" in recipe
+                else []
+            ),
             "--weight-decay",
             str(recipe["weight_decay"]),
             (

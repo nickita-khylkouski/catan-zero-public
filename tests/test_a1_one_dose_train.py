@@ -2723,6 +2723,7 @@ def test_direct_stage_c_parent_renders_v15_controls_without_fake_upgrade(
         overrides_json=json.dumps(
             {
                 "action_module_lr_mult": 0.25,
+                "max_grad_norm": 5.0,
                 "policy_aux_completed_q_loss_weight": 0.1,
                 "max_steps": 32,
                 "policy_aux_active_batch_size": 64,
@@ -2762,6 +2763,7 @@ def test_direct_stage_c_parent_renders_v15_controls_without_fake_upgrade(
     )
     assert _option(command, "--init-checkpoint") == str(parent.resolve())
     assert _option(command, "--action-module-lr-mult") == "0.25"
+    assert _option(command, "--max-grad-norm") == "5.0"
     assert _option(command, "--completed-q-loss-weight") == "0.0"
     assert _option(command, "--policy-aux-completed-q-loss-weight") == "0.1"
     assert _option(command, "--policy-aux-sampling-mode") == (
