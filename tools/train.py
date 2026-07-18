@@ -297,6 +297,11 @@ def _load_recipe(path: str | Path) -> tuple[TrainConfig, dict[str, Any]]:
     if not isinstance(engine, dict):
         raise SystemExit("canonical train config engine_settings must be an object")
     recipe_role = str(engine.get("initialization_mode", "") or "")
+    if recipe_role not in CANONICAL_CONFIG_ROLES:
+        raise SystemExit(
+            "production train recipe has an unsupported initialization role: "
+            f"catalog_name={recipe_name!r} role={recipe_role!r}"
+        )
     try:
         expected_role = training_initialization_mode(_REPO_ROOT, recipe_name)
     except ProductionContractError as error:

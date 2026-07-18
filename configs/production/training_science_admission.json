@@ -206,6 +206,24 @@
       },
       "commissioning_evidence": []
     },
+    "a1-parent-update-shared-action25-value25-35m-b200": {
+      "recipe_canonical_sha256": "aa76029bfdb8a91b76c9ec135348ea3cee08182c1ad049bbbf1063baa9e2584d",
+      "authorized": false,
+      "reason": "combined_shared_action_value_trust_region_requires_fresh_commissioning",
+      "unresolved_requirements": [
+        "commission combined shared-action and value-head 0.25 LR multipliers against exact f7 parent"
+      ],
+      "observations": {
+        "architecture_information_surface": "v6_b12_all_required_modules_positive_learning_signal",
+        "retained_composite_adapter_status": "fresh_adapter_v6_composite_authenticated",
+        "required_fresh_learner_adapter": "rust_entity_adapter_v6_exact_actor_resources_initial_road_two_hop",
+        "shared_action_lr_multiplier": 0.25,
+        "value_head_lr_multiplier": 0.25,
+        "shared_trunk_lr_multiplier": 0.25,
+        "scalar_value_objective": "binary_win_bce_logit_equivalent_deployed_tanh"
+      },
+      "commissioning_evidence": []
+    },
     "a1-parent-update-active-p10-35m-b200": {
       "recipe_canonical_sha256": "b484268b389cff7bc522849b84744cba286d915803467f266258aeba9876ab47",
       "authorized": false,
