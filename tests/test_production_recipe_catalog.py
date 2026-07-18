@@ -49,6 +49,10 @@ APPROVED_ACTIVE_P10_WARMUP0_PARENT_UPDATE = (
     "configs/training/a1_parent_update_active_p10_warmup0_35m_b200.schema1.json",
     "a1-parent-update-active-p10-warmup0-35m-b200",
 )
+APPROVED_ACTIVE_P10_WARMUP0_OPENING_VALUE25_PARENT_UPDATE = (
+    "configs/training/a1_parent_update_active_p10_warmup0_opening_value25_35m_b200.schema1.json",
+    "a1-parent-update-active-p10-warmup0-opening-value25-35m-b200",
+)
 APPROVED_SHARED_ACTION_PARENT_UPDATE = (
     "configs/training/a1_parent_update_shared_action25_35m_b200.schema1.json",
     "a1-parent-update-shared-action25-35m-b200",
@@ -116,6 +120,29 @@ def test_p10_warmup0_is_an_exact_short_dose_causal_arm() -> None:
     assert treatment_fields["lr_warmup_steps"] == 0
     assert treatment_fields["max_steps"] == 12
     assert treatment_fields["lr_warmup_steps"] < treatment_fields["max_steps"]
+
+
+def test_opening_value25_is_an_exact_warmup0_causal_arm() -> None:
+    treatment_path = (
+        ROOT / APPROVED_ACTIVE_P10_WARMUP0_OPENING_VALUE25_PARENT_UPDATE[0]
+    )
+    control_path = ROOT / APPROVED_ACTIVE_P10_WARMUP0_PARENT_UPDATE[0]
+    treatment = json.loads(treatment_path.read_text(encoding="utf-8"))
+    control = json.loads(control_path.read_text(encoding="utf-8"))
+
+    assert (
+        require_production_recipe(
+            entrypoint="train",
+            path=treatment_path,
+            payload=treatment,
+        )
+        == APPROVED_ACTIVE_P10_WARMUP0_OPENING_VALUE25_PARENT_UPDATE[1]
+    )
+    assert treatment["train_config"] == control["train_config"]
+    treatment_engine = dict(treatment["engine_settings"])
+    control_engine = dict(control["engine_settings"])
+    assert treatment_engine.pop("policy_aux_opening_value_mix_fraction") == 0.25
+    assert treatment_engine == control_engine
 
 
 def test_checked_in_active_parent_update_recipe_is_authenticated() -> None:
@@ -298,6 +325,7 @@ def test_authenticated_catalog_listing_has_no_second_identity_registry() -> None
         "a1-parent-update-active-mix10-35m-b200",
         "a1-parent-update-active-p10-clip5-35m-b200",
         "a1-parent-update-active-p10-warmup0-35m-b200",
+        "a1-parent-update-active-p10-warmup0-opening-value25-35m-b200",
         "a1-parent-update-active-p25-35m-b200",
     ]
     assert all(Path(entry["path"]).is_absolute() for entry in train)

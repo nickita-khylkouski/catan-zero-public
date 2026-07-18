@@ -278,6 +278,25 @@
       },
       "commissioning_evidence": []
     },
+    "a1-parent-update-active-p10-warmup0-opening-value25-35m-b200": {
+      "recipe_canonical_sha256": "bb2be77345131d39a3b6921dc7dfe2f4dd58a9b706aecd0bcc830b5fadca74ff",
+      "authorized": false,
+      "reason": "diagnostic_opening_value_reuse_arm_requires_commissioning",
+      "unresolved_requirements": [
+        "compare opening-value calibration and exact-parent playing strength against warmup0"
+      ],
+      "observations": {
+        "active_policy_treatment": "policy_aux_active_batch_size_64_policy_aux_loss_weight_0.10",
+        "lr_warmup_steps": 0,
+        "opening_value_mix_fraction": 0.25,
+        "opening_value_phases": [
+          "BUILD_INITIAL_SETTLEMENT",
+          "BUILD_INITIAL_ROAD"
+        ],
+        "short_dose_steps": 12
+      },
+      "commissioning_evidence": []
+    },
     "a1-parent-update-active-p25-35m-b200": {
       "recipe_canonical_sha256": "940e70128bafeb6b35a8e267058e7551affc73922282bef19ada83042cab3b50",
       "authorized": false,
