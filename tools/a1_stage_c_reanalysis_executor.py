@@ -1366,28 +1366,51 @@ def _search_patch(
         allow_python_fallback=False,
     )
     result = run_information_set_safe_search(plan, search, reconstructed_game)
-    legal_rust = tuple(
+    live_legal_rust = tuple(
         int(action)
         for action in reconstructed_game.playable_action_indices(
             list(config.colors), config.map_kind
         )
     )
     action_size = _checkpoint_action_size(_target_checkpoint(plan))
-    legal_policy_ids = np.asarray(
+    live_legal_policy_ids = np.asarray(
         rust_policy_action_ids(
             reconstructed_game,
-            legal_rust,
+            live_legal_rust,
             colors=tuple(config.colors),
             action_size=action_size,
         ),
-        dtype=np.int32,
-    )
+        dtype=np.int64,
+    ).reshape(-1)
     stored = np.asarray(expected_legal_policy_ids, dtype=np.int64).reshape(-1)
     stored = stored[stored >= 0]
-    if not np.array_equal(legal_policy_ids.astype(np.int64), stored):
+    if (
+        len(live_legal_rust) != len(live_legal_policy_ids)
+        or len(stored) != len(live_legal_policy_ids)
+        or len(set(map(int, stored))) != len(stored)
+        or len(set(map(int, live_legal_policy_ids))) != len(live_legal_policy_ids)
+        or set(map(int, stored)) != set(map(int, live_legal_policy_ids))
+    ):
         raise ExecutorError(
-            "legal action order changed between qualification and search"
+            "legal action support changed between qualification and search"
         )
+    rust_action_by_policy_id = {
+        int(policy_id): int(rust_action)
+        for rust_action, policy_id in zip(
+            live_legal_rust,
+            live_legal_policy_ids,
+            strict=True,
+        )
+    }
+    # Qualification authenticates the producer's canonical action order.  The
+    # Rust engine is free to enumerate the same legal support differently when
+    # the state is reconstructed (notably Road Building + Monopoly).  Align the
+    # search result to the authenticated policy ids rather than treating live
+    # enumeration order as corpus semantics.
+    legal_policy_ids = stored.astype(np.int32, copy=False)
+    legal_rust = tuple(
+        rust_action_by_policy_id[int(policy_id)] for policy_id in stored
+    )
     support = set(legal_rust)
     if (
         set(map(int, result.improved_policy)) != support

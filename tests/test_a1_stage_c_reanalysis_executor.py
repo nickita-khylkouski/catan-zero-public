@@ -369,6 +369,11 @@ def _generator_patch(
     root_prior_value: float = 0.1,
     target: tuple[float, float] = (0.7, 0.3),
     prior: tuple[float, float] = (0.6, 0.4),
+    q_values: tuple[float, float] = (0.4, 0.1),
+    completed_q_values: tuple[float, float] = (0.4, 0.1),
+    live_rust_order: tuple[int, int] = (101, 102),
+    live_policy_order: tuple[int, int] = (11, 13),
+    selected_action: int = 101,
 ) -> dict[str, object]:
     config = SimpleNamespace(colors=("RED", "BLUE"), map_kind=None)
     effective = executor.alignment._complete_effective_search_config(  # noqa: SLF001
@@ -383,17 +388,20 @@ def _generator_patch(
     result = SimpleNamespace(
         improved_policy={101: target[0], 102: target[1]},
         priors={101: prior[0], 102: prior[1]},
-        q_values={101: 0.4, 102: 0.1},
-        completed_q_values={101: 0.4, 102: 0.1},
+        q_values={101: q_values[0], 102: q_values[1]},
+        completed_q_values={
+            101: completed_q_values[0],
+            102: completed_q_values[1],
+        },
         used_full_search=True,
         simulations_used=128,
         root_value=root_value,
         root_prior_value=root_prior_value,
         q_values_root_perspective=True,
-        selected_action=101,
+        selected_action=selected_action,
     )
     game = SimpleNamespace(
-        playable_action_indices=lambda _colors, _map_kind: [101, 102]
+        playable_action_indices=lambda _colors, _map_kind: list(live_rust_order)
     )
     monkeypatch.setattr(
         executor, "_effective_search_config", lambda *_args, **_kwargs: config
@@ -409,7 +417,7 @@ def _generator_patch(
     monkeypatch.setattr(
         executor,
         "rust_policy_action_ids",
-        lambda *_args, **_kwargs: (11, 13),
+        lambda *_args, **_kwargs: live_policy_order,
     )
     return executor._search_patch(
         plan=plan,
@@ -435,6 +443,30 @@ def test_search_patch_accepts_bounded_root_prior_value_endpoints(
 ) -> None:
     patch = _generator_patch(monkeypatch, root_prior_value=root_prior_value)
     assert patch["root_prior_value"] == root_prior_value
+
+
+def test_search_patch_aligns_all_action_fields_to_qualified_policy_order(
+    monkeypatch,
+) -> None:
+    # The reconstructed engine enumerates Rust action 102 first, but the
+    # qualified producer row authenticates policy ids in the 11, 13 order.
+    patch = _generator_patch(
+        monkeypatch,
+        live_rust_order=(102, 101),
+        live_policy_order=(13, 11),
+        selected_action=102,
+        q_values=(0.25, np.nan),
+        completed_q_values=(0.2, -0.1),
+    )
+
+    np.testing.assert_array_equal(patch["legal_action_ids"], [11, 13])
+    np.testing.assert_allclose(patch["target_policy"], [0.7, 0.3])
+    np.testing.assert_allclose(patch["prior_policy"], [0.6, 0.4])
+    np.testing.assert_allclose(patch["target_scores"], [0.25, np.nan])
+    np.testing.assert_array_equal(patch["target_scores_mask"], [True, False])
+    np.testing.assert_allclose(patch["completed_q_values"], [0.2, -0.1])
+    np.testing.assert_array_equal(patch["completed_q_mask"], [True, True])
+    assert patch["selected_action_policy_id"] == 13
 
 
 @pytest.mark.parametrize("root_prior_value", [np.nan, np.inf, -1.01, 1.01])
