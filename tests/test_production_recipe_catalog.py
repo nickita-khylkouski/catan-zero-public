@@ -41,6 +41,10 @@ APPROVED_ACTIVE_P10_PARENT_UPDATE = (
     "configs/training/a1_parent_update_active_p10_35m_b200.schema1.json",
     "a1-parent-update-active-p10-35m-b200",
 )
+APPROVED_SHARED_ACTION_PARENT_UPDATE = (
+    "configs/training/a1_parent_update_shared_action25_35m_b200.schema1.json",
+    "a1-parent-update-shared-action25-35m-b200",
+)
 
 
 @pytest.mark.parametrize("entrypoint", sorted(APPROVED))
@@ -93,6 +97,19 @@ def test_checked_in_active_p10_parent_update_recipe_is_authenticated() -> None:
     assert fields["policy_aux_active_batch_size"] == 64
     assert fields["policy_aux_loss_weight"] == pytest.approx(0.1)
     assert fields["policy_aux_sampling_mode"] == "weighted_permutation_cycles_v1"
+
+
+def test_checked_in_shared_action_parent_update_recipe_is_authenticated() -> None:
+    relative, expected_name = APPROVED_SHARED_ACTION_PARENT_UPDATE
+    path = ROOT / relative
+    payload = json.loads(path.read_text(encoding="utf-8"))
+
+    assert (
+        require_production_recipe(entrypoint="train", path=path, payload=payload)
+        == expected_name
+    )
+    fields = payload["train_config"]["fields"]
+    assert fields["shared_action_lr_mult"] == pytest.approx(0.25)
 
 
 def test_generation_recipe_round_trips_every_typed_science_field() -> None:

@@ -44,6 +44,7 @@ PIPELINE_LAUNCHERS = {
 TRAIN_LAUNCHERS = {
     "a1-current-35m-b200": "tools/a1_scratch_train.py",
     "a1-parent-update-35m-b200": "tools/train.py",
+    "a1-parent-update-shared-action25-35m-b200": "tools/train.py",
     "a1-parent-update-active-p10-35m-b200": "tools/train.py",
     "a1-parent-update-active-p25-35m-b200": "tools/train.py",
 }
@@ -54,6 +55,7 @@ PIPELINE_ACCELERATOR_MODELS = {
 TRAIN_ACCELERATOR_MODELS = {
     "a1-current-35m-b200": "NVIDIA B200",
     "a1-parent-update-35m-b200": "NVIDIA B200",
+    "a1-parent-update-shared-action25-35m-b200": "NVIDIA B200",
     "a1-parent-update-active-p10-35m-b200": "NVIDIA B200",
     "a1-parent-update-active-p25-35m-b200": "NVIDIA B200",
 }
