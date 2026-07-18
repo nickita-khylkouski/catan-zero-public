@@ -1767,15 +1767,15 @@ def test_canonical_parent_update_binds_12_step_8x64_recipe(tmp_path: Path) -> No
         "symmetry_augment": True,
     }
     assert bound["canonical_parent_update"]["checkpoint_steps"] == [8, 10]
-    assert bound["training_science_commissioning"]["authorized"] is False
-    assert bound["training_science_commissioning"]["go_authorized"] is False
+    assert bound["training_science_commissioning"]["authorized"] is True
+    assert bound["training_science_commissioning"]["go_authorized"] is True
     assert bound["training_science_commissioning"]["reason"] == (
-        "v8_parent_update_requires_fresh_commissioning"
+        "canonical_parent_update_authorized"
     )
     assert bound["promotion_eligible"] is False
-    assert bound["eligible_for_full_gate"] is False
+    assert bound["eligible_for_full_gate"] is True
     assert bound["promotion_block_reason"] == (
-        "training_science_admission_unauthorized"
+        "requires_normal_full_promotion_gates"
     )
 
 
