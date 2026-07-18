@@ -49,6 +49,10 @@ APPROVED_ACTION_SHARED_ACTION_PARENT_UPDATE = (
     "configs/training/a1_parent_update_action25_shared_action25_35m_b200.schema1.json",
     "a1-parent-update-action25-shared-action25-35m-b200",
 )
+APPROVED_SHARED_ACTION_VALUE_HEAD_PARENT_UPDATE = (
+    "configs/training/a1_parent_update_shared_action25_value25_35m_b200.schema1.json",
+    "a1-parent-update-shared-action25-value25-35m-b200",
+)
 APPROVED_VALUE_HEAD_PARENT_UPDATE = (
     "configs/training/a1_parent_update_value25_35m_b200.schema1.json",
     "a1-parent-update-value25-35m-b200",
@@ -140,6 +144,28 @@ def test_checked_in_action_shared_action_parent_update_recipe_is_authenticated()
     assert fields["shared_action_lr_mult"] == pytest.approx(0.25)
     assert fields["value_lr_mult"] == pytest.approx(1.0)
     assert fields["policy_aux_active_batch_size"] == 0
+
+
+def test_checked_in_shared_action_value_head_parent_update_recipe_is_authenticated() -> (
+    None
+):
+    relative, expected_name = APPROVED_SHARED_ACTION_VALUE_HEAD_PARENT_UPDATE
+    path = ROOT / relative
+    payload = json.loads(path.read_text(encoding="utf-8"))
+
+    assert (
+        require_production_recipe(entrypoint="train", path=path, payload=payload)
+        == expected_name
+    )
+    fields = payload["train_config"]["fields"]
+    assert fields["shared_action_lr_mult"] == pytest.approx(0.25)
+    assert fields["value_lr_mult"] == pytest.approx(0.25)
+    required_signal_modules = set(
+        payload["engine_settings"]["require_feature_learning_signal_modules"].split(
+            ","
+        )
+    )
+    assert {"action_encoder", "value_head"} <= required_signal_modules
 
 
 def test_checked_in_value_head_parent_update_recipe_is_authenticated() -> None:

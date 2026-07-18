@@ -172,7 +172,7 @@
       "commissioning_evidence": []
     },
     "a1-parent-update-shared-action25-value25-35m-b200": {
-      "recipe_canonical_sha256": "aa76029bfdb8a91b76c9ec135348ea3cee08182c1ad049bbbf1063baa9e2584d",
+      "recipe_canonical_sha256": "3e7ad5132bf52667213658d7b8f4208180a7fb85211dd8ee6a48daab5e3ffa85",
       "authorized": false,
       "reason": "combined_trust_region_requires_fresh_commissioning",
       "unresolved_requirements": [
