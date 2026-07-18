@@ -33,12 +33,56 @@ WORLD_SIZE = 8
 
 
 def _input_file(raw: str, *, label: str) -> Path:
+    source = Path(raw).expanduser()
+    if source.is_symlink():
+        raise SystemExit(f"{label} must not be a symlink: {source}")
     try:
-        value = Path(raw).expanduser().resolve(strict=True)
+        value = source.resolve(strict=True)
     except OSError as error:
         raise SystemExit(f"{label} cannot be resolved: {error}") from error
     if value.is_symlink() or not value.is_file():
         raise SystemExit(f"{label} must be a regular non-symlink file: {value}")
+    return value
+
+
+def _training_data(raw: str) -> Path:
+    """Accept the trainer's two authenticated data surfaces.
+
+    A composite is one regular descriptor file. A direct memmap corpus is the
+    directory containing ``corpus_meta.json``; passing that metadata file alone
+    loses the payload root and is therefore deliberately not rewritten here.
+    """
+
+    source = Path(raw).expanduser()
+    if source.is_symlink():
+        raise SystemExit(f"training data must not be a symlink: {source}")
+    try:
+        value = source.resolve(strict=True)
+    except OSError as error:
+        raise SystemExit(f"training data cannot be resolved: {error}") from error
+    if value.is_file():
+        return value
+    if not value.is_dir():
+        raise SystemExit(
+            "training data must be a composite descriptor file or memmap directory: "
+            f"{value}"
+        )
+    metadata = value / "corpus_meta.json"
+    if metadata.is_symlink() or not metadata.is_file():
+        raise SystemExit(
+            "memmap training directory requires regular corpus_meta.json: "
+            f"{metadata}"
+        )
+    return value
+
+
+def _python_executable(raw: str) -> Path:
+    try:
+        value = Path(raw).expanduser().resolve(strict=True)
+    except OSError as error:
+        raise SystemExit(f"Python executable cannot be resolved: {error}") from error
+    if not value.is_file() or not os.access(value, os.X_OK):
+        raise SystemExit(f"Python executable is not executable: {value}")
     return value
 
 
@@ -99,7 +143,7 @@ def command_from_args(args: argparse.Namespace) -> list[str]:
         current_science.CANONICAL_PARENT_UPDATE_CONFIG_PATH
     )
     current_science.require_selected_parent_update_go_authorized()
-    data = _input_file(args.data, label="training data descriptor")
+    data = _training_data(args.data)
     parent = _input_file(args.parent_checkpoint, label="parent checkpoint")
     initializer = _input_file(args.init_checkpoint, label="initializer checkpoint")
     migration = (
@@ -122,7 +166,7 @@ def command_from_args(args: argparse.Namespace) -> list[str]:
         )
     checkpoint = _output_file(args.checkpoint, label="candidate checkpoint")
     report = _output_file(args.report, label="training report")
-    python = _input_file(args.python, label="Python executable")
+    python = _python_executable(args.python)
     command = [
         str(python),
         "-m",
