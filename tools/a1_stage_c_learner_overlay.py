@@ -30,6 +30,7 @@ import math
 import os
 from pathlib import Path
 import shutil
+import stat
 import sys
 import tempfile
 from typing import Any, Mapping, Sequence
@@ -1751,6 +1752,50 @@ def _updated_inventory(
     return result
 
 
+def _seal_rewritten_payloads(
+    output_root: Path, rewritten_filenames: set[str]
+) -> None:
+    """Flush and make overlay-owned payloads eligible for auth caching.
+
+    Unchanged payloads are hard links to the immutable base corpus and must not
+    be chmodded here: even a no-op metadata change can invalidate the base
+    corpus authentication cache. Rewritten files are private to this overlay,
+    so sealing them before inventory hashing makes the whole published corpus
+    read-only and allows subsequent learner launches to reuse payload auth.
+    """
+
+    open_flags = os.O_RDONLY
+    open_flags |= getattr(os, "O_CLOEXEC", 0)
+    open_flags |= getattr(os, "O_NOFOLLOW", 0)
+    for filename in sorted(rewritten_filenames):
+        path = output_root / filename
+        try:
+            descriptor = os.open(path, open_flags)
+        except OSError as error:
+            raise OverlayError(f"cannot open rewritten payload for sealing: {path}") from error
+        try:
+            before = os.fstat(descriptor)
+            if not stat.S_ISREG(before.st_mode):
+                raise OverlayError(f"rewritten payload is not a regular file: {path}")
+            os.fsync(descriptor)
+            os.fchmod(descriptor, stat.S_IMODE(before.st_mode) & ~0o222)
+            os.fsync(descriptor)
+            after = os.fstat(descriptor)
+            if int(after.st_ino) != int(before.st_ino) or int(after.st_dev) != int(
+                before.st_dev
+            ):
+                raise OverlayError(f"rewritten payload identity changed while sealing: {path}")
+            if stat.S_IMODE(after.st_mode) & 0o222:
+                raise OverlayError(f"rewritten payload remained writable after sealing: {path}")
+        finally:
+            os.close(descriptor)
+    directory = os.open(output_root, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+
+
 def _unit_mean_capped_weights(raw: np.ndarray, *, cap: float) -> np.ndarray:
     values = np.asarray(raw, dtype=np.float64)
     if (
@@ -2172,11 +2217,13 @@ def _materialize(args: argparse.Namespace) -> dict[str, Any]:
         }
         if None in rewritten_filenames:
             raise OverlayError("Stage-C rewritten column unexpectedly has no payload")
+        sealed_filenames = {str(value) for value in rewritten_filenames}
+        _seal_rewritten_payloads(temporary, sealed_filenames)
         inventory = _updated_inventory(
             base_meta=base_meta,
             output_meta=meta,
             output_root=temporary,
-            rewritten_filenames={str(value) for value in rewritten_filenames},
+            rewritten_filenames=sealed_filenames,
         )
         inventory_sha = _value_sha256(inventory)
         meta["payload_inventory"] = inventory

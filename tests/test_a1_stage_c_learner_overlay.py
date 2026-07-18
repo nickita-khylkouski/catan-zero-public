@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import numpy as np
@@ -12,6 +13,25 @@ from tools import train_bc
 
 def _write(path: Path, values: np.ndarray) -> None:
     values.tofile(path)
+
+
+def test_seal_rewritten_payloads_makes_only_named_files_read_only(
+    tmp_path: Path,
+) -> None:
+    rewritten = tmp_path / "target_policy.dat"
+    preserved = tmp_path / "obs.dat"
+    rewritten.write_bytes(b"new-policy")
+    preserved.write_bytes(b"shared-observation")
+    os.chmod(rewritten, 0o644)
+    os.chmod(preserved, 0o644)
+
+    overlay._seal_rewritten_payloads(  # noqa: SLF001
+        tmp_path, {rewritten.name}
+    )
+
+    assert rewritten.read_bytes() == b"new-policy"
+    assert rewritten.stat().st_mode & 0o222 == 0
+    assert preserved.stat().st_mode & 0o222 != 0
 
 
 def _completed_q_binding_fixture() -> tuple[dict, dict[str, np.ndarray], str]:
