@@ -19323,6 +19323,8 @@ def main(
         aux_order = None
         weighted_cycle_mode = False
         epoch_policy_aux_cycle: dict[str, object] | None = None
+        epoch_policy_aux_cycle_start_offset = 0
+        epoch_policy_aux_realized_local_draws = 0
         if policy_aux_sampling_weights is not None:
             # This stream is stateless with respect to the persisted base RNG.
             # Legacy mode keeps its exact historical per-epoch seed. Cycle mode
@@ -19348,6 +19350,7 @@ def main(
                 if weighted_cycle_mode
                 else 0
             )
+            epoch_policy_aux_cycle_start_offset = global_aux_draw_offset
             aux_order = _policy_aux_epoch_order(
                 policy_aux_rng,
                 len(train_indices),
@@ -19357,16 +19360,10 @@ def main(
                 mode=str(args.policy_aux_sampling_mode),
                 global_draw_offset=global_aux_draw_offset,
             )
-            epoch_policy_aux_cycle = {
-                "epoch": int(epoch) + 1,
-                **_policy_aux_sampling_cycle_report(
-                    policy_aux_sampling_weights,
-                    local_draws=local_aux_draws,
-                    ddp=ddp,
-                    mode=str(args.policy_aux_sampling_mode),
-                    global_draw_offset=global_aux_draw_offset,
-                ),
-            }
+            # Mark this epoch as carrying an AUX stream. The authenticated
+            # cycle report is built after the loop from realized draws because
+            # an exact optimizer-step cap may stop this planned order early.
+            epoch_policy_aux_cycle = {}
         epoch_policy_component_dose: dict[str, float] = {}
         epoch_policy_component_phase_dose: dict[str, float] = {}
         epoch_value_component_dose: dict[str, float] = {}
@@ -19662,6 +19659,9 @@ def main(
                 )
                 policy_aux_source_row_counts.update(
                     int(row) for row in aux_source_rows_array
+                )
+                epoch_policy_aux_realized_local_draws += int(
+                    aux_source_rows_array.size
                 )
                 if "game_seed" in data:
                     policy_aux_seen_game_identities.update(
@@ -21309,6 +21309,14 @@ def main(
             else None
         )
         if epoch_policy_aux_cycle is not None:
+            epoch_policy_aux_cycle = _realized_policy_aux_epoch_cycle_report(
+                policy_aux_sampling_weights,
+                epoch=int(epoch) + 1,
+                realized_local_draws=epoch_policy_aux_realized_local_draws,
+                ddp=ddp,
+                mode=str(args.policy_aux_sampling_mode),
+                global_draw_offset=epoch_policy_aux_cycle_start_offset,
+            )
             policy_aux_epoch_cycles_state.append(epoch_policy_aux_cycle)
         if weighted_policy_aux_stream and policy_aux_source_reuse_resume_state is not None and (
             int(policy_aux_source_reuse_resume_state["global_draws"])
@@ -45358,6 +45366,39 @@ def _policy_aux_sampling_cycle_report(
             else "none_weighted_draws_with_replacement"
         ),
         "global_stream_rank_partition": "rank_stride",
+    }
+
+
+def _realized_policy_aux_epoch_cycle_report(
+    sample_weights: np.ndarray,
+    *,
+    epoch: int,
+    realized_local_draws: int,
+    ddp: Mapping[str, int | bool],
+    mode: str,
+    global_draw_offset: int,
+) -> dict[str, object]:
+    """Seal the AUX slice actually consumed, not the planned epoch capacity.
+
+    Exact-step runs commonly stop partway through their first corpus epoch.
+    The sampler must plan a full order up front, but checkpoint telemetry must
+    describe only batches that reached the optimizer.  Persisting the planned
+    length made the compact source-reuse counter and epoch-cycle ledger
+    disagree after an otherwise successful capped run.
+    """
+
+    draws = int(realized_local_draws)
+    if draws < 0:
+        raise ValueError("realized policy AUX draws must be non-negative")
+    return {
+        "epoch": int(epoch),
+        **_policy_aux_sampling_cycle_report(
+            sample_weights,
+            local_draws=draws,
+            ddp=ddp,
+            mode=mode,
+            global_draw_offset=int(global_draw_offset),
+        ),
     }
 
 

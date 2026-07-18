@@ -227,6 +227,28 @@ def test_cycle_report_binds_coverage_ess_and_reuse_cap() -> None:
     assert report["duplicates_before_cycle_exhaustion"] is False
 
 
+def test_realized_epoch_cycle_uses_consumed_exact_cap_not_planned_order() -> None:
+    weights = np.asarray([1.0, 2.0, 3.0, 4.0], dtype=np.float64)
+    ddp = {"enabled": True, "world_size": 8, "rank": 0}
+
+    report = train_bc._realized_policy_aux_epoch_cycle_report(  # noqa: SLF001
+        weights,
+        epoch=1,
+        realized_local_draws=12 * 64,
+        ddp=ddp,
+        mode=MODE,
+        global_draw_offset=0,
+    )
+
+    assert report["epoch"] == 1
+    assert report["local_draws_per_rank"] == 768
+    assert report["global_draws"] == 6_144
+    assert report["global_draw_end"] == 6_144
+    assert train_bc._validate_policy_aux_epoch_cycles(  # noqa: SLF001
+        [report], expected_global_draw_end=6_144
+    ) == [report]
+
+
 def test_source_reuse_resume_state_exactly_merges_disjoint_segments() -> None:
     ddp = {"enabled": False, "world_size": 1, "rank": 0}
     pre_counts = Counter({2: 2, 9: 1})
