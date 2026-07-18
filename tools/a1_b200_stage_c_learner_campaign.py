@@ -45,9 +45,15 @@ from tools import a1_one_dose_train as one_dose  # noqa: E402
 from tools import a1_stage_c_learner_overlay as overlay  # noqa: E402
 
 
-SCHEMA = "a1-b200-stage-c-aligned-learner-campaign-v6"
+SCHEMA = "a1-b200-stage-c-aligned-learner-campaign-v7"
 EXECUTION_SCHEMA = "a1-b200-stage-c-aligned-learner-execution-v2"
-FINGERPRINT_SCHEMA = "a1-b200-stage-c-aligned-learner-fingerprint-v4"
+FINGERPRINT_SCHEMA = "a1-b200-stage-c-aligned-learner-fingerprint-v5"
+BEHAVIORAL_COMPETENCE_GATE_SCHEMA = "a1-maritime-behavioral-competence-gate-v1"
+POSTHOC_BEHAVIORAL_COMPETENCE_SCHEMA = "posthoc-behavioral-competence-v1"
+PAIRED_BEHAVIORAL_COMPETENCE_SCHEMA = (
+    "posthoc-paired-parent-behavioral-competence-v1"
+)
+POLICY_BEHAVIOR_METRICS_SCHEMA = "policy-target-behavior-metrics-v1"
 POLICY_TEACHER_GAP_OBJECTIVE_SCHEMA = "posthoc-policy-teacher-gap-objective-v1"
 PAIRED_PARENT_GAP_SCHEMA = "posthoc-paired-parent-teacher-gap-v2"
 TRANSITIONAL_PAIRED_PARENT_GAP_SCHEMA = "posthoc-paired-parent-teacher-gap-v1"
@@ -233,6 +239,745 @@ def _canonical_bytes(value: object) -> bytes:
 
 def _value_sha256(value: object) -> str:
     return "sha256:" + hashlib.sha256(_canonical_bytes(value)).hexdigest()
+
+
+def _behavioral_competence_gate_contract() -> dict[str, Any]:
+    """Return the immutable Stage-C maritime competence admission contract."""
+
+    return {
+        "schema_version": BEHAVIORAL_COMPETENCE_GATE_SCHEMA,
+        "required_streams": ["base", "aux"],
+        "stream_admission": {
+            "mode": "independent",
+            "pooling": False,
+            "all_required_streams_must_pass": True,
+        },
+        "required_axis": "teacher_argmax_action_type",
+        "required_action_type": "MARITIME_TRADE",
+        "minimum_rows": 64,
+        "confidence_interval": {
+            "method": "wilson_score",
+            "sided": "one",
+            "confidence_level": 0.95,
+            "z": 1.6448536269514722,
+        },
+        "minimum_teacher_top1_lower_bound": 0.15,
+        "maximum_end_turn_confusion_upper_bound": 0.40,
+        "maximum_teacher_top1_parent_regression": 0.05,
+        "maximum_end_turn_confusion_parent_regression": 0.05,
+        "objective_weighted_diagnostic": {
+            "required": True,
+            "axis": "objective_weighted_teacher_argmax_action_type",
+            "selection_authority": False,
+        },
+        "playing_strength": {
+            "candidate_prefilter_only": True,
+            "h2h_final_ranking_authority": True,
+        },
+    }
+
+
+def _wilson_score_interval(
+    successes: int, total: int, *, z: float
+) -> tuple[float, float]:
+    """Return the Wilson score interval used by the one-sided competence gate."""
+
+    if isinstance(successes, bool) or isinstance(total, bool):
+        raise CampaignError("behavioral competence counts must be integers")
+    if int(successes) != successes or int(total) != total:
+        raise CampaignError("behavioral competence counts must be integers")
+    hits = int(successes)
+    rows = int(total)
+    critical = float(z)
+    if (
+        rows <= 0
+        or hits < 0
+        or hits > rows
+        or not math.isfinite(critical)
+        or critical <= 0.0
+    ):
+        raise CampaignError("behavioral competence counts/critical value are invalid")
+    rate = hits / rows
+    z2 = critical * critical
+    denominator = 1.0 + z2 / rows
+    center = (rate + z2 / (2.0 * rows)) / denominator
+    radius = (
+        critical
+        * math.sqrt((rate * (1.0 - rate) + z2 / (4.0 * rows)) / rows)
+        / denominator
+    )
+    return max(0.0, center - radius), min(1.0, center + radius)
+
+
+def _require_behavior_rate(value: object, *, where: str) -> float:
+    try:
+        rate = float(value)
+    except (TypeError, ValueError) as error:
+        raise CampaignError(f"{where} must be a finite probability") from error
+    if not math.isfinite(rate) or not 0.0 <= rate <= 1.0:
+        raise CampaignError(f"{where} must be a finite probability")
+    return rate
+
+
+def _integer_successes(rate: float, rows: int, *, where: str) -> int:
+    scaled = rate * rows
+    successes = round(scaled)
+    if not math.isclose(scaled, successes, rel_tol=0.0, abs_tol=1.0e-9):
+        raise CampaignError(f"{where} is not backed by an integer count")
+    return int(successes)
+
+
+def _require_action_catalog_abi(value: object, *, where: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise CampaignError(f"{where} action-catalog ABI is missing")
+    required = {
+        "version",
+        "size",
+        "ordered_descriptors_sha256",
+        "action_types_by_id_sha256",
+        "identity_sha256",
+    }
+    if set(value) != required:
+        raise CampaignError(f"{where} action-catalog ABI is malformed")
+    digest_keys = (
+        "ordered_descriptors_sha256",
+        "action_types_by_id_sha256",
+        "identity_sha256",
+    )
+    if (
+        isinstance(value["size"], bool)
+        or not isinstance(value["size"], int)
+        or value["size"] <= 0
+        or not isinstance(value["version"], str)
+        or not value["version"]
+        or any(
+            not isinstance(value[key], str)
+            or len(value[key]) != 71
+            or not value[key].startswith("sha256:")
+            or any(character not in "0123456789abcdef" for character in value[key][7:])
+            for key in digest_keys
+        )
+    ):
+        raise CampaignError(f"{where} action-catalog ABI is malformed")
+    unsigned = {key: item for key, item in value.items() if key != "identity_sha256"}
+    if value["identity_sha256"] != _value_sha256(unsigned):
+        raise CampaignError(f"{where} action-catalog ABI identity is inconsistent")
+    return copy.deepcopy(value)
+
+
+def _require_behavior_metrics(
+    value: object,
+    *,
+    rows: int,
+    where: str,
+) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise CampaignError(f"{where} behavioral metrics are missing")
+    top1 = _require_behavior_rate(
+        value.get("teacher_top1_accuracy"),
+        where=f"{where} teacher_top1_accuracy",
+    )
+    confusion = _require_behavior_rate(
+        value.get("end_turn_confusion_rate"),
+        where=f"{where} end_turn_confusion_rate",
+    )
+    result: dict[str, Any] = {
+        "teacher_top1_accuracy": top1,
+        "end_turn_confusion_rate": confusion,
+        "teacher_top1_successes": _integer_successes(
+            top1, rows, where=f"{where} teacher_top1_accuracy"
+        ),
+        "end_turn_confusions": _integer_successes(
+            confusion, rows, where=f"{where} end_turn_confusion_rate"
+        ),
+    }
+    required_metrics = (
+        "end_turn_confusion_teacher_probability_regret_per_row",
+        "end_turn_confusion_teacher_probability_regret_conditional_mean",
+    )
+    for key in (
+        "teacher_top3_accuracy",
+        "teacher_top3_mass",
+        *required_metrics,
+    ):
+        if key not in value:
+            if key in required_metrics:
+                raise CampaignError(f"{where} {key} is missing")
+            continue
+        try:
+            metric = float(value[key])
+        except (TypeError, ValueError) as error:
+            raise CampaignError(f"{where} {key} is malformed") from error
+        if not math.isfinite(metric) or metric < 0.0:
+            raise CampaignError(f"{where} {key} is malformed")
+        if key in {"teacher_top3_accuracy", "teacher_top3_mass"} and metric > 1.0:
+            raise CampaignError(f"{where} {key} is malformed")
+        result[key] = metric
+    return result
+
+
+def _require_weighted_behavior_metrics(
+    value: object,
+    *,
+    where: str,
+) -> dict[str, float]:
+    """Validate objective-weighted metrics without inventing binomial counts."""
+
+    if not isinstance(value, dict):
+        raise CampaignError(f"{where} weighted behavioral metrics are missing")
+    result = {
+        "teacher_top1_accuracy": _require_behavior_rate(
+            value.get("teacher_top1_accuracy"),
+            where=f"{where} teacher_top1_accuracy",
+        ),
+        "end_turn_confusion_rate": _require_behavior_rate(
+            value.get("end_turn_confusion_rate"),
+            where=f"{where} end_turn_confusion_rate",
+        ),
+    }
+    for key in (
+        "end_turn_confusion_teacher_probability_regret_per_row",
+        "end_turn_confusion_teacher_probability_regret_conditional_mean",
+    ):
+        try:
+            metric = float(value[key])
+        except (KeyError, TypeError, ValueError) as error:
+            raise CampaignError(f"{where} {key} is missing or malformed") from error
+        if not math.isfinite(metric) or metric < 0.0:
+            raise CampaignError(f"{where} {key} is malformed")
+        result[key] = metric
+    for key in ("teacher_top3_accuracy", "teacher_top3_mass"):
+        if key not in value:
+            continue
+        result[key] = _require_behavior_rate(value[key], where=f"{where} {key}")
+    return result
+
+
+def _require_paired_weighted_behavior_metrics(
+    value: object,
+    *,
+    candidate: Mapping[str, float],
+    parent: Mapping[str, float],
+    row_probability: float,
+    where: str,
+) -> dict[str, float]:
+    if not isinstance(value, dict):
+        raise CampaignError(f"{where} paired weighted metrics are missing")
+    try:
+        paired_probability = float(value["row_probability"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise CampaignError(f"{where} paired row probability is missing") from error
+    if not math.isfinite(paired_probability) or not math.isclose(
+        paired_probability, row_probability, rel_tol=0.0, abs_tol=1.0e-12
+    ):
+        raise CampaignError(f"{where} paired row probability differs")
+    paired_parent = _require_weighted_behavior_metrics(
+        value.get("parent"), where=f"{where} parent"
+    )
+    paired_candidate = _require_weighted_behavior_metrics(
+        value.get("candidate"), where=f"{where} candidate"
+    )
+    if paired_parent != dict(parent) or paired_candidate != dict(candidate):
+        raise CampaignError(f"{where} paired projections differ from direct metrics")
+    deltas = value.get("candidate_minus_parent")
+    if not isinstance(deltas, dict):
+        raise CampaignError(f"{where} paired deltas are missing")
+    projected: dict[str, float] = {}
+    for key in candidate:
+        if key not in parent:
+            raise CampaignError(f"{where} parent metric keys differ")
+        expected = float(candidate[key]) - float(parent[key])
+        try:
+            actual = float(deltas[key])
+        except (KeyError, TypeError, ValueError) as error:
+            raise CampaignError(f"{where} paired delta {key} is missing") from error
+        if not math.isfinite(actual) or not math.isclose(
+            actual, expected, rel_tol=0.0, abs_tol=1.0e-12
+        ):
+            raise CampaignError(f"{where} paired delta {key} is inconsistent")
+        projected[key] = actual
+    return projected
+
+
+def _require_paired_behavior_metrics(
+    value: object,
+    *,
+    candidate: Mapping[str, Any],
+    parent: Mapping[str, Any],
+    rows: int,
+    where: str,
+) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise CampaignError(f"{where} paired behavioral metrics are missing")
+    if int(value.get("rows", -1)) != rows:
+        raise CampaignError(f"{where} paired row count differs")
+    paired_parent = _require_behavior_metrics(
+        value.get("parent"), rows=rows, where=f"{where} parent"
+    )
+    paired_candidate = _require_behavior_metrics(
+        value.get("candidate"), rows=rows, where=f"{where} candidate"
+    )
+    if paired_parent != dict(parent) or paired_candidate != dict(candidate):
+        raise CampaignError(f"{where} paired projections differ from direct metrics")
+    deltas = value.get("candidate_minus_parent")
+    if not isinstance(deltas, dict):
+        raise CampaignError(f"{where} paired deltas are missing")
+    metric_keys = set(candidate) - {
+        "teacher_top1_successes",
+        "end_turn_confusions",
+    }
+    if metric_keys != set(parent) - {
+        "teacher_top1_successes",
+        "end_turn_confusions",
+    }:
+        raise CampaignError(f"{where} parent metric keys differ")
+    required_deltas = {
+        key: float(candidate[key]) - float(parent[key])
+        for key in metric_keys
+    }
+    projected: dict[str, float] = {}
+    for key, expected in required_deltas.items():
+        try:
+            actual = float(deltas[key])
+        except (KeyError, TypeError, ValueError) as error:
+            raise CampaignError(f"{where} paired delta {key} is missing") from error
+        if not math.isfinite(actual) or not math.isclose(
+            actual, expected, rel_tol=0.0, abs_tol=1.0e-12
+        ):
+            raise CampaignError(f"{where} paired delta {key} is inconsistent")
+        projected[key] = actual
+    return projected
+
+
+def _behavior_stream(
+    projection: Mapping[str, Any],
+    *,
+    stream: str,
+    where: str,
+    require_schema: bool = True,
+) -> dict[str, Any]:
+    streams = projection.get("streams")
+    if not isinstance(streams, dict) or not isinstance(streams.get(stream), dict):
+        raise CampaignError(f"{where} required {stream} stream is missing")
+    result = streams[stream]
+    if require_schema and result.get("schema_version") != POLICY_BEHAVIOR_METRICS_SCHEMA:
+        raise CampaignError(f"{where} behavioral metric schema drifted")
+    return result
+
+
+def _evaluate_maritime_behavioral_competence_gate(
+    functional: Mapping[str, Any],
+    *,
+    contract: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Authenticate posthoc evidence and evaluate the maritime prefilter."""
+
+    expected_contract = _behavioral_competence_gate_contract()
+    supplied_contract = expected_contract if contract is None else dict(contract)
+    if supplied_contract != expected_contract:
+        raise CampaignError("maritime behavioral competence contract drifted")
+    candidate_projection = functional.get("behavioral_competence")
+    parent_projection = functional.get("parent_behavioral_competence")
+    paired_projection = functional.get("paired_parent_behavioral_competence")
+    if (
+        not isinstance(candidate_projection, dict)
+        or candidate_projection.get("schema_version")
+        != POSTHOC_BEHAVIORAL_COMPETENCE_SCHEMA
+        or candidate_projection.get("selection_authority") is not False
+        or not isinstance(parent_projection, dict)
+        or parent_projection.get("schema_version")
+        != POSTHOC_BEHAVIORAL_COMPETENCE_SCHEMA
+        or parent_projection.get("selection_authority") is not False
+        or not isinstance(paired_projection, dict)
+        or paired_projection.get("schema_version")
+        != PAIRED_BEHAVIORAL_COMPETENCE_SCHEMA
+        or paired_projection.get("selection_authority") is not False
+    ):
+        raise CampaignError("posthoc maritime behavioral competence surface is missing")
+
+    axis_name = str(expected_contract["required_axis"])
+    action_type = str(expected_contract["required_action_type"])
+    objective_axis = str(
+        expected_contract["objective_weighted_diagnostic"]["axis"]
+    )
+    evidence_streams: dict[str, Any] = {}
+    shared_abi: dict[str, Any] | None = None
+    for stream_name in expected_contract["required_streams"]:
+        candidate_stream = _behavior_stream(
+            candidate_projection, stream=stream_name, where="candidate"
+        )
+        parent_stream = _behavior_stream(
+            parent_projection, stream=stream_name, where="parent"
+        )
+        paired_stream = _behavior_stream(
+            paired_projection,
+            stream=stream_name,
+            where="paired parent",
+            require_schema=False,
+        )
+        candidate_abi = _require_action_catalog_abi(
+            candidate_stream.get("action_catalog_abi"),
+            where=f"candidate {stream_name}",
+        )
+        parent_abi = _require_action_catalog_abi(
+            parent_stream.get("action_catalog_abi"),
+            where=f"parent {stream_name}",
+        )
+        paired_abi = _require_action_catalog_abi(
+            paired_stream.get("action_catalog_abi"),
+            where=f"paired parent {stream_name}",
+        )
+        if candidate_abi != parent_abi or candidate_abi != paired_abi:
+            raise CampaignError(
+                f"{stream_name} maritime behavioral competence ABI differs"
+            )
+        if shared_abi is None:
+            shared_abi = candidate_abi
+        elif candidate_abi != shared_abi:
+            raise CampaignError(
+                "maritime behavioral competence ABI differs across streams"
+            )
+
+        try:
+            candidate_row = candidate_stream[axis_name][action_type]
+            parent_row = parent_stream[axis_name][action_type]
+            paired_row = paired_stream[axis_name][action_type]
+        except (KeyError, TypeError) as error:
+            raise CampaignError(
+                f"{stream_name} uniform maritime behavioral stratum is missing"
+            ) from error
+        if not isinstance(candidate_row, dict) or not isinstance(parent_row, dict):
+            raise CampaignError(
+                f"{stream_name} uniform maritime behavioral stratum is malformed"
+            )
+        candidate_rows = candidate_row.get("rows")
+        parent_rows = parent_row.get("rows")
+        if (
+            isinstance(candidate_rows, bool)
+            or not isinstance(candidate_rows, int)
+            or isinstance(parent_rows, bool)
+            or not isinstance(parent_rows, int)
+            or candidate_rows <= 0
+            or parent_rows != candidate_rows
+        ):
+            raise CampaignError(
+                f"{stream_name} uniform maritime row count is malformed"
+            )
+        rows = candidate_rows
+        candidate_metrics = _require_behavior_metrics(
+            candidate_row, rows=rows, where=f"candidate {stream_name} maritime"
+        )
+        parent_metrics = _require_behavior_metrics(
+            parent_row, rows=rows, where=f"parent {stream_name} maritime"
+        )
+        paired_deltas = _require_paired_behavior_metrics(
+            paired_row,
+            candidate=candidate_metrics,
+            parent=parent_metrics,
+            rows=rows,
+            where=f"paired {stream_name} maritime",
+        )
+
+        try:
+            candidate_objective = candidate_stream[objective_axis][action_type]
+            parent_objective = parent_stream[objective_axis][action_type]
+            paired_objective = paired_stream[objective_axis][action_type]
+        except (KeyError, TypeError) as error:
+            raise CampaignError(
+                f"{stream_name} objective-weighted maritime diagnostic is missing"
+            ) from error
+        if not all(
+            isinstance(row, dict)
+            for row in (candidate_objective, parent_objective, paired_objective)
+        ):
+            raise CampaignError(
+                f"{stream_name} objective-weighted maritime diagnostic is malformed"
+            )
+        try:
+            candidate_probability = float(candidate_objective["row_probability"])
+            parent_probability = float(parent_objective["row_probability"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise CampaignError(
+                f"{stream_name} objective-weighted row probability is missing"
+            ) from error
+        if (
+            not math.isfinite(candidate_probability)
+            or candidate_probability <= 0.0
+            or not math.isclose(
+                candidate_probability,
+                parent_probability,
+                rel_tol=0.0,
+                abs_tol=1.0e-12,
+            )
+        ):
+            raise CampaignError(
+                f"{stream_name} objective-weighted row probability differs"
+            )
+        objective_candidate = _require_weighted_behavior_metrics(
+            candidate_objective,
+            where=f"candidate {stream_name} objective-weighted maritime",
+        )
+        objective_parent = _require_weighted_behavior_metrics(
+            parent_objective,
+            where=f"parent {stream_name} objective-weighted maritime",
+        )
+        objective_deltas = _require_paired_weighted_behavior_metrics(
+            paired_objective,
+            candidate=objective_candidate,
+            parent=objective_parent,
+            row_probability=candidate_probability,
+            where=f"paired {stream_name} objective-weighted maritime",
+        )
+        evidence_streams[str(stream_name)] = {
+            "axis": axis_name,
+            "action_type": action_type,
+            "action_catalog_abi": candidate_abi,
+            "rows": rows,
+            "candidate": candidate_metrics,
+            "parent": parent_metrics,
+            "candidate_minus_parent": paired_deltas,
+            "objective_weighted_diagnostic": {
+                "axis": objective_axis,
+                "selection_authority": False,
+                "row_probability": candidate_probability,
+                "candidate": objective_candidate,
+                "parent": objective_parent,
+                "candidate_minus_parent": objective_deltas,
+            },
+        }
+    evidence = {"streams": evidence_streams}
+    return _maritime_behavioral_competence_gate_from_evidence(
+        evidence, contract=expected_contract
+    )
+
+
+def _maritime_behavioral_competence_gate_from_evidence(
+    evidence: Mapping[str, Any],
+    *,
+    contract: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Recompute the canonical gate result from stored, authenticated evidence."""
+
+    expected_contract = _behavioral_competence_gate_contract()
+    supplied_contract = expected_contract if contract is None else dict(contract)
+    if supplied_contract != expected_contract:
+        raise CampaignError("maritime behavioral competence contract drifted")
+    streams = evidence.get("streams")
+    if not isinstance(streams, dict) or set(streams) != set(
+        expected_contract["required_streams"]
+    ):
+        raise CampaignError("maritime behavioral competence evidence streams drifted")
+    canonical_streams: dict[str, Any] = {}
+    stream_checks: dict[str, Any] = {}
+    shared_abi: dict[str, Any] | None = None
+    for stream_name in expected_contract["required_streams"]:
+        stream = streams.get(stream_name)
+        if not isinstance(stream, dict):
+            raise CampaignError(
+                f"{stream_name} maritime behavioral evidence is malformed"
+            )
+        try:
+            rows = int(stream["rows"])
+            candidate = stream["candidate"]
+            parent = stream["parent"]
+            candidate_top1 = float(candidate["teacher_top1_accuracy"])
+            candidate_confusion = float(candidate["end_turn_confusion_rate"])
+            parent_top1 = float(parent["teacher_top1_accuracy"])
+            parent_confusion = float(parent["end_turn_confusion_rate"])
+            top1_successes = int(candidate["teacher_top1_successes"])
+            confusions = int(candidate["end_turn_confusions"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise CampaignError(
+                f"{stream_name} maritime behavioral evidence is malformed"
+            ) from error
+        if (
+            stream.get("axis") != expected_contract["required_axis"]
+            or stream.get("action_type") != expected_contract["required_action_type"]
+        ):
+            raise CampaignError(
+                f"{stream_name} maritime behavioral evidence scope drifted"
+            )
+        abi = _require_action_catalog_abi(
+            stream.get("action_catalog_abi"),
+            where=f"stored {stream_name} evidence",
+        )
+        if shared_abi is None:
+            shared_abi = abi
+        elif abi != shared_abi:
+            raise CampaignError(
+                "stored maritime behavioral ABI differs across streams"
+            )
+        candidate_metrics = _require_behavior_metrics(
+            candidate, rows=rows, where=f"stored candidate {stream_name}"
+        )
+        parent_metrics = _require_behavior_metrics(
+            parent, rows=rows, where=f"stored parent {stream_name}"
+        )
+        if (
+            candidate_metrics != candidate
+            or parent_metrics != parent
+            or top1_successes != candidate_metrics["teacher_top1_successes"]
+            or confusions != candidate_metrics["end_turn_confusions"]
+        ):
+            raise CampaignError(
+                f"{stream_name} maritime behavioral stored counts differ"
+            )
+        deltas = _require_paired_behavior_metrics(
+            {
+                "rows": rows,
+                "parent": parent,
+                "candidate": candidate,
+                "candidate_minus_parent": stream.get("candidate_minus_parent"),
+            },
+            candidate=candidate_metrics,
+            parent=parent_metrics,
+            rows=rows,
+            where=f"stored paired {stream_name}",
+        )
+        objective = stream.get("objective_weighted_diagnostic")
+        if (
+            not isinstance(objective, dict)
+            or objective.get("axis")
+            != expected_contract["objective_weighted_diagnostic"]["axis"]
+            or objective.get("selection_authority") is not False
+        ):
+            raise CampaignError(
+                f"{stream_name} objective-weighted diagnostic evidence is missing"
+            )
+        try:
+            row_probability = float(objective["row_probability"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise CampaignError(
+                f"{stream_name} objective-weighted probability is malformed"
+            ) from error
+        if not math.isfinite(row_probability) or row_probability <= 0.0:
+            raise CampaignError(
+                f"{stream_name} objective-weighted probability is malformed"
+            )
+        objective_candidate = _require_weighted_behavior_metrics(
+            objective.get("candidate"),
+            where=f"stored candidate {stream_name} objective-weighted",
+        )
+        objective_parent = _require_weighted_behavior_metrics(
+            objective.get("parent"),
+            where=f"stored parent {stream_name} objective-weighted",
+        )
+        objective_deltas = _require_paired_weighted_behavior_metrics(
+            {
+                "row_probability": row_probability,
+                "parent": objective_parent,
+                "candidate": objective_candidate,
+                "candidate_minus_parent": objective.get("candidate_minus_parent"),
+            },
+            candidate=objective_candidate,
+            parent=objective_parent,
+            row_probability=row_probability,
+            where=f"stored paired {stream_name} objective-weighted",
+        )
+        z = float(expected_contract["confidence_interval"]["z"])
+        top1_lower, _ = _wilson_score_interval(top1_successes, rows, z=z)
+        _, confusion_upper = _wilson_score_interval(confusions, rows, z=z)
+        checks = {
+            "minimum_rows": rows >= int(expected_contract["minimum_rows"]),
+            "teacher_top1_lower_bound": (
+                top1_lower
+                >= float(expected_contract["minimum_teacher_top1_lower_bound"])
+            ),
+            "end_turn_confusion_upper_bound": (
+                confusion_upper
+                <= float(
+                    expected_contract["maximum_end_turn_confusion_upper_bound"]
+                )
+            ),
+            "teacher_top1_parent_regression": (
+                candidate_top1 - parent_top1
+                >= -float(
+                    expected_contract["maximum_teacher_top1_parent_regression"]
+                )
+            ),
+            "end_turn_confusion_parent_regression": (
+                candidate_confusion - parent_confusion
+                <= float(
+                    expected_contract[
+                        "maximum_end_turn_confusion_parent_regression"
+                    ]
+                )
+            ),
+            "objective_weighted_diagnostic_present": True,
+        }
+        canonical_streams[str(stream_name)] = {
+            "axis": expected_contract["required_axis"],
+            "action_type": expected_contract["required_action_type"],
+            "action_catalog_abi": abi,
+            "rows": rows,
+            "candidate": candidate_metrics,
+            "parent": parent_metrics,
+            "candidate_minus_parent": deltas,
+            "objective_weighted_diagnostic": {
+                "axis": objective["axis"],
+                "selection_authority": False,
+                "row_probability": row_probability,
+                "candidate": objective_candidate,
+                "parent": objective_parent,
+                "candidate_minus_parent": objective_deltas,
+            },
+            "confidence_bounds": {
+                "teacher_top1_lower": top1_lower,
+                "end_turn_confusion_upper": confusion_upper,
+            },
+        }
+        stream_checks[str(stream_name)] = checks
+    passed = all(all(check.values()) for check in stream_checks.values())
+    canonical_evidence = {"streams": canonical_streams}
+    checks = {
+        "streams": stream_checks,
+        "all_required_streams": passed,
+    }
+    return {
+        "schema_version": BEHAVIORAL_COMPETENCE_GATE_SCHEMA,
+        "selection_authority": True,
+        "contract": expected_contract,
+        "evidence": canonical_evidence,
+        "checks": checks,
+        "passed": passed,
+        "selection_admitted": passed,
+    }
+
+
+def _require_maritime_behavioral_competence_gate_result(
+    value: object,
+    *,
+    expected_contract: Mapping[str, Any] | None = None,
+    where: str,
+) -> dict[str, Any]:
+    """Validate a stored gate by recomputing it from evidence."""
+
+    if not isinstance(value, dict):
+        raise CampaignError(f"{where} maritime behavioral competence gate is missing")
+    contract = (
+        _behavioral_competence_gate_contract()
+        if expected_contract is None
+        else dict(expected_contract)
+    )
+    if (
+        value.get("schema_version") != BEHAVIORAL_COMPETENCE_GATE_SCHEMA
+        or value.get("selection_authority") is not True
+        or value.get("contract") != contract
+        or not isinstance(value.get("evidence"), dict)
+    ):
+        raise CampaignError(f"{where} maritime behavioral competence gate is malformed")
+    evidence = copy.deepcopy(value["evidence"])
+    for stream in evidence.get("streams", {}).values():
+        if isinstance(stream, dict):
+            stream.pop("confidence_bounds", None)
+    recomputed = _maritime_behavioral_competence_gate_from_evidence(
+        evidence, contract=contract
+    )
+    if recomputed != value:
+        raise CampaignError(
+            f"{where} maritime behavioral competence gate differs from evidence"
+        )
+    return recomputed
 
 
 def _file_sha256(path: Path) -> str:
@@ -888,15 +1633,18 @@ def _plan(args: argparse.Namespace) -> dict[str, Any]:
             "checkpoint_steps": list(CHECKPOINT_STEPS),
             "max_parent_kl": MAX_PARENT_KL,
             "max_trunk_relative_l2": MAX_TRUNK_RELATIVE_L2,
-            "requires_positive_fresh_parent_teacher_gap_closure": True,
+            "requires_positive_fresh_parent_teacher_gap_closure": False,
             "requires_checkpoint_local_feature_learning_signal": True,
             "earliest_feature_signal_step": TRAIN_DIAGNOSTIC_CADENCE_BATCHES,
             "stored_generation_prior_selection_authority": False,
             "objective": (
-                "minimum_update_with_positive_fresh_parent_uptake_within_"
-                "posthoc_trust_budgets_then_paired_play"
+                "maritime_behavior_prefilter_then_minimum_update_within_"
+                "posthoc_trust_budgets_then_h2h_final_ranking"
             ),
             "teacher_gap_closure_ranking_authority": False,
+            "behavioral_competence_gate": (
+                _behavioral_competence_gate_contract()
+            ),
             "value_quality_gate": {
                 "policy": str(
                     getattr(args, "value_gate_policy", VALUE_GATE_POLICY)
@@ -1565,39 +2313,35 @@ def _functional_artifact_path(
     allow_separate_parent: bool,
     expected_bindings: Mapping[str, Any],
 ) -> Path:
-    """Prefer reusable fresh-parent evidence; never overwrite existing bytes."""
+    """Reuse only the competence-versioned, freshly authenticated evidence."""
 
-    fresh = output_root / f"step{step:04d}.functional.fresh-parent.json"
-    legacy = output_root / f"step{step:04d}.functional.json"
-    for candidate in (fresh, legacy):
-        if candidate.is_symlink():
-            raise CampaignError(
-                f"functional artifact must not be a symlink: {candidate}"
-            )
-        if not candidate.is_file():
-            continue
-        payload = _load_json(candidate, where=f"step {step} functional evidence")[1]
-        _authenticate_cached_functional_evidence(
-            payload, expected=expected_bindings, step=step
+    del allow_separate_parent
+    versioned = (
+        output_root / f"step{step:04d}.functional.maritime-competence.json"
+    )
+    if versioned.is_symlink():
+        raise CampaignError(
+            f"functional artifact must not be a symlink: {versioned}"
         )
-        paired = payload.get("paired_parent_teacher_gap")
-        if isinstance(paired, dict) and paired.get("schema_version") in {
-            PAIRED_PARENT_GAP_SCHEMA,
-            TRANSITIONAL_PAIRED_PARENT_GAP_SCHEMA,
-        }:
-            return candidate
-        if (
-            allow_separate_parent
-            and candidate == legacy
-            and payload.get("schema_version") == "posthoc-checkpoint-teacher-gap/v1"
-            and isinstance(payload.get("teacher_gap"), dict)
-        ):
-            return candidate
-        if candidate == fresh:
-            raise CampaignError(
-                f"fresh-parent functional artifact is malformed: {fresh}"
-            )
-    return fresh
+    if not versioned.is_file():
+        return versioned
+    payload = _load_json(
+        versioned, where=f"step {step} maritime competence functional evidence"
+    )[1]
+    _authenticate_cached_functional_evidence(
+        payload, expected=expected_bindings, step=step
+    )
+    paired = payload.get("paired_parent_teacher_gap")
+    if (
+        not isinstance(paired, dict)
+        or paired.get("schema_version")
+        not in {PAIRED_PARENT_GAP_SCHEMA, TRANSITIONAL_PAIRED_PARENT_GAP_SCHEMA}
+    ):
+        raise CampaignError(
+            f"maritime competence functional artifact is malformed: {versioned}"
+        )
+    _evaluate_maritime_behavioral_competence_gate(payload)
+    return versioned
 
 
 def _authenticate_cached_functional_evidence(
@@ -1684,6 +2428,7 @@ def _select_fingerprint_winner(
     records: Sequence[Mapping[str, Any]],
     *,
     expected_objective: Mapping[str, Any] | None = None,
+    expected_behavioral_competence_gate: Mapping[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     """Nominate the smallest representation- and value-safe update.
 
@@ -1699,11 +2444,24 @@ def _select_fingerprint_winner(
         if expected_objective is None
         else dict(expected_objective)
     )
+    behavior_contract = (
+        _behavioral_competence_gate_contract()
+        if expected_behavioral_competence_gate is None
+        else dict(expected_behavioral_competence_gate)
+    )
+    authenticated_gates: dict[int, dict[str, Any]] = {}
     for row in records:
         _require_policy_teacher_gap_objective(
             row.get("policy_teacher_gap_objective"),
             expected=expected,
             where=f"step {row.get('step', '?')} fingerprint",
+        )
+        authenticated_gates[id(row)] = (
+            _require_maritime_behavioral_competence_gate_result(
+                row.get("behavioral_competence_gate"),
+                expected_contract=behavior_contract,
+                where=f"step {row.get('step', '?')} fingerprint",
+            )
         )
 
     eligible = [
@@ -1717,6 +2475,7 @@ def _select_fingerprint_winner(
             row.get("value_quality_gate", {}).get("passed"),
         )
         is True
+        and authenticated_gates[id(row)]["selection_admitted"] is True
     ]
     if not eligible:
         return None
@@ -1989,6 +2748,11 @@ def _fingerprint(
     plan_path: Path, plan: Mapping[str, Any], *, go: bool, device: str
 ) -> dict[str, Any]:
     _verify_inputs(plan)
+    behavior_contract = plan.get("selection_contract", {}).get(
+        "behavioral_competence_gate"
+    )
+    if behavior_contract != _behavioral_competence_gate_contract():
+        raise CampaignError("Stage-C maritime behavioral gate contract drifted")
     receipt_path, receipt, report, report_payload = (
         _authenticate_completed_stage_c_dose(plan)
     )
@@ -2201,6 +2965,9 @@ def _fingerprint(
                 ]
             ),
         )
+        behavior_gate = _evaluate_maritime_behavioral_competence_gate(
+            functional, contract=behavior_contract
+        )
         legacy_closure = fresh_gap["legacy_stored_prior_closure"]
         trunk = _trunk_relative_l2(drift)
         feature_signal = _checkpoint_feature_learning_signal(
@@ -2210,9 +2977,8 @@ def _fingerprint(
             feature_signal["authenticated"] is True
             and parent_kl <= MAX_PARENT_KL
             and trunk <= MAX_TRUNK_RELATIVE_L2
-            and fresh_gap["absolute_closure"] > 0.0
-            and fresh_gap["relative_closure"] > 0.0
             and value_gate["selection_admitted"]
+            and behavior_gate["selection_admitted"]
         )
         records.append(
             {
@@ -2243,6 +3009,7 @@ def _fingerprint(
                 ],
                 "feature_learning_signal": feature_signal,
                 "value_quality_gate": value_gate,
+                "behavioral_competence_gate": behavior_gate,
                 "eligible": eligible,
                 "functional": {
                     "path": str(functional_path),
@@ -2263,6 +3030,7 @@ def _fingerprint(
     winner = _select_fingerprint_winner(
         records,
         expected_objective=policy_teacher_gap_objective,
+        expected_behavioral_competence_gate=behavior_contract,
     )
     payload: dict[str, Any] = {
         "schema_version": FINGERPRINT_SCHEMA,
@@ -2292,14 +3060,15 @@ def _fingerprint(
         "optimizer_batch_kl_used_as_trust_authority": False,
         "stored_generation_prior_used_as_selection_authority": False,
         "selection_objective": (
-            "minimum_update_with_positive_fresh_parent_uptake_within_parent_"
-            "kl_and_trunk_drift_budgets"
+            "maritime_behavior_prefilter_then_minimum_update_within_parent_"
+            "kl_and_trunk_drift_budgets_then_h2h_final_ranking"
         ),
         "teacher_gap_closure_ranking_authority": False,
         "policy_teacher_gap_objective": policy_teacher_gap_objective,
         "value_quality_gate": copy.deepcopy(
             plan["selection_contract"]["value_quality_gate"]
         ),
+        "behavioral_competence_gate": copy.deepcopy(behavior_contract),
         "output": str(_fresh_parent_fingerprint_path(plan)),
         "checkpoints": records,
         "winner": winner,

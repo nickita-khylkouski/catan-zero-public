@@ -20,6 +20,124 @@ def _policy_teacher_gap_objective() -> dict[str, object]:
     )
 
 
+def _action_catalog_abi() -> dict[str, object]:
+    unsigned: dict[str, object] = {
+        "version": "catanatron-flat-v1",
+        "size": 4,
+        "ordered_descriptors_sha256": "sha256:" + "1" * 64,
+        "action_types_by_id_sha256": "sha256:" + "2" * 64,
+    }
+    return {
+        **unsigned,
+        "identity_sha256": campaign._value_sha256(unsigned),  # noqa: SLF001
+    }
+
+
+def _behavior_metrics(*, rows: int, top1: int, confusion: int) -> dict[str, object]:
+    return {
+        "rows": rows,
+        "teacher_top1_accuracy": top1 / rows,
+        "end_turn_confusion_rate": confusion / rows,
+        "end_turn_confusion_teacher_probability_regret_per_row": 0.1,
+        "end_turn_confusion_teacher_probability_regret_conditional_mean": 0.2,
+    }
+
+
+def _weighted_behavior_metrics(
+    *,
+    top1: float = 0.21337,
+    confusion: float = 0.30861,
+) -> dict[str, object]:
+    return {
+        "row_probability": 0.193,
+        "teacher_top1_accuracy": top1,
+        "end_turn_confusion_rate": confusion,
+        "end_turn_confusion_teacher_probability_regret_per_row": 0.113,
+        "end_turn_confusion_teacher_probability_regret_conditional_mean": 0.271,
+    }
+
+
+def _paired_behavior_row(
+    candidate: dict[str, object], parent: dict[str, object]
+) -> dict[str, object]:
+    count_key = "rows" if "rows" in candidate else "row_probability"
+    metric_keys = set(candidate) - {count_key}
+    return {
+        count_key: candidate[count_key],
+        "parent": {key: parent[key] for key in metric_keys},
+        "candidate": {key: candidate[key] for key in metric_keys},
+        "candidate_minus_parent": {
+            key: float(candidate[key]) - float(parent[key]) for key in metric_keys
+        },
+    }
+
+
+def _behavioral_functional(
+    *,
+    base: tuple[int, int] = (20, 29),
+    aux: tuple[int, int] = (20, 29),
+) -> dict[str, object]:
+    abi = _action_catalog_abi()
+    candidate_streams: dict[str, object] = {}
+    parent_streams: dict[str, object] = {}
+    paired_streams: dict[str, object] = {}
+    for stream, counts in (("base", base), ("aux", aux)):
+        candidate = _behavior_metrics(rows=94, top1=counts[0], confusion=counts[1])
+        parent = _behavior_metrics(rows=94, top1=20, confusion=29)
+        weighted_candidate = _weighted_behavior_metrics()
+        weighted_parent = _weighted_behavior_metrics(top1=0.203, confusion=0.302)
+        candidate_streams[stream] = {
+            "schema_version": campaign.POLICY_BEHAVIOR_METRICS_SCHEMA,
+            "action_catalog_abi": abi,
+            "teacher_argmax_action_type": {"MARITIME_TRADE": candidate},
+            "objective_weighted_teacher_argmax_action_type": {
+                "MARITIME_TRADE": weighted_candidate
+            },
+        }
+        parent_streams[stream] = {
+            "schema_version": campaign.POLICY_BEHAVIOR_METRICS_SCHEMA,
+            "action_catalog_abi": abi,
+            "teacher_argmax_action_type": {"MARITIME_TRADE": parent},
+            "objective_weighted_teacher_argmax_action_type": {
+                "MARITIME_TRADE": weighted_parent
+            },
+        }
+        paired_streams[stream] = {
+            "action_catalog_abi": abi,
+            "teacher_argmax_action_type": {
+                "MARITIME_TRADE": _paired_behavior_row(candidate, parent)
+            },
+            "objective_weighted_teacher_argmax_action_type": {
+                "MARITIME_TRADE": _paired_behavior_row(
+                    weighted_candidate, weighted_parent
+                )
+            },
+        }
+    return {
+        "behavioral_competence": {
+            "schema_version": campaign.POSTHOC_BEHAVIORAL_COMPETENCE_SCHEMA,
+            "selection_authority": False,
+            "streams": candidate_streams,
+        },
+        "parent_behavioral_competence": {
+            "schema_version": campaign.POSTHOC_BEHAVIORAL_COMPETENCE_SCHEMA,
+            "selection_authority": False,
+            "streams": parent_streams,
+        },
+        "paired_parent_behavioral_competence": {
+            "schema_version": campaign.PAIRED_BEHAVIORAL_COMPETENCE_SCHEMA,
+            "selection_authority": False,
+            "streams": paired_streams,
+        },
+    }
+
+
+def _passing_behavioral_gate() -> dict[str, object]:
+    return campaign._evaluate_maritime_behavioral_competence_gate(  # noqa: SLF001
+        _behavioral_functional()
+    )
+
+
 def _feature_observability(*, observed_steps: int) -> dict[str, object]:
     module_row = {
         "mean_pre_clip_grad_norm": 0.4,
@@ -145,6 +263,7 @@ def _cached_functional_payload(expected: dict[str, object]) -> dict[str, object]
         "validation_manifest": expected["validation_manifest"],
     }
     return {
+        **_behavioral_functional(),
         "schema_version": "posthoc-checkpoint-teacher-gap/v1",
         "arch": "entity_graph",
         "batch_size": 16,
@@ -166,6 +285,96 @@ def _cached_functional_payload(expected: dict[str, object]) -> dict[str, object]
             "schema_version": campaign.PAIRED_PARENT_GAP_SCHEMA,
         },
     }
+
+
+def test_stage_c_maritime_competence_wilson_boundaries() -> None:
+    failed = campaign._evaluate_maritime_behavioral_competence_gate(  # noqa: SLF001
+        _behavioral_functional(base=(6, 74), aux=(20, 29))
+    )
+    passed = _passing_behavioral_gate()
+
+    assert failed["selection_admitted"] is False
+    assert failed["checks"]["streams"]["base"]["teacher_top1_lower_bound"] is False
+    assert (
+        failed["checks"]["streams"]["base"]["end_turn_confusion_upper_bound"]
+        is False
+    )
+    assert failed["checks"]["streams"]["aux"]["minimum_rows"] is True
+    assert failed["evidence"]["streams"]["base"]["confidence_bounds"] == pytest.approx(
+        {
+            "teacher_top1_lower": 0.03336295494479746,
+            "end_turn_confusion_upper": 0.8481230261724284,
+        }
+    )
+    assert passed["selection_admitted"] is True
+    assert passed["evidence"]["streams"]["base"]["confidence_bounds"] == pytest.approx(
+        {
+            "teacher_top1_lower": 0.15187697382757154,
+            "end_turn_confusion_upper": 0.3913089890761858,
+        }
+    )
+
+
+def test_stage_c_maritime_gate_never_pools_base_and_aux() -> None:
+    aux_failed = campaign._evaluate_maritime_behavioral_competence_gate(  # noqa: SLF001
+        _behavioral_functional(base=(20, 29), aux=(6, 74))
+    )
+
+    assert aux_failed["checks"]["streams"]["base"] == {
+        "minimum_rows": True,
+        "teacher_top1_lower_bound": True,
+        "end_turn_confusion_upper_bound": True,
+        "teacher_top1_parent_regression": True,
+        "end_turn_confusion_parent_regression": True,
+        "objective_weighted_diagnostic_present": True,
+    }
+    assert aux_failed["checks"]["all_required_streams"] is False
+    assert aux_failed["selection_admitted"] is False
+
+
+def test_stage_c_weighted_behavior_is_diagnostic_not_binomial() -> None:
+    functional = _behavioral_functional()
+    gate = campaign._evaluate_maritime_behavioral_competence_gate(  # noqa: SLF001
+        functional
+    )
+
+    diagnostic = gate["evidence"]["streams"]["base"][
+        "objective_weighted_diagnostic"
+    ]
+    assert diagnostic["candidate"]["teacher_top1_accuracy"] == pytest.approx(
+        0.21337
+    )
+    assert "teacher_top1_successes" not in diagnostic["candidate"]
+    assert gate["selection_admitted"] is True
+
+
+def test_stage_c_maritime_gate_rejects_missing_abi_and_corrupt_delta() -> None:
+    missing_abi = _behavioral_functional()
+    del missing_abi["behavioral_competence"]["streams"]["base"][  # type: ignore[index]
+        "action_catalog_abi"
+    ]
+    with pytest.raises(campaign.CampaignError, match="ABI is missing"):
+        campaign._evaluate_maritime_behavioral_competence_gate(  # noqa: SLF001
+            missing_abi
+        )
+
+    corrupt_abi = _behavioral_functional()
+    corrupt_abi["behavioral_competence"]["streams"]["base"][  # type: ignore[index]
+        "action_catalog_abi"
+    ]["ordered_descriptors_sha256"] = "sha256:" + "f" * 64
+    with pytest.raises(campaign.CampaignError, match="identity is inconsistent"):
+        campaign._evaluate_maritime_behavioral_competence_gate(  # noqa: SLF001
+            corrupt_abi
+        )
+
+    corrupt_delta = _behavioral_functional()
+    corrupt_delta["paired_parent_behavioral_competence"]["streams"]["aux"][  # type: ignore[index]
+        "teacher_argmax_action_type"
+    ]["MARITIME_TRADE"]["candidate_minus_parent"]["teacher_top1_accuracy"] = 0.7
+    with pytest.raises(campaign.CampaignError, match="paired delta"):
+        campaign._evaluate_maritime_behavioral_competence_gate(  # noqa: SLF001
+            corrupt_delta
+        )
 
 
 def test_stage_c_feature_learning_signal_is_evidence_backed() -> None:
@@ -249,7 +458,7 @@ def test_stage_c_rejects_cached_functional_for_stale_candidate(tmp_path: Path) -
         manifest=manifest,
         manifest_semantic="sha256:" + "d" * 64,
     )
-    cached = output / "step0004.functional.fresh-parent.json"
+    cached = output / "step0004.functional.maritime-competence.json"
     _write_json(cached, _cached_functional_payload(old))
     checkpoint.write_bytes(b"current candidate")
     current = _functional_bindings(
@@ -287,7 +496,7 @@ def test_stage_c_rejects_cached_functional_for_stale_holdout(tmp_path: Path) -> 
         manifest=manifest,
         manifest_semantic="sha256:" + "d" * 64,
     )
-    cached = output / "step0004.functional.fresh-parent.json"
+    cached = output / "step0004.functional.maritime-competence.json"
     _write_json(cached, _cached_functional_payload(old))
     manifest.write_text('{"version": 2}\n', encoding="utf-8")
     current = _functional_bindings(
@@ -305,6 +514,39 @@ def test_stage_c_rejects_cached_functional_for_stale_holdout(tmp_path: Path) -> 
             allow_separate_parent=False,
             expected_bindings=current,
         )
+
+
+def test_stage_c_versions_away_from_legacy_functional_cache(tmp_path: Path) -> None:
+    output = tmp_path / "fingerprints"
+    output.mkdir()
+    checkpoint = tmp_path / "candidate.pt"
+    report = tmp_path / "report.json"
+    data = tmp_path / "data"
+    manifest = tmp_path / "holdout.json"
+    checkpoint.write_bytes(b"candidate")
+    report.write_text("{}\n", encoding="utf-8")
+    data.mkdir()
+    manifest.write_text("{}\n", encoding="utf-8")
+    bindings = _functional_bindings(
+        checkpoint=checkpoint,
+        report=report,
+        data=data,
+        manifest=manifest,
+        manifest_semantic="sha256:" + "d" * 64,
+    )
+    legacy = output / "step0004.functional.fresh-parent.json"
+    _write_json(legacy, _cached_functional_payload(bindings))
+
+    selected = campaign._functional_artifact_path(  # noqa: SLF001
+        output,
+        4,
+        allow_separate_parent=False,
+        expected_bindings=bindings,
+    )
+
+    assert selected == output / "step0004.functional.maritime-competence.json"
+    assert not selected.exists()
+    assert legacy.exists()
 
 
 def test_stage_c_objective_gradient_signal_is_evidence_backed() -> None:
@@ -596,6 +838,11 @@ def test_stage_c_fingerprint_binds_report_emitted_holdout(
     plan = {
         "output_root": str(output_root),
         "recipe": campaign._recipe(),  # noqa: SLF001
+        "selection_contract": {
+            "behavioral_competence_gate": (
+                campaign._behavioral_competence_gate_contract()  # noqa: SLF001
+            )
+        },
         "inputs": {
             "python": "/usr/bin/python3",
             "data": str(data),
@@ -669,6 +916,11 @@ def test_stage_c_fingerprint_refuses_frozen_adapter_report(
         },
     }
     plan = {
+        "selection_contract": {
+            "behavioral_competence_gate": (
+                campaign._behavioral_competence_gate_contract()  # noqa: SLF001
+            )
+        },
         "expected_artifacts": {
             "one_dose_receipt": str(receipt_path),
             "report": str(report_path),
@@ -704,6 +956,7 @@ def test_stage_c_selector_ignores_misleading_stored_generation_prior_closure() -
             "fresh_parent_teacher_gap_absolute_closure": -0.02,
             "fresh_parent_teacher_gap_relative_closure": -0.10,
             "value_quality_gate": {"passed": True},
+            "behavioral_competence_gate": _passing_behavioral_gate(),
         },
         {
             "step": 16,
@@ -718,6 +971,7 @@ def test_stage_c_selector_ignores_misleading_stored_generation_prior_closure() -
             "fresh_parent_teacher_gap_absolute_closure": 0.04,
             "fresh_parent_teacher_gap_relative_closure": 0.25,
             "value_quality_gate": {"passed": True},
+            "behavioral_competence_gate": _passing_behavioral_gate(),
         },
     ]
 
@@ -746,6 +1000,7 @@ def test_stage_c_selector_rejects_base_only_gap_for_aux_recipe() -> None:
             "fresh_parent_teacher_gap_absolute_closure": 0.04,
             "fresh_parent_teacher_gap_relative_closure": 0.25,
             "value_quality_gate": {"passed": True},
+            "behavioral_competence_gate": _passing_behavioral_gate(),
         }
     ]
 
@@ -771,6 +1026,7 @@ def test_stage_c_selector_rejects_early_checkpoint_without_feature_signal() -> N
             "fresh_parent_teacher_gap_absolute_closure": 0.5,
             "fresh_parent_teacher_gap_relative_closure": 0.5,
             "value_quality_gate": {"passed": True},
+            "behavioral_competence_gate": _passing_behavioral_gate(),
         },
         {
             "step": 16,
@@ -783,6 +1039,7 @@ def test_stage_c_selector_rejects_early_checkpoint_without_feature_signal() -> N
             "fresh_parent_teacher_gap_absolute_closure": 0.01,
             "fresh_parent_teacher_gap_relative_closure": 0.01,
             "value_quality_gate": {"passed": True},
+            "behavioral_competence_gate": _passing_behavioral_gate(),
         },
     ]
 
@@ -809,6 +1066,7 @@ def test_stage_c_rejects_policy_improvement_when_value_regresses() -> None:
             "fresh_parent_teacher_gap_absolute_closure": 0.02,
             "fresh_parent_teacher_gap_relative_closure": 0.03,
             "value_quality_gate": {"passed": False},
+            "behavioral_competence_gate": _passing_behavioral_gate(),
         },
         {
             "step": 24,
@@ -819,6 +1077,7 @@ def test_stage_c_rejects_policy_improvement_when_value_regresses() -> None:
             "fresh_parent_teacher_gap_absolute_closure": 0.05,
             "fresh_parent_teacher_gap_relative_closure": 0.06,
             "value_quality_gate": {"passed": False},
+            "behavioral_competence_gate": _passing_behavioral_gate(),
         },
     ]
 
@@ -836,6 +1095,7 @@ def test_stage_c_accepts_earlier_mid_epoch_value_safe_checkpoint() -> None:
             "fresh_parent_teacher_gap_absolute_closure": 0.02,
             "fresh_parent_teacher_gap_relative_closure": 0.03,
             "value_quality_gate": {"passed": True},
+            "behavioral_competence_gate": _passing_behavioral_gate(),
         },
         {
             "step": 24,
@@ -846,6 +1106,7 @@ def test_stage_c_accepts_earlier_mid_epoch_value_safe_checkpoint() -> None:
             "fresh_parent_teacher_gap_absolute_closure": 0.05,
             "fresh_parent_teacher_gap_relative_closure": 0.06,
             "value_quality_gate": {"passed": False},
+            "behavioral_competence_gate": _passing_behavioral_gate(),
         },
     ]
 
@@ -865,6 +1126,7 @@ def test_stage_c_teacher_closure_is_diagnostic_not_an_admission_gate() -> None:
             "fresh_parent_teacher_gap_absolute_closure": -0.02,
             "fresh_parent_teacher_gap_relative_closure": -0.03,
             "value_quality_gate": {"passed": True},
+            "behavioral_competence_gate": _passing_behavioral_gate(),
         },
         {
             "step": 24,
@@ -875,12 +1137,43 @@ def test_stage_c_teacher_closure_is_diagnostic_not_an_admission_gate() -> None:
             "fresh_parent_teacher_gap_absolute_closure": 0.05,
             "fresh_parent_teacher_gap_relative_closure": 0.06,
             "value_quality_gate": {"passed": True},
+            "behavioral_competence_gate": _passing_behavioral_gate(),
         },
     ]
 
     selected = campaign._select_fingerprint_winner(records)  # noqa: SLF001
     assert selected is not None
     assert selected["step"] == 16
+
+
+def test_stage_c_failed_maritime_gate_is_never_selected() -> None:
+    failed_gate = campaign._evaluate_maritime_behavioral_competence_gate(  # noqa: SLF001
+        _behavioral_functional(base=(6, 74), aux=(20, 29))
+    )
+    records = [
+        {
+            "step": 16,
+            "policy_teacher_gap_objective": _policy_teacher_gap_objective(),
+            "feature_learning_signal_authenticated": True,
+            "parent_kl": 0.001,
+            "trunk_relative_l2": 0.001,
+            "value_quality_gate": {"passed": True},
+            "behavioral_competence_gate": failed_gate,
+        },
+        {
+            "step": 24,
+            "policy_teacher_gap_objective": _policy_teacher_gap_objective(),
+            "feature_learning_signal_authenticated": True,
+            "parent_kl": 0.002,
+            "trunk_relative_l2": 0.002,
+            "value_quality_gate": {"passed": True},
+            "behavioral_competence_gate": _passing_behavioral_gate(),
+        },
+    ]
+
+    selected = campaign._select_fingerprint_winner(records)  # noqa: SLF001
+    assert selected is not None
+    assert selected["step"] == 24
 
 
 def test_stage_c_value_gate_replays_b200_parent_comparison() -> None:
@@ -949,6 +1242,7 @@ def test_stage_c_value_gate_replays_b200_parent_comparison() -> None:
                 "fresh_parent_teacher_gap_absolute_closure": 0.02064811311465664,
                 "fresh_parent_teacher_gap_relative_closure": 0.025638264338820396,
                 "value_quality_gate": early,
+                "behavioral_competence_gate": _passing_behavioral_gate(),
             },
             {
                 "step": 32,
@@ -959,6 +1253,7 @@ def test_stage_c_value_gate_replays_b200_parent_comparison() -> None:
                 "fresh_parent_teacher_gap_absolute_closure": 0.1080338176634672,
                 "fresh_parent_teacher_gap_relative_closure": 0.13414298727479415,
                 "value_quality_gate": regressed,
+                "behavioral_competence_gate": _passing_behavioral_gate(),
             },
         ]
     )
