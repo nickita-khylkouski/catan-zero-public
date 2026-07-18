@@ -1,0 +1,178 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Catan — play &amp; flag</title>
+<style>
+  :root { --bg:#1a2233; --panel:#232e45; --ink:#e8ecf5; --dim:#9aa7c0; --acc:#ffb84d; }
+  * { box-sizing:border-box; }
+  body { margin:0; font:14px/1.45 -apple-system,Segoe UI,sans-serif; background:var(--bg); color:var(--ink); display:flex; height:100vh; }
+  #board-wrap { flex:1; display:flex; align-items:center; justify-content:center; min-width:0; }
+  svg { max-width:100%; max-height:100vh; }
+  #side { width:380px; background:var(--panel); padding:14px; overflow-y:auto; display:flex; flex-direction:column; gap:12px; }
+  h3 { margin:2px 0 6px; font-size:13px; text-transform:uppercase; letter-spacing:.08em; color:var(--dim); }
+  button { background:#31405f; color:var(--ink); border:1px solid #46587e; border-radius:6px; padding:6px 10px; cursor:pointer; font-size:13px; }
+  button:hover { background:#3c4d72; }
+  button.primary { background:var(--acc); color:#22283a; font-weight:600; border-color:var(--acc); }
+  .row { display:flex; gap:6px; flex-wrap:wrap; align-items:center; }
+  select,input[type=text],input[type=number] { background:#182136; color:var(--ink); border:1px solid #46587e; border-radius:6px; padding:5px 8px; font-size:13px; }
+  #actions button { display:block; width:100%; text-align:left; margin:3px 0; }
+  #log { font-size:12px; color:var(--dim); max-height:150px; overflow-y:auto; }
+  #log .BLUE { color:#7fb3ff; } #log .RED { color:#ff8f8f; }
+  .stat { display:flex; justify-content:space-between; font-size:13px; padding:1px 0; }
+  .banner { padding:8px 10px; border-radius:6px; background:#2c3a58; font-weight:600; }
+  .banner.win { background:#2d5a3a; } .banner.lose { background:#5a2d2d; }
+  #flagbox { border:1px solid #46587e; border-radius:8px; padding:10px; background:#1e2940; }
+  .hexlabel { font-weight:700; pointer-events:none; }
+  .clickable { cursor:pointer; }
+  .toast { position:fixed; left:16px; bottom:16px; background:#2d5a3a; color:#fff; padding:8px 14px; border-radius:8px; opacity:0; transition:opacity .3s; }
+</style>
+</head>
+<body>
+<div id="board-wrap"><svg id="board" viewBox="-360 -330 720 660"></svg></div>
+<div id="side">
+  <div>
+    <h3>Game</h3>
+    <div class="row">
+      <select id="opp"><option value="value">ValueFunction</option><option value="ab2">AlphaBeta-2</option><option value="ab3">AlphaBeta-3</option></select>
+      <select id="mycolor"><option>BLUE</option><option>RED</option></select>
+      <input id="seed" type="number" placeholder="seed (blank=random)" style="width:110px">
+      <button class="primary" onclick="newGame()">New game</button>
+      <button onclick="undo()" title="rewind your last decision">Undo</button>
+    </div>
+    <div id="status" class="banner" style="margin-top:8px">no game — press New game</div>
+  </div>
+  <div><h3>Players</h3><div id="stats"></div></div>
+  <div><h3>Your actions <span id="acount" style="color:var(--dim)"></span></h3><div id="actions"></div></div>
+  <div id="flagbox">
+    <h3>Flag bot mistake <span style="color:var(--dim)">(hotkey F)</span></h3>
+    <div class="row">
+      <select id="fcat"></select>
+      <input id="freason" type="text" placeholder="why, in ~5 words" style="flex:1">
+    </div>
+    <div class="row" style="margin-top:6px"><button class="primary" onclick="flag()">Flag moment</button>
+    <span id="fcount" style="color:var(--dim)"></span></div>
+  </div>
+  <div><h3>Recent actions</h3><div id="log"></div></div>
+</div>
+<div class="toast" id="toast"></div>
+<script>
+const SQ3 = Math.sqrt(3), HEX = 62;
+const RES_COLOR = {WOOD:"#3d7a3f", BRICK:"#b3552e", SHEEP:"#8ec25a", WHEAT:"#d8b940", ORE:"#8a90a3", DESERT:"#cbb27a"};
+const PCOLOR = {BLUE:"#4a90e2", RED:"#e25555", WHITE:"#f0f0f0", ORANGE:"#f0a030"};
+const NODE_ANG = {NORTH:-90, NORTHEAST:-30, SOUTHEAST:30, SOUTH:90, SOUTHWEST:150, NORTHWEST:210};
+let S = null, flagsThis = 0;
+
+function hexCenter(c){ const [q,,r]=[c[0],c[1],c[2]]; return [HEX*SQ3*(q + r/2), HEX*1.5*r]; }
+function nodePos(n){ const [cx,cy]=hexCenter(n.tile_coordinate); const a=NODE_ANG[n.direction]*Math.PI/180; return [cx+HEX*Math.cos(a), cy+HEX*Math.sin(a)]; }
+
+async function api(path, body){ const r = await fetch(path, body?{method:"POST",body:JSON.stringify(body)}:{}); const d = await r.json(); if(d.error){ toast(d.error,"#5a2d2d"); throw d.error; } return d; }
+async function refresh(){ S = await api("/api/state"); render(); }
+async function newGame(){ S = await api("/api/new",{opponent:opp.value,human_color:mycolor.value,seed:seed.value?+seed.value:null}); flagsThis=0; render(); }
+async function act(i){ S = await api("/api/act",{i}); render(); }
+async function undo(){ S = await api("/api/undo",{}); render(); }
+async function flag(){
+  if(!S||S.no_game) return;
+  await api("/api/flag",{category:fcat.value,reason:freason.value});
+  flagsThis++; fcount.textContent = flagsThis+" flagged this game"; freason.value="";
+  toast("flagged @ decision "+S.decision_index);
+}
+function toast(msg,bg){ const t=document.getElementById("toast"); t.textContent=msg; t.style.background=bg||"#2d5a3a"; t.style.opacity=1; setTimeout(()=>t.style.opacity=0,1600); }
+document.addEventListener("keydown",e=>{ if(e.key==="f"&&document.activeElement.tagName!=="INPUT"){ e.preventDefault(); freason.focus(); } if(e.key==="Enter"&&document.activeElement===freason){ flag(); } });
+
+function render(){
+  const cats=document.getElementById("fcat");
+  if(cats.options.length===0&&S.categories) S.categories.forEach(c=>{const o=document.createElement("option");o.value=o.textContent=c;cats.appendChild(o);});
+  if(S.no_game) return;
+  const g=S.game;
+  drawBoard(g);
+  // status
+  const st=document.getElementById("status");
+  if(S.winner){ st.className="banner "+(S.winner===S.human_color?"win":"lose"); st.textContent = (S.winner===S.human_color?"You win! ":"Bot wins. ")+" seed "+S.seed+" · "+S.decision_index+" decisions"; }
+  else { st.className="banner"; st.textContent=(S.human_turn?"Your turn":"Bot thinking…")+" · "+g.current_prompt.replace("PLAY_TURN","play")+" · seed "+S.seed+" · #"+S.decision_index; }
+  // stats
+  const ps=g.player_state, colors=g.colors;
+  let html="";
+  colors.forEach((c,i)=>{
+    const p="P"+i+"_", mine=c===S.human_color;
+    const vp = ps[p+(mine?"ACTUAL_VICTORY_POINTS":"VICTORY_POINTS")];
+    let hand = mine ? ["WOOD","BRICK","SHEEP","WHEAT","ORE"].map(r=>ps[p+r+"_IN_HAND"]?r[0]+ps[p+r+"_IN_HAND"]:"").filter(Boolean).join(" ")
+                    : ps[p+"NUM_RESOURCES_IN_HAND"]+" cards";
+    let devs = mine ? ["KNIGHT","YEAR_OF_PLENTY","MONOPOLY","ROAD_BUILDING","VICTORY_POINT"].map(r=>ps[p+r+"_IN_HAND"]?r.split("_").map(w=>w[0]).join("")+ps[p+r+"_IN_HAND"]:"").filter(Boolean).join(" ")
+                    : ps[p+"NUM_DEVS_IN_HAND"]+" devs";
+    html += `<div style="border-left:4px solid ${PCOLOR[c]};padding-left:8px;margin:6px 0">
+      <div class="stat"><b style="color:${PCOLOR[c]}">${c}${mine?" (you)":""}</b><b>${vp} VP</b></div>
+      <div class="stat"><span>${hand||"—"}</span><span>${devs||"—"}</span></div>
+      <div class="stat"><span>army ${ps[p+"PLAYED_KNIGHT"]||0}${ps[p+"HAS_ARMY"]?" ★":""}</span><span>road ${g.longest_roads_by_player[c]||0}${ps[p+"HAS_ROAD"]?" ★":""}</span></div>
+    </div>`;
+  });
+  document.getElementById("stats").innerHTML=html;
+  // actions (non-spatial ones as buttons; spatial ones clickable on board)
+  const A=document.getElementById("actions"); A.innerHTML="";
+  document.getElementById("acount").textContent = S.actions.length?("("+S.actions.length+")"):"";
+  const spatial=new Set(["BUILD_SETTLEMENT","BUILD_CITY","BUILD_ROAD","MOVE_ROBBER"]);
+  const spatialCount = S.actions.filter(a=>spatial.has(a.type)).length;
+  if(spatialCount) { const d=document.createElement("div"); d.style.color="var(--dim)"; d.style.fontSize="12px"; d.textContent="+ "+spatialCount+" build/robber choices — click them on the board"; A.appendChild(d); }
+  S.actions.filter(a=>!spatial.has(a.type)).forEach(a=>{
+    const b=document.createElement("button"); b.textContent=a.desc; b.onclick=()=>act(a.i); A.appendChild(b);
+  });
+  // log
+  document.getElementById("log").innerHTML = S.log.slice().reverse().map(e=>`<div class="${e.color}">#${e.i} ${e.desc}</div>`).join("");
+}
+
+function drawBoard(g){
+  const svg=document.getElementById("board"); svg.innerHTML="";
+  const put=(el)=>svg.appendChild(el);
+  const mk=(t,attrs)=>{const e=document.createElementNS("http://www.w3.org/2000/svg",t);for(const k in attrs)e.setAttribute(k,attrs[k]);return e;};
+  // tiles
+  g.tiles.forEach(t=>{
+    const [cx,cy]=hexCenter(t.coordinate);
+    const pts=[...Array(6)].map((_,i)=>{const a=(60*i-90)*Math.PI/180;return (cx+HEX*.97*Math.cos(a))+","+(cy+HEX*.97*Math.sin(a));}).join(" ");
+    const tt=t.tile;
+    if(tt.type==="WATER"){ put(mk("polygon",{points:pts,fill:"#1d3a5f",opacity:.35})); return; }
+    if(tt.type==="PORT"){ put(mk("polygon",{points:pts,fill:"#1d3a5f",opacity:.5}));
+      const lbl=mk("text",{x:cx,y:cy+4,"text-anchor":"middle","font-size":13,fill:"#cfe0ff",class:"hexlabel"});
+      lbl.textContent = tt.resource?("2:1 "+tt.resource[0]+tt.resource.slice(1,3).toLowerCase()):"3:1"; put(lbl); return; }
+    const fill = tt.type==="DESERT"?RES_COLOR.DESERT:RES_COLOR[tt.resource];
+    put(mk("polygon",{points:pts,fill,stroke:"#101623","stroke-width":2}));
+    const isRob = JSON.stringify(g.robber_coordinate)===JSON.stringify(t.coordinate);
+    if(tt.number){ put(mk("circle",{cx,cy,r:15,fill:"#f3ead2",opacity:isRob?.45:1}));
+      const n=mk("text",{x:cx,y:cy+5,"text-anchor":"middle","font-size":15,fill:(tt.number===6||tt.number===8)?"#c0392b":"#333",class:"hexlabel"}); n.textContent=tt.number; put(n); }
+    if(isRob){ const r=mk("text",{x:cx,y:cy-18,"text-anchor":"middle","font-size":20,class:"hexlabel"}); r.textContent="🥷"; put(r); }
+  });
+  // node positions
+  const npos={}; Object.values(g.nodes).forEach(n=>{ npos[n.id]=nodePos(n); });
+  // roads
+  g.edges.forEach(e=>{ if(!e.color) return; const [a,b]=e.id, [x1,y1]=npos[a],[x2,y2]=npos[b];
+    put(mkLine(x1,y1,x2,y2,PCOLOR[e.color],7)); });
+  function mkLine(x1,y1,x2,y2,stroke,w,cls){const l=mk("line",{x1,y1,x2,y2,stroke,"stroke-width":w,"stroke-linecap":"round"});if(cls)l.setAttribute("class",cls);return l;}
+  // buildings
+  Object.values(g.nodes).forEach(n=>{ if(!n.building) return; const [x,y]=npos[n.id];
+    if(n.building==="SETTLEMENT") put(mk("rect",{x:x-8,y:y-8,width:16,height:16,fill:PCOLOR[n.color],stroke:"#111","stroke-width":1.5,rx:3}));
+    else put(mk("polygon",{points:`${x-10},${y+9} ${x+10},${y+9} ${x+10},${y-5} ${x},${y-14} ${x-10},${y-5}`,fill:PCOLOR[n.color],stroke:"#111","stroke-width":1.5}));
+  });
+  // clickable action targets
+  if(S.human_turn){
+    const byType={};
+    S.actions.forEach(a=>{(byType[a.type]??=[]).push(a);});
+    (byType.BUILD_ROAD||[]).forEach(a=>{ const [n1,n2]=a.value, [x1,y1]=npos[n1],[x2,y2]=npos[n2];
+      const l=mkLine(x1,y1,x2,y2,"#ffd88a",9,"clickable"); l.setAttribute("opacity",.55); l.onclick=()=>act(a.i); put(l); });
+    (byType.BUILD_SETTLEMENT||[]).forEach(a=>{ const [x,y]=npos[a.value];
+      const c=mk("circle",{cx:x,cy:y,r:10,fill:"#ffd88a",opacity:.75,class:"clickable",stroke:"#7a5b16"}); c.onclick=()=>act(a.i); put(c); });
+    (byType.BUILD_CITY||[]).forEach(a=>{ const [x,y]=npos[a.value];
+      const c=mk("circle",{cx:x,cy:y,r:12,fill:"none",stroke:"#ffd88a","stroke-width":4,class:"clickable"}); c.onclick=()=>act(a.i); put(c); });
+    // robber: one clickable ring per target hex; if several victims, choose
+    const rob=byType.MOVE_ROBBER||[];
+    const byHex={};
+    rob.forEach(a=>{ const key=JSON.stringify(a.value[0]); (byHex[key]??=[]).push(a); });
+    Object.entries(byHex).forEach(([key,as])=>{ const [cx,cy]=hexCenter(JSON.parse(key));
+      const c=mk("circle",{cx,cy,r:22,fill:"#000",opacity:.35,stroke:"#ffd88a","stroke-width":3,class:"clickable"});
+      c.onclick=()=>{ if(as.length===1) act(as[0].i);
+        else { const pick=prompt("Steal from: "+as.map((a,j)=>j+"="+(a.value[1]||"nobody")).join("  ")); if(pick!==null&&as[+pick]) act(as[+pick].i); } };
+      put(c); });
+  }
+}
+refresh();
+</script>
+</body>
+</html>
