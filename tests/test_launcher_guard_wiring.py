@@ -50,7 +50,7 @@ VAL_ONLY_SEED = 6_195_000_000  # inside prelaunch_guard.VAL_ONLY_SEED_RANGE
 GOLDEN_OPTION_STRINGS = {
     "train": {
         ("--allow-concurrent-bc",),
-        ("--architecture-upgrade-receipt",),
+        ("--information-contract-migration-receipt",),
         ("--checkpoint",),
         ("--config",),
         ("--data",),

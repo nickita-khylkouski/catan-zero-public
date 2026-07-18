@@ -29,6 +29,19 @@ from catan_zero.rl.entity_feature_adapter import (  # noqa: E402
 from catan_zero.rl.pipeline_configs import GenerateConfig  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _isolate_launcher_tests_from_native_wheel_availability(monkeypatch):
+    """These tests exercise launcher contracts, not native-wheel installation."""
+    monkeypatch.setattr(cli, "require_rust_feature_path", lambda: None)
+    monkeypatch.setitem(
+        sys.modules,
+        "catanatron_rs",
+        types.SimpleNamespace(
+            gumbel_search_capabilities=lambda: {"public_award_feature_parity"}
+        ),
+    )
+
+
 def test_evaluator_history_contract_rejects_mislabeled_teacher_features() -> None:
     evaluator = types.SimpleNamespace(
         policy=types.SimpleNamespace(

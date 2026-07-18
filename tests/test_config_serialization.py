@@ -74,9 +74,11 @@ def test_missing_fields_take_current_defaults():
     assert rebuilt.dropout == 0.05
 
 
-def test_action_cross_bottleneck_is_appended_for_positional_pickle_safety():
-    assert tuple(EntityGraphConfig.__dataclass_fields__)[-1] == (
-        "action_cross_attention_bottleneck"
+def test_v8_resource_residual_is_appended_for_positional_pickle_safety():
+    fields = tuple(EntityGraphConfig.__dataclass_fields__)
+    assert fields[-2:] == (
+        "action_cross_attention_bottleneck",
+        "public_card_exact_resource_residual",
     )
 
 

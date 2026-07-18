@@ -122,12 +122,12 @@ def test_canonical_training_routes_fresh_scratch_through_authenticated_planner(
         )
 
 
-def test_canonical_training_rejects_role_substitution(
+def test_canonical_training_rejects_unsupported_role(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     source = ROOT / "configs/training/a1_parent_update_35m_b200.schema1.json"
     payload = json.loads(source.read_text(encoding="utf-8"))
-    payload["engine_settings"]["initialization_mode"] = "scratch_fresh_optimizer"
+    payload["engine_settings"]["initialization_mode"] = "legacy_reused_optimizer"
     drifted = tmp_path / source.name
     drifted.write_text(json.dumps(payload), encoding="utf-8")
     monkeypatch.setattr(
@@ -136,7 +136,7 @@ def test_canonical_training_rejects_role_substitution(
         lambda **_kwargs: "a1-parent-update-35m-b200",
     )
 
-    with pytest.raises(SystemExit, match="role does not match"):
+    with pytest.raises(SystemExit, match="unsupported initialization role"):
         train._load_recipe(drifted)  # noqa: SLF001
 
 

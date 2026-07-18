@@ -540,7 +540,7 @@ def _sample_receipt(*, final: bool = False, composite: dict | None = None) -> di
     seed = coordinator.FINAL_SAMPLER_SEED if final else coordinator.P1_SAMPLER_SEED
     return coordinator._sealed(
         {
-            "schema_version": "a1-authenticated-sample-evidence-v2",
+            "schema_version": "a1-authenticated-sample-evidence-v3",
             "status": "complete",
             "sample_dose": dose,
             "sampler_seed": seed,
@@ -569,10 +569,11 @@ def _sample_receipt(*, final: bool = False, composite: dict | None = None) -> di
                 }
                 for component in coordinator.COMPONENT_IDS
             },
-            "kl_eligible_rows": dose // 2 if not final else dose // 4,
-            "kl_eligible_mass_decimal": "0.5" if not final else "0.25",
+            "kl_eligible_rows": 0,
+            "kl_eligible_mass_decimal": "0",
             "kl_ordered_evidence_sha256": _sha("1"),
             "kl_eligible_evidence_sha256": _sha("2"),
+            "policy_kl_anchor_component_ids": [],
             "descriptor_sha256": composite["descriptor_sha256"],
             "payload_inventory_sha256": composite["payload_inventory_sha256"],
             "category_semantics": copy.deepcopy(composite["category_semantics"]),
@@ -776,14 +777,9 @@ def _p1_input_paths(root: Path) -> tuple[dict[str, Path], dict]:
 
 
 def _issue_p1_sweep(root: Path) -> dict:
-    paths, composite = _p1_input_paths(root)
-    return coordinator.prepare_p1_sweep(
-        root,
-        final_lock_authority=_final_lock(),
-        composite=composite,
-        portable_code_identity_sha256=_sha("a"),
-        allocations=_p1_allocations(),
-        **paths,
+    pytest.skip(
+        "the historical-replay P1 sweep and its dependent auxiliary workflow "
+        "were retired when production moved to the fresh-only 80/15/5 composite"
     )
 
 
@@ -1761,48 +1757,22 @@ def test_evaluation_design_is_canonical_and_has_no_operator_knobs() -> None:
                 verifier(mutation, baseline_checkpoint_sha256=baseline)
 
 
-def test_p1_sweep_has_fixed_one_axis_arms_and_central_selection(tmp_path: Path) -> None:
-    sweep, selected = _complete_p1(tmp_path)
-    assert list(sweep["arms"]) == ["K0", "K3", "K10"]
-    assert [
-        sweep["arms"][arm]["policy_kl_anchor_weight_decimal"]
-        for arm in coordinator.P1_ARMS
-    ] == ["0", "0.015", "0.05"]
-    base = sweep["final_lock_authority"]["base_recipe"]
-    control_recipe = sweep["arms"]["K0"]["effective_recipe"]
-    assert control_recipe["world_size"] == 8
-    assert control_recipe["batch_size"] == 512
-    assert control_recipe["global_batch_size"] == 4096
-    assert {
-        key for key in control_recipe if control_recipe.get(key) != base.get(key)
-    } == {"world_size", "batch_size"}
-    for arm in coordinator.P1_ARMS:
-        recipe = sweep["arms"][arm]["effective_recipe"]
-        changed = {key for key in recipe if recipe.get(key) != control_recipe.get(key)}
-        if arm == "K0":
-            assert changed == set()
-        else:
-            assert changed == {"policy_kl_anchor_weight"}
-    assert selected["selected_arm"] == "K3"
-    assert selected["effective_recipe"]["policy_kl_anchor_weight"] == 0.015
-    assert selected["effective_recipe"]["truncated_vp_margin_value_weight"] == 0.25
-    transaction = tmp_path / sweep["sweep_id"].removeprefix("sha256:")
-    for arm_id in coordinator.P1_ARMS:
-        descriptor = sweep["arms"][arm_id]["training_descriptor_authority"]
-        expected_scope = [] if arm_id == "K0" else ["historical_replay"]
-        expected_rows = (
-            0
-            if arm_id == "K0"
-            else sweep["kl_eligibility_authority"]["eligible_rows"]
+def test_p1_historical_anchor_sweep_is_retired_for_fresh_only_data(
+    tmp_path: Path,
+) -> None:
+    paths, composite = _p1_input_paths(tmp_path)
+    with pytest.raises(
+        coordinator.CoordinatorError,
+        match="historical-anchor sweep is retired.*fresh-only",
+    ):
+        coordinator.prepare_p1_sweep(
+            tmp_path,
+            final_lock_authority=_final_lock(),
+            composite=composite,
+            portable_code_identity_sha256=_sha("a"),
+            allocations=_p1_allocations(),
+            **paths,
         )
-        assert descriptor["policy_kl_anchor_component_ids"] == expected_scope
-        assert descriptor["expected_policy_kl_anchor_eligible_rows"] == expected_rows
-        if arm_id != "K0":
-            path = transaction / descriptor["filename"]
-            assert path.stat().st_mode & 0o777 == 0o444
-            assert json.loads(path.read_text())["policy_kl_anchor_component_ids"] == [
-                "historical_replay"
-            ]
 
 
 @pytest.mark.parametrize(
@@ -2006,7 +1976,7 @@ def test_typed_composite_requires_exact_mix_and_truncation_proof() -> None:
             composite["component_sampling_ratios"] = [0.80, 0.10, 0.05, 0.05]
         else:
             composite["complete_game_inputs"] = False
-        with pytest.raises(coordinator.CoordinatorError, match="64/12/4/20|truncation"):
+        with pytest.raises(coordinator.CoordinatorError, match="80/15/5|truncation"):
             coordinator._verify_composite(composite)
 
 

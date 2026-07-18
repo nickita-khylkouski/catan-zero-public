@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from catan_zero.rl.hex_symmetry import HexSymmetry, N_SYMMETRIES
 
@@ -87,4 +88,4 @@ def test_valid_action_zero_relabels_when_targeted() -> None:
 
     out = symmetry.permute_entity_batch(entity, 1, relabel_events=True)
 
-    assert out["event_tokens"][0, 0, 35] == 1.0 / 607.0
+    assert out["event_tokens"][0, 0, 35] == pytest.approx(1.0 / 607.0)

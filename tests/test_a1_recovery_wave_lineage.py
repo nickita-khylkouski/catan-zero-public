@@ -296,10 +296,6 @@ def test_composite_descriptor_carries_exact_recovery_semantics(
             "provenance_manifest": str(provenance),
             "provenance_manifest_sha256": composite._file_sha256(provenance),  # noqa: SLF001
         }
-        if component_id == composite.HISTORICAL_REPLAY_CATEGORY:
-            component["entity_feature_adapter_version"] = (
-                CURRENT_RUST_ENTITY_ADAPTER_VERSION
-            )
         if component_id in composite.FRESH_SOURCE_GAME_RATIOS:
             corpus = tmp_path / f"{component_id}.corpus"
             corpus.mkdir()

@@ -78,6 +78,14 @@ while True:
             "category": category,
             "argv": argv,
             "argv_sha256": supervisor._digest(argv),
+            "render_argv_sha256": supervisor._digest(
+                [
+                    f"{supervisor.RUNTIME_REPO_TOKEN}/tools/fleet/"
+                    "a1_lane_supervisor.py",
+                    *argv[1:],
+                ]
+            ),
+            "runtime_repo_argv_indices": [0],
             "environment": environment,
             "environment_sha256": supervisor._digest(environment),
             "render_environment_sha256": supervisor._digest(source_environment),
