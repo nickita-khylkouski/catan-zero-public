@@ -17,6 +17,7 @@ from catan_zero.production_contracts import (
     production_status,
     validate_pipeline_contract,
 )
+from tools import train
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -447,6 +448,50 @@ def test_cataloged_parent_update_uses_exact_blocked_recipe_and_parent(
     assert "--architecture-upgrade-receipt" not in plan["command"]
     assert "--nproc-per-node=8" in plan["command"]
     assert plan["prepare_command"] is None
+
+
+def test_parent_update_job_schema_matches_cataloged_initialization_semantics() -> None:
+    schema = json.loads(
+        (ROOT / "configs/production/job.schema.json").read_text(encoding="utf-8")
+    )
+    parent_branch = next(
+        branch
+        for branch in schema["oneOf"]
+        if "parent_checkpoint" in branch.get("required", ())
+    )
+    schema_recipes = set(parent_branch["properties"]["recipe"]["enum"])
+    cataloged_parent_recipes = {
+        entry["name"]
+        for entry in contracts.production_recipes("train")
+        if contracts.training_initialization_mode(ROOT, entry["name"])
+        == "parent_fresh_optimizer"
+    }
+
+    assert schema_recipes == cataloged_parent_recipes
+
+
+@pytest.mark.parametrize(
+    "recipe",
+    [
+        entry["name"]
+        for entry in contracts.production_recipes("train")
+        if contracts.training_initialization_mode(ROOT, entry["name"])
+        == "parent_fresh_optimizer"
+    ],
+)
+def test_cataloged_parent_update_command_parses_with_canonical_launcher(
+    tmp_path: Path, recipe: str
+) -> None:
+    command = cli.build_plan(
+        _write_job(tmp_path, "train", recipe=recipe)
+    )["command"]
+    launcher_index = command.index(str((ROOT / "tools/train.py").resolve()))
+
+    parsed = train.build_parser().parse_args(command[launcher_index + 1 :])
+
+    assert parsed.information_contract_migration_receipt.endswith(
+        "information-contract-migration.receipt.json"
+    )
 
 
 def test_training_science_admission_cannot_authorize_recipe_digest_drift(
