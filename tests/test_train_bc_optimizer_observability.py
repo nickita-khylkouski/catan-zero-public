@@ -562,6 +562,22 @@ def test_checkpoint_dose_telemetry_binds_exposure_and_feature_paths() -> None:
         "aux_denominator": 9.0,
     }
     assert dose["optimizer"]["clipped_fraction"] == pytest.approx(0.25)
+    assert dose["policy_objective_dose"]["interpretation"] == {
+        "schema_version": "policy-dose-clipping-interpretation-v1",
+        "raw_exposure_authority": "training_row_draws_and_active_rows",
+        "coefficient_weighted_measure": "pre_clip_objective_mixture_proxy",
+        "coefficient_weighted_measure_is_realized_update_amplitude": False,
+        "aux_coefficient_effect": (
+            "changes_pre_clip_objective_mixture_and_gradient_direction"
+        ),
+        "realized_update_amplitude_status": "partially_clip_limited",
+        "realized_update_amplitude_semantics": (
+            "global_grad_clip_limited_on_a_subset_of_observed_steps"
+        ),
+        "optimizer_observed_steps": 8,
+        "optimizer_clipped_steps": 2,
+        "clipped_fraction": pytest.approx(0.25),
+    }
     assert dose["shared_trunk_objective_gradients"]["observed_steps"] == 1
     assert (
         dose["feature_path_gradients"]["public_card"]["status"]

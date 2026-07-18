@@ -3218,13 +3218,19 @@ def _policy_objective_equivalent_active_rows(
     policy_aux_loss_weight: float,
     policy_objective_fraction: float,
 ) -> float:
-    """Return coefficient- and boundary-aware policy row exposure.
+    """Return coefficient- and boundary-aware pre-clip policy exposure.
 
     Base and AUX are independently normalized objective means:
     ``base_mean + policy_aux_loss_weight * aux_mean``. Raw active-row telemetry
-    counts every presented row, while full-dose-equivalent telemetry must scale
-    AUX rows by that coefficient. Otherwise P10 and P25 falsely report the same
-    equivalent exposure.
+    counts every presented row, while this pre-clip objective-mixture proxy
+    scales AUX rows by that coefficient. Otherwise P10 and P25 falsely report
+    the same objective mixture.
+
+    This quantity is deliberately *not* realized update amplitude. Global
+    gradient clipping can map different pre-clip objective magnitudes onto the
+    same clipped update norm while preserving a different gradient direction.
+    The checkpoint report binds this proxy to clipping telemetry so consumers
+    cannot silently interpret it as applied optimizer dose.
     """
 
     values = (
@@ -3240,6 +3246,52 @@ def _policy_objective_equivalent_active_rows(
     if values[3] > 1.0 + 1.0e-12:
         raise ValueError("policy objective fraction exceeds full dose")
     return (values[0] + values[2] * values[1]) * min(1.0, values[3])
+
+
+def _policy_dose_clipping_interpretation(
+    *,
+    optimizer_observed_steps: int,
+    optimizer_clipped_steps: int,
+) -> dict[str, object]:
+    """Describe what coefficient-weighted policy telemetry can establish.
+
+    The AUX coefficient changes the independently normalized policy objective
+    before global gradient clipping. It therefore changes objective mixture
+    and generally gradient direction, but coefficient-weighted row/mass
+    telemetry cannot establish realized update amplitude on clipped steps.
+    """
+
+    observed = int(optimizer_observed_steps)
+    clipped = int(optimizer_clipped_steps)
+    if observed < 0 or clipped < 0 or clipped > observed:
+        raise ValueError("optimizer clipping counters are inconsistent")
+    fraction = float(clipped) / observed if observed > 0 else None
+    if observed == 0:
+        status = "unobserved"
+        amplitude = "no_optimizer_steps_observed"
+    elif clipped == observed:
+        status = "fully_clip_limited"
+        amplitude = "global_grad_clip_limited_on_all_observed_steps"
+    elif clipped > 0:
+        status = "partially_clip_limited"
+        amplitude = "global_grad_clip_limited_on_a_subset_of_observed_steps"
+    else:
+        status = "not_clip_limited_on_observed_steps"
+        amplitude = "no_observed_step_reached_the_global_grad_clip_threshold"
+    return {
+        "schema_version": "policy-dose-clipping-interpretation-v1",
+        "raw_exposure_authority": "training_row_draws_and_active_rows",
+        "coefficient_weighted_measure": "pre_clip_objective_mixture_proxy",
+        "coefficient_weighted_measure_is_realized_update_amplitude": False,
+        "aux_coefficient_effect": (
+            "changes_pre_clip_objective_mixture_and_gradient_direction"
+        ),
+        "realized_update_amplitude_status": status,
+        "realized_update_amplitude_semantics": amplitude,
+        "optimizer_observed_steps": observed,
+        "optimizer_clipped_steps": clipped,
+        "clipped_fraction": fraction,
+    }
 
 
 def _global_policy_objective_presence(
@@ -22677,6 +22729,12 @@ def main(
         "optimizer_lr_dose": optimizer_lr_dose,
         "max_grad_norm": float(args.max_grad_norm),
         "gradient_clipping_enabled": bool(float(args.max_grad_norm) > 0.0),
+        "policy_objective_dose_interpretation": (
+            _policy_dose_clipping_interpretation(
+                optimizer_observed_steps=optimizer_observed_steps,
+                optimizer_clipped_steps=optimizer_clipped_steps,
+            )
+        ),
         "weight_decay": float(args.weight_decay),
         **optimizer_fused_report_fields,
         "hidden_size": int(args.hidden_size),
@@ -46812,6 +46870,12 @@ def _checkpoint_dose_telemetry(
             )
         ),
     }
+    policy_objective_dose["interpretation"] = (
+        _policy_dose_clipping_interpretation(
+            optimizer_observed_steps=optimizer_observed_steps,
+            optimizer_clipped_steps=optimizer_clipped_steps,
+        )
+    )
     return {
         "schema_version": CHECKPOINT_DOSE_TELEMETRY_SCHEMA,
         "optimizer_step": int(optimizer_step),

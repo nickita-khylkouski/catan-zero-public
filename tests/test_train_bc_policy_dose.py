@@ -7,6 +7,34 @@ import pytest
 from tools import train_bc
 
 
+@pytest.mark.parametrize(
+    ("observed", "clipped", "status", "fraction"),
+    [
+        (0, 0, "unobserved", None),
+        (8, 0, "not_clip_limited_on_observed_steps", 0.0),
+        (8, 2, "partially_clip_limited", 0.25),
+        (8, 8, "fully_clip_limited", 1.0),
+    ],
+)
+def test_policy_dose_clipping_interpretation_does_not_call_weighted_rows_amplitude(
+    observed: int,
+    clipped: int,
+    status: str,
+    fraction: float | None,
+) -> None:
+    report = train_bc._policy_dose_clipping_interpretation(  # noqa: SLF001
+        optimizer_observed_steps=observed,
+        optimizer_clipped_steps=clipped,
+    )
+
+    assert report["coefficient_weighted_measure"] == (
+        "pre_clip_objective_mixture_proxy"
+    )
+    assert report["coefficient_weighted_measure_is_realized_update_amplitude"] is False
+    assert report["realized_update_amplitude_status"] == status
+    assert report["clipped_fraction"] == fraction
+
+
 def test_policy_lr_area_hits_exact_boundary_and_then_stops() -> None:
     assert train_bc._policy_weight_for_lr_area(  # noqa: SLF001
         1.0,
