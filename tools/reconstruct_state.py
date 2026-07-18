@@ -48,13 +48,15 @@ from catan_zero.rl.action_mask import ActionCatalog
 from catan_zero.rl.entity_feature_adapter import (
     CURRENT_RUST_ENTITY_ADAPTER_VERSION,
 )
-from catan_zero.rl.gumbel_self_play import _action_type_of, _apply_selected_action
+from catan_zero.rl.gumbel_self_play import (
+    _action_type_of,
+    _apply_selected_action,
+    _build_public_learner_features,
+)
 from catan_zero.rl.meaningful_history import (
     MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION,
 )
 from catan_zero.search.neural_rust_mcts import (
-    rust_action_context_batch,
-    rust_game_to_entity_batch,
     rust_policy_action_ids,
 )
 from catan_zero.search.rust_mcts import _require_rust_module
@@ -509,41 +511,25 @@ def featurize_state(
         int(a) for a in game.playable_action_indices(list(colors), None)
     )
     acting_color = str(game.current_color())
-    mapped = rust_policy_action_ids(
-        game, legal_rust, colors=colors, action_size=action_size
-    )
     snapshot = json.loads(game.json_snapshot())
     action_ids = [int(a) for a in game.playable_action_indices(list(colors), None)]
     raw_actions = json.loads(game.playable_actions_json())
     action_by_id = {aid: raw for aid, raw in zip(action_ids, raw_actions)}
-    entity = rust_game_to_entity_batch(
-        game,
-        legal_rust,
-        actor=acting_color,
-        colors=colors,
-        action_size=action_size,
-        policy_action_ids=mapped,
-        snapshot=snapshot,
-        action_by_id=action_by_id,
-        public_observation=True,
-        meaningful_public_history=meaningful_public_history,
-        history_limit=history_limit,
-        meaningful_public_history_schema=meaningful_public_history_schema,
-        entity_feature_adapter_version=entity_feature_adapter_version,
+    mapped, features, context, snapshot, _action_by_id = (
+        _build_public_learner_features(
+            game,
+            legal_rust,
+            actor=acting_color,
+            colors=colors,
+            action_size=action_size,
+            snapshot=snapshot,
+            action_by_id=action_by_id,
+            meaningful_public_history=meaningful_public_history,
+            meaningful_public_history_schema=meaningful_public_history_schema,
+            event_history_limit=history_limit,
+            entity_feature_adapter_version=entity_feature_adapter_version,
+        )
     )
-    features = {key: value[0] for key, value in entity.items()}
-    context = rust_action_context_batch(
-        game,
-        legal_rust,
-        actor=acting_color,
-        colors=colors,
-        action_size=action_size,
-        policy_action_ids=mapped,
-        snapshot=snapshot,
-        action_by_id=action_by_id,
-        public_observation=True,
-        entity_feature_adapter_version=entity_feature_adapter_version,
-    )[0]
     return {
         "features": features,
         "context": context,

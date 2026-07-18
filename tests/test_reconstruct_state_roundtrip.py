@@ -34,25 +34,27 @@ class _FakeGame:
         return None
 
 
-def test_featurize_state_always_uses_public_observation(monkeypatch):
-    calls: list[tuple[str, bool]] = []
+def test_featurize_state_uses_canonical_public_learner_surface(monkeypatch):
+    calls: list[dict[str, object]] = []
 
-    monkeypatch.setattr(rs, "rust_policy_action_ids", lambda *a, **k: (5, 6))
+    def canonical(*args, **kwargs):
+        calls.append(kwargs)
+        return (
+            (5, 6),
+            {"hex_tokens": np.zeros((2, 3), dtype=np.float32)},
+            np.zeros((2, 4), dtype=np.float32),
+            {"current_prompt": "ROLL"},
+            {11: {"id": 11}, 12: {"id": 12}},
+        )
 
-    def entity(*args, **kwargs):
-        calls.append(("entity", kwargs.get("public_observation")))
-        return {"hex_tokens": np.zeros((1, 2, 3), dtype=np.float32)}
-
-    def context(*args, **kwargs):
-        calls.append(("context", kwargs.get("public_observation")))
-        return np.zeros((1, 2, 4), dtype=np.float32)
-
-    monkeypatch.setattr(rs, "rust_game_to_entity_batch", entity)
-    monkeypatch.setattr(rs, "rust_action_context_batch", context)
+    monkeypatch.setattr(rs, "_build_public_learner_features", canonical)
 
     result = rs.featurize_state(_FakeGame(), action_size=64)
 
-    assert calls == [("entity", True), ("context", True)]
+    assert len(calls) == 1
+    assert calls[0]["actor"] == "RED"
+    assert calls[0]["action_size"] == 64
+    assert calls[0]["meaningful_public_history"] is False
     assert result["legal_policy_ids"] == (5, 6)
 
 
