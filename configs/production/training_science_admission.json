@@ -228,6 +228,28 @@
         "docs/evidence/A1_ACTIVE_POLICY_P10_MATCHED_CONTROL_REJECTION_20260718.json"
       ]
     },
+    "a1-parent-update-active-mix10-35m-b200": {
+      "recipe_canonical_sha256": "ae1abb134be268b79a9a20a559effbff3279b1e5059434a8d72248c3cbcb8015",
+      "authorized": false,
+      "reason": "dose_neutral_active_mix10_requires_fresh_commissioning",
+      "unresolved_requirements": [
+        "commission the exact 0.90 base plus 0.10 coherent-reanalysis policy mixture against the exact current parent"
+      ],
+      "observations": {
+        "architecture_information_surface": "v6_b12_all_required_modules_positive_learning_signal",
+        "retained_composite_adapter_status": "fresh_adapter_v6_composite_authenticated",
+        "required_fresh_learner_adapter": "rust_entity_adapter_v6_exact_actor_resources_initial_road_two_hop",
+        "policy_objective_semantics": "0.90*base_policy_mean+0.10*stage_c_aux_policy_mean",
+        "outer_policy_loss_weight": 0.9,
+        "inner_policy_aux_loss_weight": 0.1111111111111111,
+        "effective_base_policy_coefficient": 0.9,
+        "effective_stage_c_aux_policy_coefficient": 0.1,
+        "total_policy_coefficient": 1.0,
+        "shared_trunk_lr_multiplier": 0.25,
+        "scalar_value_objective": "binary_win_bce_logit_equivalent_deployed_tanh"
+      },
+      "commissioning_evidence": []
+    },
     "a1-parent-update-active-p10-clip5-35m-b200": {
       "recipe_canonical_sha256": "0e2d31354cea0f89dcfd978351a520041b7a55dc6aa1240c54e80bacea466504",
       "authorized": false,

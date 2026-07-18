@@ -41,6 +41,10 @@ APPROVED_ACTIVE_P10_PARENT_UPDATE = (
     "configs/training/a1_parent_update_active_p10_35m_b200.schema1.json",
     "a1-parent-update-active-p10-35m-b200",
 )
+APPROVED_ACTIVE_MIX10_PARENT_UPDATE = (
+    "configs/training/a1_parent_update_active_mix10_35m_b200.schema1.json",
+    "a1-parent-update-active-mix10-35m-b200",
+)
 APPROVED_ACTIVE_P10_WARMUP0_PARENT_UPDATE = (
     "configs/training/a1_parent_update_active_p10_warmup0_35m_b200.schema1.json",
     "a1-parent-update-active-p10-warmup0-35m-b200",
@@ -142,6 +146,27 @@ def test_checked_in_active_p10_parent_update_recipe_is_authenticated() -> None:
     assert fields["policy_aux_active_batch_size"] == 64
     assert fields["policy_aux_loss_weight"] == pytest.approx(0.1)
     assert fields["policy_aux_sampling_mode"] == "weighted_permutation_cycles_v1"
+
+
+def test_checked_in_active_mix10_parent_update_recipe_is_dose_neutral() -> None:
+    relative, expected_name = APPROVED_ACTIVE_MIX10_PARENT_UPDATE
+    path = ROOT / relative
+    payload = json.loads(path.read_text(encoding="utf-8"))
+
+    assert (
+        require_production_recipe(entrypoint="train", path=path, payload=payload)
+        == expected_name
+    )
+    fields = payload["train_config"]["fields"]
+    outer = float(fields["policy_loss_weight"])
+    aux_inside = float(fields["policy_aux_loss_weight"])
+    assert fields["policy_aux_active_batch_size"] == 64
+    assert fields["policy_aux_sampling_mode"] == "weighted_permutation_cycles_v1"
+    assert outer == pytest.approx(0.9)
+    assert outer * aux_inside == pytest.approx(0.1)
+    assert outer + outer * aux_inside == pytest.approx(1.0)
+    assert fields["lr_warmup_steps"] == 16
+    assert fields["max_grad_norm"] == pytest.approx(1.0)
 
 
 def test_checked_in_shared_action_parent_update_recipe_is_authenticated() -> None:
@@ -270,6 +295,7 @@ def test_authenticated_catalog_listing_has_no_second_identity_registry() -> None
         "a1-parent-update-value25-35m-b200",
         "a1-parent-update-shared-action25-value25-35m-b200",
         "a1-parent-update-active-p10-35m-b200",
+        "a1-parent-update-active-mix10-35m-b200",
         "a1-parent-update-active-p10-clip5-35m-b200",
         "a1-parent-update-active-p10-warmup0-35m-b200",
         "a1-parent-update-active-p25-35m-b200",
