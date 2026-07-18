@@ -1860,7 +1860,9 @@ def test_ppo_update_stops_early_on_target_kl() -> None:
     )
 
     assert update["early_stop"] == 1.0
-    assert update["minibatches"] == 1.0
+    # A minibatch that already violates the trust region is rejected before
+    # optimizer.step; early stopping must not knowingly apply one extra update.
+    assert update["minibatches"] == 0.0
 
 
 def test_dagger_episode_labels_policy_visited_states() -> None:
