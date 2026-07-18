@@ -93,6 +93,10 @@ _CANONICAL_RUNTIME_DEFAULTS: dict[str, Any] = {
     "accepted_policy_target_identity_sha256": [],
     "require_only_trainable_prefixes": "",
     "allow_teacher_score_q_loss": False,
+    # Completed-Q is a separately commissioned Stage-C objective. Canonical
+    # scratch and parent-update recipes keep it inactive until a recipe binds
+    # authenticated completed-Q rows and a nonzero weight explicitly.
+    "completed_q_loss_weight": 0.0,
     "allow_legacy_action_mask_upgrade": False,
     "acknowledge_diagnostic_outcome_conditioned_policy_distillation": False,
     "a1_learner_ablation_id": "",
