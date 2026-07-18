@@ -163,6 +163,25 @@ def test_descriptor_authenticates_ordered_component_bytes(tmp_path):
     )
 
 
+def test_descriptor_accepts_completed_q_reliability_overrides(tmp_path):
+    path = _descriptor(tmp_path)
+    payload = json.loads(path.read_text())
+    overrides = payload["learner_recipe_overrides"]
+    overrides.update(
+        {
+            "completed_q_loss_weight": 0.25,
+            "target_reliability_confidence_floor": 0.4,
+            "target_reliability_confidence_weighting": False,
+        }
+    )
+    payload["learner_recipe_overrides_sha256"] = _canonical(overrides)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    verified = train_bc._preflight_memmap_composite_descriptor(path)
+
+    assert verified["learner_recipe_overrides"] == overrides
+
+
 def test_v2_authenticates_three_component_ratios_and_anchor_scope(tmp_path):
     path = _descriptor_v2(tmp_path)
     verified = train_bc._preflight_memmap_composite_descriptor(path)

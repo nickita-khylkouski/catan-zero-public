@@ -86,6 +86,39 @@ def test_parent_production_recipe_can_collect_two_signal_observations() -> None:
     assert engine["minimum_feature_learning_signal_observations"] == 2
 
 
+def test_completed_q_opt_in_binds_reliability_inputs() -> None:
+    config, engine = train._load_recipe(PARENT_RECIPE)  # noqa: SLF001
+    baseline_args = train._engine_namespace(  # noqa: SLF001
+        config=config,
+        engine_settings=engine,
+        public_args=_public_args(init_checkpoint="/tmp/parent.pt"),
+    )
+    baseline = train_bc._effective_a1_learner_training_recipe(  # noqa: SLF001
+        baseline_args,
+        {"enabled": True, "world_size": 8, "rank": 0, "local_rank": 0},
+    )
+    assert "completed_q_loss_weight" not in baseline
+
+    opt_in_args = train._engine_namespace(  # noqa: SLF001
+        config=dataclasses.replace(
+            config,
+            completed_q_loss_weight=0.25,
+            target_reliability_confidence_floor=0.4,
+            target_reliability_confidence_weighting=False,
+        ),
+        engine_settings=engine,
+        public_args=_public_args(init_checkpoint="/tmp/parent.pt"),
+    )
+    effective = train_bc._effective_a1_learner_training_recipe(  # noqa: SLF001
+        opt_in_args,
+        {"enabled": True, "world_size": 8, "rank": 0, "local_rank": 0},
+    )
+
+    assert effective["completed_q_loss_weight"] == pytest.approx(0.25)
+    assert effective["target_reliability_confidence_floor"] == pytest.approx(0.4)
+    assert effective["target_reliability_confidence_weighting"] is False
+
+
 def test_parent_report_retains_canonical_launch_authority(tmp_path) -> None:
     report = tmp_path / "train.report.json"
     report.write_text(

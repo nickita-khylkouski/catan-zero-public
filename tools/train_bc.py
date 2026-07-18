@@ -6571,6 +6571,8 @@ def _preflight_memmap_composite_descriptor(
         "policy_kl_target", "policy_kl_dual_lr", "policy_kl_max_weight",
         "policy_target_blend_semantics", "q_loss_weight", "soft_target_source",
         "completed_q_loss_weight",
+        "target_reliability_confidence_floor",
+        "target_reliability_confidence_weighting",
         "soft_target_temperature", "soft_target_weight",
         "scalar_value_objective", "scalar_value_loss_readout",
         "scalar_value_loss_scale",
@@ -10282,8 +10284,17 @@ def _effective_a1_learner_training_recipe(
     )
     effective = {field: getattr(args, field) for field in bound_fields}
     if float(getattr(args, "completed_q_loss_weight", 0.0)) != 0.0:
+        # Keep disabled historical recipes exact, but seal every input that
+        # changes the enabled completed-Q objective.  The confidence floor is
+        # active when policy weights have not already consumed reliability.
         effective["completed_q_loss_weight"] = float(
             args.completed_q_loss_weight
+        )
+        effective["target_reliability_confidence_floor"] = float(
+            args.target_reliability_confidence_floor
+        )
+        effective["target_reliability_confidence_weighting"] = bool(
+            args.target_reliability_confidence_weighting
         )
     min_35m_params = int(getattr(args, "min_35m_params", 30_000_000))
     max_35m_params = int(getattr(args, "max_35m_params", 40_000_000))
@@ -22438,6 +22449,12 @@ def main(
         "final_vp_loss_weight": args.final_vp_loss_weight,
         "q_loss_weight": args.q_loss_weight,
         "completed_q_loss_weight": args.completed_q_loss_weight,
+        "completed_q_confidence_floor": float(
+            args.target_reliability_confidence_floor
+        ),
+        "completed_q_policy_weights_include_reliability": bool(
+            args.target_reliability_confidence_weighting
+        ),
         "completed_q_objective_admission": completed_q_admission,
         "policy_kl_anchor_weight": args.policy_kl_anchor_weight,
         "policy_kl_anchor_initial_weight": args.policy_kl_anchor_weight,
