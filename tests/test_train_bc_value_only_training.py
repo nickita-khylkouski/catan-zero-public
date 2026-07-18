@@ -1579,8 +1579,6 @@ def test_entity_main_builds_base_only_policy_report_with_unforced_phases(
             "0",
             "--host-lock-file",
             str(tmp_path / "train.lock"),
-            "--train-diagnostics-every-batches",
-            "1",
             "--skip-guards",
         ]
     )
@@ -1598,6 +1596,14 @@ def test_entity_main_builds_base_only_policy_report_with_unforced_phases(
     assert metric["policy_aux_accuracy_active_count"] == 0
     assert metric["policy_total_accuracy_active_count"] == 4
     assert metric["policy_total_accuracy"] == metric["accuracy"]
+    semantics = metric["policy_metric_semantics"]
+    assert semantics["sampled_action_phase_collection_scope"] == (
+        "all_policy_active_rows_all_batches"
+    )
+    assert semantics["sampled_action_phase_ddp_reduction"] == (
+        "sum_counts_all_ranks"
+    )
+    assert semantics["sampled_action_phase_world_size"] == 1
     assert metric["policy_total_phase_accuracy"] == metric["phase_accuracy"]
     assert "FORCED" not in metric["policy_base_phase_accuracy"]
     assert metric["policy_base_phase_accuracy"]["OPEN"]["count"] == 4
@@ -1695,9 +1701,80 @@ def test_unforced_phase_ddp_reducer_merges_unequal_rank_counts(monkeypatch) -> N
         "OPEN": {"count": 4, "top1": 2, "top3": 3},
         "ROBBER": {"count": 2, "top1": 0, "top3": 1},
     }
+    train_bc._require_complete_phase_metric_counts(  # noqa: SLF001
+        reduced,
+        expected_rows=6,
+        label="synthetic-two-rank",
+    )
     finalized = train_bc._finalize_phase_stats(reduced)  # noqa: SLF001
     assert finalized["OPEN"]["top1_accuracy"] == pytest.approx(0.5)
     assert finalized["ROBBER"]["top3_accuracy"] == pytest.approx(0.5)
+
+
+def test_phase_metric_reconciliation_rejects_rank_local_receipt() -> None:
+    from tools import train_bc
+
+    rank_local = {
+        "MOVE_ROBBER": {"count": 61, "top1": 16, "top3": 39},
+    }
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            "cover 61 rows, but the globally reduced policy-active counter "
+            "is 490"
+        ),
+    ):
+        train_bc._require_complete_phase_metric_counts(  # noqa: SLF001
+            rank_local,
+            expected_rows=490,
+            label="synthetic-eight-rank",
+        )
+
+
+def test_phase_stats_cover_policy_rows_when_module_diagnostics_are_disabled(
+    tmp_path,
+) -> None:
+    import torch
+
+    data = _write_and_load_shard(tmp_path, _collect_real_samples(6))
+    data["phase"] = np.asarray(["MOVE_ROBBER"] * 6, dtype=object)
+    data["teacher_name"] = np.asarray(["entity_teacher"] * 6, dtype=object)
+    batch = np.arange(6)
+    policy_weights = np.ones(6, dtype=np.float32)
+    policy = _make_entity_policy()
+    optimizer = torch.optim.SGD(policy.model.parameters(), lr=0.0)
+
+    metrics = _train_entity_batch(
+        policy,
+        optimizer,
+        data,
+        batch,
+        policy_weights,
+        np.ones(6, dtype=np.float32),
+        soft_target_temperature=1.0,
+        soft_target_weight=0.0,
+        soft_target_source="scores",
+        soft_target_min_legal_coverage=0.0,
+        policy_loss_weight=1.0,
+        value_loss_weight=0.0,
+        final_vp_loss_weight=0.0,
+        q_loss_weight=0.0,
+        q_skip_teacher_prefixes=(),
+        vps_to_win=10,
+        advantage_policy_weighting="none",
+        advantage_temperature=1.0,
+        advantage_weight_cap=5.0,
+        advantage_weight_floor=0.05,
+        amp="none",
+        diagnostics=False,
+    )
+
+    assert metrics["policy_base_active_count"] == 6
+    assert metrics["phase_stats"]["MOVE_ROBBER"]["count"] == 6
+    assert metrics["policy_base_phase_stats"]["MOVE_ROBBER"]["count"] == 6
+    assert metrics["policy_metric_semantics"][
+        "sampled_action_phase_collection_scope"
+    ] == "all_policy_active_rows_in_batch"
 
 
 def test_policy_target_distribution_metrics_follow_soft_teacher_and_opening_index() -> None:

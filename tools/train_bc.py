@@ -20076,6 +20076,21 @@ def main(
             )
         policy_total_rows = policy_base_rows + policy_aux_rows
         policy_total_active = policy_base_active + policy_aux_active
+        _require_complete_phase_metric_counts(
+            policy_base_phase_stats,
+            expected_rows=policy_base_active,
+            label="base",
+        )
+        _require_complete_phase_metric_counts(
+            policy_aux_phase_stats,
+            expected_rows=policy_aux_active,
+            label="aux",
+        )
+        _require_complete_phase_metric_counts(
+            phase_stats,
+            expected_rows=policy_total_active,
+            label="total",
+        )
         policy_base_correct = float(
             epoch_policy_metric_counts["policy_base_correct_count"]
         )
@@ -20294,6 +20309,16 @@ def main(
                         "uniform_active_row_count"
                     ),
                     "sampled_action_accuracy_deprecated": True,
+                    "sampled_action_phase_collection_scope": (
+                        "all_policy_active_rows_all_batches"
+                    ),
+                    "sampled_action_phase_ddp_reduction": (
+                        "sum_counts_all_ranks"
+                    ),
+                    "sampled_action_phase_world_size": int(
+                        ddp["world_size"]
+                    ),
+                    "sampled_action_phase_count_reconciled": True,
                     "teacher_distribution_metric": (
                         "policy_target_distribution_metrics"
                     ),
@@ -23399,36 +23424,41 @@ def _train_entity_batch(
                     objective_weights=aux_weights.detach().float().cpu().numpy(),
                 )
             )
-            if diagnostics:
-                aux_predictions_np = aux_predictions.detach().cpu().numpy()
-                aux_targets_np = aux_actions.detach().cpu().numpy()
-                aux_logits_np = (
-                    aux_outputs["logits"].float().detach().cpu().numpy()
-                )
-                policy_aux_phase_stats = _field_stats(
-                    policy_aux_data,
-                    policy_aux_batch,
-                    aux_predictions_np,
-                    aux_targets_np,
-                    aux_logits_np,
-                    field="phase",
-                )
-                policy_aux_phase_stats_unforced = _field_stats_unforced(
-                    policy_aux_data,
-                    policy_aux_batch,
-                    aux_predictions_np,
-                    aux_targets_np,
-                    aux_logits_np,
-                    field="phase",
-                )
-                policy_aux_teacher_stats = _field_stats(
-                    policy_aux_data,
-                    policy_aux_batch,
-                    aux_predictions_np,
-                    aux_targets_np,
-                    aux_logits_np,
-                    field="teacher_name",
-                )
+            # Sampled-action compatibility metrics are deprecated, but while
+            # they remain in the report their counts must cover the complete
+            # policy stream. ``diagnostics`` gates expensive optimizer/module
+            # observability; using it here silently sampled only cadence
+            # batches (two of twelve in the H100 audit) before the otherwise
+            # correct DDP reduction.
+            aux_predictions_np = aux_predictions.detach().cpu().numpy()
+            aux_targets_np = aux_actions.detach().cpu().numpy()
+            aux_logits_np = (
+                aux_outputs["logits"].float().detach().cpu().numpy()
+            )
+            policy_aux_phase_stats = _field_stats(
+                policy_aux_data,
+                policy_aux_batch,
+                aux_predictions_np,
+                aux_targets_np,
+                aux_logits_np,
+                field="phase",
+            )
+            policy_aux_phase_stats_unforced = _field_stats_unforced(
+                policy_aux_data,
+                policy_aux_batch,
+                aux_predictions_np,
+                aux_targets_np,
+                aux_logits_np,
+                field="phase",
+            )
+            policy_aux_teacher_stats = _field_stats(
+                policy_aux_data,
+                policy_aux_batch,
+                aux_predictions_np,
+                aux_targets_np,
+                aux_logits_np,
+                field="teacher_name",
+            )
         # Batch size is a Monte-Carlo estimator/throughput knob, not a hidden
         # science coefficient. Normalize the base and AUX measures independently
         # so row weights and DDP world size cannot silently redefine AUX strength.
@@ -24001,54 +24031,46 @@ def _train_entity_batch(
         policy_aux_target_distribution_stats,
     )
     active_np = active.detach().cpu().numpy().astype(bool)
-    if diagnostics:
-        predictions_np = predictions.detach().cpu().numpy()
-        target_np = target.detach().cpu().numpy()
-        logits_np = outputs["logits"].float().detach().cpu().numpy()
-        policy_base_phase_stats = _field_stats(
-            data,
-            batch[active_np],
-            predictions_np[active_np],
-            target_np[active_np],
-            logits_np[active_np],
-            field="phase",
-        )
-        policy_base_teacher_stats = _field_stats(
-            data,
-            batch[active_np],
-            predictions_np[active_np],
-            target_np[active_np],
-            logits_np[active_np],
-            field="teacher_name",
-        )
-        policy_base_phase_stats_unforced = _field_stats_unforced(
-            data,
-            batch[active_np],
-            predictions_np[active_np],
-            target_np[active_np],
-            logits_np[active_np],
-            field="phase",
-        )
-        phase_stats: dict = {}
-        phase_stats_unforced: dict = {}
-        teacher_stats: dict = {}
-        _merge_phase_stats(phase_stats, policy_base_phase_stats)
-        _merge_phase_stats(phase_stats, policy_aux_phase_stats)
-        _merge_phase_stats(
-            phase_stats_unforced, policy_base_phase_stats_unforced
-        )
-        _merge_phase_stats(
-            phase_stats_unforced, policy_aux_phase_stats_unforced
-        )
-        _merge_phase_stats(teacher_stats, policy_base_teacher_stats)
-        _merge_phase_stats(teacher_stats, policy_aux_teacher_stats)
-    else:
-        policy_base_phase_stats = {}
-        policy_base_teacher_stats = {}
-        policy_base_phase_stats_unforced = {}
-        phase_stats = {}
-        teacher_stats = {}
-        phase_stats_unforced = {}
+    predictions_np = predictions.detach().cpu().numpy()
+    target_np = target.detach().cpu().numpy()
+    logits_np = outputs["logits"].float().detach().cpu().numpy()
+    policy_base_phase_stats = _field_stats(
+        data,
+        batch[active_np],
+        predictions_np[active_np],
+        target_np[active_np],
+        logits_np[active_np],
+        field="phase",
+    )
+    policy_base_teacher_stats = _field_stats(
+        data,
+        batch[active_np],
+        predictions_np[active_np],
+        target_np[active_np],
+        logits_np[active_np],
+        field="teacher_name",
+    )
+    policy_base_phase_stats_unforced = _field_stats_unforced(
+        data,
+        batch[active_np],
+        predictions_np[active_np],
+        target_np[active_np],
+        logits_np[active_np],
+        field="phase",
+    )
+    phase_stats: dict = {}
+    phase_stats_unforced: dict = {}
+    teacher_stats: dict = {}
+    _merge_phase_stats(phase_stats, policy_base_phase_stats)
+    _merge_phase_stats(phase_stats, policy_aux_phase_stats)
+    _merge_phase_stats(
+        phase_stats_unforced, policy_base_phase_stats_unforced
+    )
+    _merge_phase_stats(
+        phase_stats_unforced, policy_aux_phase_stats_unforced
+    )
+    _merge_phase_stats(teacher_stats, policy_base_teacher_stats)
+    _merge_phase_stats(teacher_stats, policy_aux_teacher_stats)
     q_score_rows_ge2 = (
         _q_score_rows_ge2(
             data,
@@ -24189,6 +24211,9 @@ def _train_entity_batch(
             "aux_scope": "all_rows_in_policy_aux_forward",
             "sampled_action_accuracy_weighting": "uniform_active_row_count",
             "sampled_action_accuracy_deprecated": True,
+            "sampled_action_phase_collection_scope": (
+                "all_policy_active_rows_in_batch"
+            ),
             "teacher_distribution_metric": (
                 "policy_target_distribution_stats"
             ),
@@ -33957,6 +33982,45 @@ def _reduce_nested_count_stats(
         if item:
             _merge_phase_stats(merged, item)
     return merged
+
+
+def _require_complete_phase_metric_counts(
+    stats: Mapping[str, Mapping[str, object]],
+    *,
+    expected_rows: float,
+    label: str,
+) -> None:
+    """Refuse a sampled-action receipt that omitted batches or DDP ranks."""
+
+    expected = float(expected_rows)
+    if (
+        not math.isfinite(expected)
+        or expected < 0.0
+        or not expected.is_integer()
+    ):
+        raise RuntimeError(
+            f"{label} policy active-row counter is not a non-negative integer"
+        )
+    observed = 0
+    for phase, row in stats.items():
+        try:
+            count = int(row.get("count", 0))
+            top1 = int(row.get("top1", 0))
+            top3 = int(row.get("top3", 0))
+        except (TypeError, ValueError) as error:
+            raise RuntimeError(
+                f"{label} sampled-action phase stats are malformed for {phase!r}"
+            ) from error
+        if count < 0 or not 0 <= top1 <= count or not 0 <= top3 <= count:
+            raise RuntimeError(
+                f"{label} sampled-action phase stats are invalid for {phase!r}"
+            )
+        observed += count
+    if observed != int(expected):
+        raise RuntimeError(
+            f"{label} sampled-action phase metrics cover {observed} rows, "
+            f"but the globally reduced policy-active counter is {int(expected)}"
+        )
 
 
 def _finalize_phase_stats(stats: dict[str, dict[str, int]]) -> dict[str, dict[str, float]]:
