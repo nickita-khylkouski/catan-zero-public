@@ -5,6 +5,7 @@ import json
 import multiprocessing
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
@@ -1178,6 +1179,14 @@ def _parent_update_admissible_report(
         "grad_accum_steps": int(fields["grad_accum_steps"]),
         "effective_global_batch_size": global_batch_size,
         "optimizer": fields["optimizer"],
+        "fused_optimizer": bool(fields["fused_optimizer"]),
+        "fused_optimizer_requested": bool(fields["fused_optimizer"]),
+        "fused_optimizer_runtime": {
+            "requested": bool(fields["fused_optimizer"]),
+            "attempted": bool(fields["fused_optimizer"]),
+            "effective": bool(fields["fused_optimizer"]),
+            "fallback_after_type_error": False,
+        },
         "lr": float(fields["lr"]),
         "lr_warmup_steps": int(fields["lr_warmup_steps"]),
         "lr_schedule": fields["lr_schedule"],
@@ -1233,7 +1242,12 @@ def _parent_update_admissible_report(
                     "checkpoint_sha256": checkpoint_ref_by_step[step]["sha256"],
                     "measure": "report_bound_raw_validation_rows",
                     "validation_game_seed_set_sha256": "sha256:" + "1" * 64,
-                    "metrics": {"loss": 0.75, "samples": 512},
+                    "metrics": {
+                        "loss": 0.75,
+                        "policy_loss": 0.5,
+                        "value_loss": 0.25,
+                        "samples": 512,
+                    },
                 }
                 for step in terminal_steps
             ],
@@ -1303,7 +1317,12 @@ def _parent_validation_fixture(
     *,
     recipe: str = "a1-parent-update-35m-b200",
 ) -> tuple[dict[str, object], dict[str, object], Path, dict[str, object]]:
-    plan = cli.build_plan(_write_job(tmp_path, "train", recipe=recipe))
+    with patch.object(
+        cli,
+        "pipeline_readiness",
+        return_value={"authorized": False, "reason": "validator_fixture"},
+    ):
+        plan = cli.build_plan(_write_job(tmp_path, "train", recipe=recipe))
     run_dir = Path(str(plan["job"]["run_dir"]))
     run_dir.mkdir(parents=True, exist_ok=True)
     checkpoint = run_dir / "candidate.pt"
@@ -1320,6 +1339,7 @@ def _parent_validation_fixture(
     (
         "a1-parent-update-35m-b200",
         "a1-parent-update-shared-action25-35m-b200",
+        "a1-parent-update-shared-action25-value25-35m-b200",
         "a1-parent-update-value25-35m-b200",
         "a1-parent-update-active-p10-35m-b200",
         "a1-parent-update-active-p25-35m-b200",
@@ -1365,8 +1385,16 @@ def test_parent_update_validator_accepts_every_catalog_recipe(
         "nonfinite_clipping",
         "aux_dose",
         "feature_admission",
+        "empty_feature_evidence",
         "objective_admission",
+        "empty_objective_evidence",
+        "aux_coefficient",
+        "weighted_objective_mass",
+        "fused_receipt_omitted",
+        "fused_receipt_contradiction",
         "holdout_binding",
+        "holdout_nan",
+        "holdout_zero_samples",
     ),
 )
 def test_parent_update_validator_rejects_authenticated_report_drift(
@@ -1401,12 +1429,34 @@ def test_parent_update_validator_rejects_authenticated_report_drift(
         rows[-1]["active_rows"]["policy_aux"] = 0
     elif tamper == "feature_admission":
         report["feature_learning_signal_admission"]["authenticated"] = False
+    elif tamper == "empty_feature_evidence":
+        report["feature_learning_signal_admission"]["modules"] = {}
     elif tamper == "objective_admission":
         report["objective_gradient_signal_admission"]["observed_steps"] = "2"
+    elif tamper == "empty_objective_evidence":
+        report["objective_gradient_signal_admission"]["observations"] = []
+    elif tamper == "aux_coefficient":
+        rows[-1]["policy_stream_objective"]["aux_coefficient"] = 0.9
+    elif tamper == "weighted_objective_mass":
+        rows[-1]["policy_objective_dose"][
+            "coefficient_weighted_effective_weight_sum"
+        ] += 1.0
+    elif tamper == "fused_receipt_omitted":
+        report.pop("fused_optimizer_runtime")
+    elif tamper == "fused_receipt_contradiction":
+        report["fused_optimizer_runtime"]["effective"] = False
     elif tamper == "holdout_binding":
         report["checkpoint_holdout_frontier"]["checkpoints"][-1][
             "checkpoint_sha256"
         ] = "sha256:" + "0" * 64
+    elif tamper == "holdout_nan":
+        report["checkpoint_holdout_frontier"]["checkpoints"][-1]["metrics"][
+            "loss"
+        ] = float("nan")
+    elif tamper == "holdout_zero_samples":
+        report["checkpoint_holdout_frontier"]["checkpoints"][-1]["metrics"][
+            "samples"
+        ] = 0
     else:
         raise AssertionError(f"unknown tamper: {tamper}")
 
@@ -1435,6 +1485,24 @@ def test_parent_update_validator_hashes_and_requires_intermediate_checkpoints(
             checkpoint_path=checkpoint,
             checkpoint_ref=checkpoint_ref,
         )
+
+
+def test_parent_update_validator_allows_explicit_fused_backend_fallback(
+    tmp_path: Path,
+) -> None:
+    plan, report, checkpoint, checkpoint_ref = _parent_validation_fixture(tmp_path)
+    report["fused_optimizer"] = False
+    runtime = report["fused_optimizer_runtime"]
+    assert isinstance(runtime, dict)
+    runtime["effective"] = False
+    runtime["fallback_after_type_error"] = True
+
+    cli._verify_parent_update_outputs(  # noqa: SLF001
+        plan,
+        report=report,
+        checkpoint_path=checkpoint,
+        checkpoint_ref=checkpoint_ref,
+    )
 
 
 def test_parent_update_validator_rejects_legacy_minimal_success_report(

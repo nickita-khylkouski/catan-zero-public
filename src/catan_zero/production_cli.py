@@ -1128,6 +1128,7 @@ def _require_parent_echoes(
         "lr_schedule": fields["lr_schedule"],
         "max_grad_norm": float(fields["max_grad_norm"]),
         "weight_decay": float(fields["weight_decay"]),
+        "policy_loss_weight": float(fields["policy_loss_weight"]),
         "policy_aux_active_batch_size": int(fields["policy_aux_active_batch_size"]),
         "policy_aux_loss_weight": float(fields["policy_aux_loss_weight"]),
         "policy_aux_sampling_mode": fields["policy_aux_sampling_mode"],
@@ -1315,12 +1316,48 @@ def _require_parent_optimizer(row: object, *, step: int) -> None:
         raise ProductionCLIError("parent-update optimizer/clipping counters drifted")
 
 
+def _require_parent_fused_optimizer(
+    report: Mapping[str, Any], fields: Mapping[str, Any]
+) -> None:
+    requested = bool(fields["fused_optimizer"])
+    runtime = report.get("fused_optimizer_runtime")
+    if (
+        not isinstance(runtime, Mapping)
+        or set(runtime)
+        != {"requested", "attempted", "effective", "fallback_after_type_error"}
+        or any(not isinstance(value, bool) for value in runtime.values())
+        or runtime["requested"] is not requested
+        or report.get("fused_optimizer_requested") is not requested
+        or report.get("fused_optimizer") is not runtime["effective"]
+        or runtime["attempted"] is not requested
+        or (
+            requested
+            and runtime["fallback_after_type_error"] is runtime["effective"]
+        )
+        or (
+            not requested
+            and (runtime["effective"] or runtime["fallback_after_type_error"])
+        )
+    ):
+        raise ProductionCLIError(
+            "parent-update fused optimizer runtime receipt drifted"
+        )
+
+
 def _require_parent_admissions(
-    report: Mapping[str, Any], engine: Mapping[str, Any]
+    report: Mapping[str, Any],
+    fields: Mapping[str, Any],
+    engine: Mapping[str, Any],
 ) -> None:
     minimum = int(engine["minimum_feature_learning_signal_observations"])
     feature = report.get("feature_learning_signal_admission")
     objective = report.get("objective_gradient_signal_admission")
+    positive_fields = (
+        "mean_pre_clip_grad_norm",
+        "max_pre_clip_grad_norm",
+        "mean_parameter_delta_norm",
+        "mean_parameter_update_rms",
+    )
     required_modules = sorted(
         name.strip()
         for name in str(engine["require_feature_learning_signal_modules"]).split(",")
@@ -1332,6 +1369,12 @@ def _require_parent_admissions(
     objective_steps = (
         objective.get("observed_steps") if isinstance(objective, Mapping) else None
     )
+    feature_modules = (
+        feature.get("modules") if isinstance(feature, Mapping) else None
+    )
+    objective_observations = (
+        objective.get("observations") if isinstance(objective, Mapping) else None
+    )
     if (
         not isinstance(feature, Mapping)
         or feature.get("schema_version") != "a1-feature-learning-signal-admission-v1"
@@ -1341,9 +1384,11 @@ def _require_parent_admissions(
         or feature_steps < minimum
         or feature.get("cadence_batches")
         != int(engine["train_diagnostics_every_batches"])
+        or feature.get("norm_scope") != "global_replicated"
         or feature.get("required_modules") != required_modules
-        or not isinstance(feature.get("modules"), Mapping)
-        or set(feature["modules"]) != set(required_modules)
+        or feature.get("positive_signal_fields") != list(positive_fields)
+        or not isinstance(feature_modules, Mapping)
+        or set(feature_modules) != set(required_modules)
         or not isinstance(objective, Mapping)
         or objective.get("schema_version")
         != "a1-objective-gradient-signal-admission-v1"
@@ -1354,8 +1399,223 @@ def _require_parent_admissions(
         or objective.get("cadence_batches")
         != int(engine["objective_gradient_interference_every_batches"])
         or objective.get("world_size") != 8
+        or objective.get("scalar_value_trunk_grad_scale")
+        != float(fields["value_trunk_grad_scale"])
+        or not isinstance(objective_observations, list)
+        or len(objective_observations) != objective_steps
     ):
         raise ProductionCLIError("parent-update feature/objective admission drifted")
+    assert isinstance(feature_modules, Mapping)
+    for module_name in required_modules:
+        row = feature_modules[module_name]
+        if (
+            not isinstance(row, Mapping)
+            or any(
+                _finite_parent_number(
+                    row.get(field),
+                    field=f"{module_name} {field}",
+                    minimum=0.0,
+                )
+                <= 0.0
+                for field in positive_fields
+            )
+            or isinstance(row.get("parameter_count"), bool)
+            or not isinstance(row.get("parameter_count"), int)
+            or row["parameter_count"] <= 0
+        ):
+            raise ProductionCLIError(
+                f"parent-update feature admission module {module_name} is empty"
+            )
+    assert isinstance(objective_observations, list)
+    value_scale = float(fields["value_trunk_grad_scale"])
+    observed_optimizer_steps: list[int] = []
+    for observation in objective_observations:
+        if not isinstance(observation, Mapping):
+            raise ProductionCLIError(
+                "parent-update objective admission observation is malformed"
+            )
+        optimizer_step = observation.get("optimizer_step")
+        if (
+            isinstance(optimizer_step, bool)
+            or not isinstance(optimizer_step, int)
+            or optimizer_step <= 0
+        ):
+            raise ProductionCLIError(
+                "parent-update objective admission step is malformed"
+            )
+        observed_optimizer_steps.append(optimizer_step)
+        policy_norm = _finite_parent_number(
+            observation.get("policy_trunk_grad_norm"),
+            field="policy trunk gradient norm",
+            minimum=0.0,
+        )
+        value_norm = _finite_parent_number(
+            observation.get("value_trunk_grad_norm"),
+            field="value trunk gradient norm",
+            minimum=0.0,
+        )
+        combined_norm = _finite_parent_number(
+            observation.get("combined_trunk_grad_norm"),
+            field="combined trunk gradient norm",
+            minimum=0.0,
+        )
+        value_ratio = _finite_parent_number(
+            observation.get("value_to_policy_grad_norm_ratio"),
+            field="value/policy gradient ratio",
+            minimum=0.0,
+        )
+        if policy_norm <= 0.0 or combined_norm <= 0.0:
+            raise ProductionCLIError(
+                "parent-update objective admission has no policy gradient signal"
+            )
+        if value_scale == 0.0:
+            if (
+                value_norm != 0.0
+                or value_ratio != 0.0
+                or observation.get("trunk_gradient_cosine") is not None
+                or observation.get("opposing_coordinate_fraction") is not None
+                or not math.isclose(
+                    combined_norm, policy_norm, rel_tol=1.0e-12, abs_tol=1.0e-12
+                )
+            ):
+                raise ProductionCLIError(
+                    "parent-update stop-gradient objective evidence drifted"
+                )
+        else:
+            cosine = _finite_parent_number(
+                observation.get("trunk_gradient_cosine"),
+                field="trunk gradient cosine",
+            )
+            opposing = _finite_parent_number(
+                observation.get("opposing_coordinate_fraction"),
+                field="opposing gradient fraction",
+                minimum=0.0,
+            )
+            if (
+                value_norm <= 0.0
+                or value_ratio <= 0.0
+                or not -1.0 <= cosine <= 1.0
+                or opposing > 1.0
+            ):
+                raise ProductionCLIError(
+                    "parent-update objective admission has invalid value evidence"
+                )
+    if observed_optimizer_steps != sorted(set(observed_optimizer_steps)):
+        raise ProductionCLIError(
+            "parent-update objective admission steps are not unique and ordered"
+        )
+
+
+def _require_parent_policy_objective(
+    row: Mapping[str, Any],
+    *,
+    step: int,
+    policy_active: int,
+    base_mass: float,
+    aux_mass: float,
+    aux_coefficient: float,
+) -> float:
+    stream = row.get("policy_stream_objective")
+    dose = row.get("policy_objective_dose")
+    aux_enabled = aux_mass > 0.0
+    expected_coefficient = aux_coefficient if aux_enabled else 0.0
+    weighted_mass = base_mass + expected_coefficient * aux_mass
+    if (
+        not isinstance(stream, Mapping)
+        or stream.get("schema_version") != "train-policy-stream-objective-v1"
+        or stream.get("formula") != "base_mean + aux_coefficient * aux_mean"
+        or stream.get("normalization") != "independent_weighted_means"
+        or stream.get("base_coefficient") != 1.0
+        or stream.get("aux_enabled") is not aux_enabled
+        or stream.get("aux_coefficient") != expected_coefficient
+        or not math.isclose(
+            _finite_parent_number(
+                stream.get("base_denominator"),
+                field="base objective denominator",
+                minimum=0.0,
+            ),
+            base_mass,
+            rel_tol=1.0e-12,
+        )
+        or not math.isclose(
+            _finite_parent_number(
+                stream.get("aux_denominator"),
+                field="AUX objective denominator",
+                minimum=0.0,
+            ),
+            aux_mass,
+            rel_tol=1.0e-12,
+        )
+        or not isinstance(dose, Mapping)
+        or dose.get("active_rows") != policy_active
+        or not math.isclose(
+            _finite_parent_number(
+                dose.get("equivalent_active_rows"),
+                field="equivalent policy active rows",
+                minimum=0.0,
+            ),
+            float(policy_active),
+            rel_tol=1.0e-12,
+        )
+        or not math.isclose(
+            _finite_parent_number(
+                dose.get("coefficient_weighted_effective_weight_sum"),
+                field="coefficient-weighted policy mass",
+                minimum=0.0,
+            ),
+            weighted_mass,
+            rel_tol=1.0e-12,
+        )
+        or not math.isclose(
+            _finite_parent_number(
+                dose.get("equivalent_effective_weight_sum"),
+                field="equivalent policy mass",
+                minimum=0.0,
+            ),
+            weighted_mass,
+            rel_tol=1.0e-12,
+        )
+        or dose.get("optimizer_updates") != step
+        or dose.get("equivalent_optimizer_updates") != float(step)
+    ):
+        raise ProductionCLIError(
+            "parent-update coefficient-weighted policy objective drifted"
+        )
+    return weighted_mass
+
+
+def _require_finite_holdout_metrics(metrics: object) -> None:
+    if not isinstance(metrics, Mapping) or not metrics:
+        raise ProductionCLIError("parent-update holdout metrics are missing")
+    samples = metrics.get("samples")
+    if (
+        isinstance(samples, bool)
+        or not isinstance(samples, int)
+        or samples <= 0
+        or any(
+            key not in metrics
+            or _finite_parent_number(
+                metrics[key], field=f"holdout {key}", minimum=0.0
+            )
+            < 0.0
+            for key in ("loss", "policy_loss", "value_loss")
+        )
+    ):
+        raise ProductionCLIError("parent-update holdout loss/sample metrics drifted")
+    pending: list[object] = [metrics]
+    while pending:
+        value = pending.pop()
+        if isinstance(value, Mapping):
+            pending.extend(value.values())
+        elif isinstance(value, list):
+            pending.extend(value)
+        elif isinstance(value, bool) or value is None or isinstance(value, str):
+            continue
+        elif isinstance(value, (int, float)):
+            if not math.isfinite(float(value)):
+                raise ProductionCLIError(
+                    "parent-update holdout metrics contain a non-finite value"
+                )
 
 
 def _verify_parent_update_outputs(
@@ -1367,8 +1627,9 @@ def _verify_parent_update_outputs(
 ) -> dict[str, dict[str, Any]]:
     fields, engine = _parent_update_recipe(plan)
     max_steps, world_size, global_batch = _require_parent_echoes(report, fields, engine)
+    _require_parent_fused_optimizer(report, fields)
     _require_parent_lr_dose(report, fields, max_steps=max_steps)
-    _require_parent_admissions(report, engine)
+    _require_parent_admissions(report, fields, engine)
     requested = _parent_checkpoint_steps(engine)
     expected_steps = [*requested, max_steps]
     raw_intermediate = report.get("intermediate_checkpoints")
@@ -1417,6 +1678,8 @@ def _verify_parent_update_outputs(
     ):
         raise ProductionCLIError("parent-update checkpoint dose trajectory drifted")
     aux_batch = int(fields["policy_aux_active_batch_size"])
+    aux_coefficient = float(fields["policy_aux_loss_weight"])
+    weighted_policy_masses: list[float] = []
     for step, row in zip(expected_steps, rows, strict=True):
         if (
             not isinstance(row, Mapping)
@@ -1465,6 +1728,17 @@ def _verify_parent_update_outputs(
             or (expected_aux == 0) != (aux_mass == 0.0)
         ):
             raise ProductionCLIError("parent-update base/AUX objective mass drifted")
+        assert isinstance(policy_total, int)
+        weighted_policy_masses.append(
+            _require_parent_policy_objective(
+                row,
+                step=step,
+                policy_active=policy_total,
+                base_mass=base_mass,
+                aux_mass=aux_mass,
+                aux_coefficient=aux_coefficient,
+            )
+        )
 
     terminal = rows[-1]
     terminal_draws = terminal["training_row_draws"]
@@ -1489,6 +1763,21 @@ def _verify_parent_update_outputs(
             raise ProductionCLIError(
                 "parent-update terminal dose/report totals drifted"
             )
+    if (
+        report.get("policy_objective_optimizer_updates") != max_steps
+        or not math.isclose(
+            _finite_parent_number(
+                report.get("policy_objective_effective_weight_sum"),
+                field="terminal coefficient-weighted policy mass",
+                minimum=0.0,
+            ),
+            weighted_policy_masses[-1],
+            rel_tol=1.0e-12,
+        )
+    ):
+        raise ProductionCLIError(
+            "parent-update terminal policy objective dose drifted"
+        )
 
     holdout = report.get("checkpoint_holdout_frontier")
     holdout_rows = holdout.get("checkpoints") if isinstance(holdout, Mapping) else None
@@ -1523,6 +1812,7 @@ def _verify_parent_update_outputs(
             or not isinstance(row.get("metrics"), Mapping)
         ):
             raise ProductionCLIError("parent-update checkpoint identity drifted")
+        _require_finite_holdout_metrics(row["metrics"])
     return admitted
 
 
