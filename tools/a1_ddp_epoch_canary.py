@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Eight-rank, non-promotable canary for the sealed B200 learner topology."""
+"""Eight-rank, non-promotable canary for one explicitly selected learner topology."""
 
 from __future__ import annotations
 
@@ -24,7 +24,27 @@ if str(REPO_ROOT) not in sys.path:
 from tools import train_bc  # noqa: E402
 
 
-SCHEMA = "a1-b200-8gpu-ddp-epoch-canary-v1"
+B200_SCHEMA = "a1-b200-8gpu-ddp-epoch-canary-v1"
+H100_SCHEMA = "a1-h100-8gpu-ddp-epoch-canary-v1"
+# Historical callers import SCHEMA.  Keep it bound to the production B200
+# authority; the H100 diagnostic has its own explicit schema.
+SCHEMA = B200_SCHEMA
+B200_TOPOLOGY = "b200-8gpu-ddp"
+H100_TOPOLOGY = "h100-8gpu-ddp"
+ACCELERATOR_CONTRACTS = {
+    "b200": {
+        "model_token": "B200",
+        "schema_version": B200_SCHEMA,
+        "runtime_schema_version": "a1-b200-learner-runtime-identity-v1",
+        "topology": B200_TOPOLOGY,
+    },
+    "h100": {
+        "model_token": "H100",
+        "schema_version": H100_SCHEMA,
+        "runtime_schema_version": "a1-h100-learner-runtime-identity-v1",
+        "topology": H100_TOPOLOGY,
+    },
+}
 WORLD_SIZE = 8
 LOCAL_BATCH_SIZE = 512
 GLOBAL_BATCH_SIZE = WORLD_SIZE * LOCAL_BATCH_SIZE
@@ -51,7 +71,9 @@ def _file_sha256(path: Path) -> str:
     return f"sha256:{digest.hexdigest()}"
 
 
-def _runtime_identity(torch_module: object) -> dict[str, object]:
+def _runtime_identity(
+    torch_module: object, *, runtime_schema_version: str
+) -> dict[str, object]:
     """Return the path-independent learner runtime used by this canary.
 
     Version strings alone are not enough: two environments can report the
@@ -78,7 +100,7 @@ def _runtime_identity(torch_module: object) -> dict[str, object]:
         {line.strip() for line in result.stdout.splitlines() if line.strip()}
     )
     if len(driver_versions) != 1:
-        raise CanaryError("B200 canary GPUs do not share one NVIDIA driver version")
+        raise CanaryError("canary GPUs do not share one NVIDIA driver version")
     executable = Path(sys.executable).resolve(strict=True)
     torch_version = getattr(torch_module, "__version__", None)
     cuda_version = getattr(getattr(torch_module, "version", None), "cuda", None)
@@ -94,7 +116,7 @@ def _runtime_identity(torch_module: object) -> dict[str, object]:
     ):
         raise CanaryError("learner CUDA runtime identity is incomplete")
     return {
-        "schema_version": "a1-b200-learner-runtime-identity-v1",
+        "schema_version": runtime_schema_version,
         "python": {
             "implementation": platform.python_implementation(),
             "version": platform.python_version(),
@@ -127,7 +149,7 @@ def _atomic_new_json(path: Path, value: dict[str, object]) -> None:
         os.close(directory_fd)
 
 
-def _nvidia_gpu_identities() -> list[dict[str, object]]:
+def _nvidia_gpu_identities(*, model_token: str) -> list[dict[str, object]]:
     """Return one stable physical identity per GPU from the driver."""
 
     try:
@@ -166,9 +188,13 @@ def _nvidia_gpu_identities() -> list[dict[str, object]]:
         [record["physical_index"] for record in records] != list(range(WORLD_SIZE))
         or len({str(record["uuid"]) for record in records}) != WORLD_SIZE
         or len({str(record["pci_bus_id"]) for record in records}) != WORLD_SIZE
-        or any("B200" not in str(record["name"]).upper() for record in records)
+        or any(
+            model_token not in str(record["name"]).upper() for record in records
+        )
     ):
-        raise CanaryError("driver inventory is not exactly eight unique B200 GPUs")
+        raise CanaryError(
+            f"driver inventory is not exactly eight unique {model_token} GPUs"
+        )
     return records
 
 
@@ -203,10 +229,14 @@ def _expected_global_draw(weights: np.ndarray) -> np.ndarray:
     return np.asarray(draw, dtype=np.int64)
 
 
-def run(out: Path) -> dict[str, object] | None:
+def run(out: Path, *, accelerator: str = "b200") -> dict[str, object] | None:
     import torch
     import torch.distributed as dist
 
+    contract = ACCELERATOR_CONTRACTS.get(accelerator)
+    if contract is None:
+        raise CanaryError(f"unsupported canary accelerator {accelerator!r}")
+    model_token = str(contract["model_token"])
     world_size = int(os.environ.get("WORLD_SIZE", "0"))
     rank = int(os.environ.get("RANK", "-1"))
     local_rank = int(os.environ.get("LOCAL_RANK", "-1"))
@@ -218,9 +248,11 @@ def run(out: Path) -> dict[str, object] | None:
         raise CanaryError("canary host must expose exactly eight GPUs")
     torch.cuda.set_device(local_rank)
     device_name = torch.cuda.get_device_name(local_rank)
-    if "B200" not in device_name.upper():
-        raise CanaryError(f"rank {rank} is not mapped to a B200: {device_name!r}")
-    identities = _nvidia_gpu_identities()
+    if model_token not in device_name.upper():
+        raise CanaryError(
+            f"rank {rank} is not mapped to an {model_token}: {device_name!r}"
+        )
+    identities = _nvidia_gpu_identities(model_token=model_token)
     identity = identities[local_rank]
     if str(identity["name"]) != device_name:
         raise CanaryError(
@@ -315,7 +347,8 @@ def run(out: Path) -> dict[str, object] | None:
                 "rank slices do not reconstruct one shared global weighted draw"
             )
         receipt: dict[str, object] = {
-            "schema_version": SCHEMA,
+            "schema_version": contract["schema_version"],
+            "training_topology": contract["topology"],
             "passed": True,
             "diagnostic_only": True,
             "promotion_eligible": False,
@@ -350,7 +383,10 @@ def run(out: Path) -> dict[str, object] | None:
             ],
             "gpu_names": [str(record["device_name"]) for record in records],
             "gpu_identities": gathered_identities,
-            "runtime_identity": _runtime_identity(torch),
+            "runtime_identity": _runtime_identity(
+                torch,
+                runtime_schema_version=str(contract["runtime_schema_version"]),
+            ),
             "tool": {
                 "path": str(Path(__file__).resolve()),
                 "sha256": _file_sha256(Path(__file__).resolve()),
@@ -373,6 +409,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", required=True, type=Path)
     parser.add_argument(
+        "--accelerator",
+        choices=tuple(ACCELERATOR_CONTRACTS),
+        default="b200",
+        help=(
+            "exact accelerator contract; h100 emits a separate diagnostic schema "
+            "and never satisfies the B200 production authority"
+        ),
+    )
+    parser.add_argument(
         "--local-batch-size",
         type=int,
         choices=(64, 512),
@@ -389,7 +434,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     GLOBAL_BATCH_SIZE = WORLD_SIZE * LOCAL_BATCH_SIZE
     SYNTHETIC_ROWS = GLOBAL_BATCH_SIZE * 2 + 97
     try:
-        run(args.out)
+        run(args.out, accelerator=args.accelerator)
     except (CanaryError, OSError, ValueError) as error:
         print(f"REFUSED: {error}", file=sys.stderr)
         return 2

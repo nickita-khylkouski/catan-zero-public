@@ -6,9 +6,11 @@ This is the only production A1 training entry point.  It consumes a sealed
 replays their byte and seed bindings, and then constructs the exact B200
 ``train_bc`` invocation bound by the lock. The historical one-GPU topology is
 replayable; current production may select one exact 8-GPU B200 DDP topology
-with the same global batch and optimizer/sample dose. The default is a
-read-only dry run; ``--go`` is required to probe every selected B200 and start
-training.
+with the same global batch and optimizer/sample dose. Authenticated
+independent-parent diagnostics may instead select a separately schematized
+same-host 8-GPU H100 topology; that authority is never production-admissible.
+The default is a read-only dry run; ``--go`` is required to probe every
+selected accelerator and start training.
 """
 
 from __future__ import annotations
@@ -154,7 +156,9 @@ DATA_LOADER_WORKERS = 2
 DATA_LOADER_PREFETCH = 2
 LEGACY_SINGLE_GPU_TOPOLOGY = "legacy-single-gpu"
 B200_8GPU_DDP_TOPOLOGY = "b200-8gpu-ddp"
+H100_8GPU_DDP_TOPOLOGY = "h100-8gpu-ddp"
 B200_8GPU_DDP_GPUS = tuple(range(8))
+H100_8GPU_DDP_GPUS = tuple(range(8))
 CANONICAL_PARENT_UPDATE_CONFIG = (
     _REPO_ROOT / "configs/training/a1_parent_update_35m_b200.schema1.json"
 )
@@ -166,6 +170,12 @@ TRAINING_TOPOLOGIES: dict[str, dict[str, Any]] = {
         "global_batch_size": 4096,
     },
     B200_8GPU_DDP_TOPOLOGY: {
+        "world_size": 8,
+        "local_batch_size": 512,
+        "grad_accum_steps": 1,
+        "global_batch_size": 4096,
+    },
+    H100_8GPU_DDP_TOPOLOGY: {
         "world_size": 8,
         "local_batch_size": 512,
         "grad_accum_steps": 1,
@@ -3289,6 +3299,26 @@ def bind_training_topology(
         if gpu != 0:
             raise ExecutorError("8-GPU B200 DDP topology must own physical GPUs 0-7")
         gpus = B200_8GPU_DDP_GPUS
+    elif topology == H100_8GPU_DDP_TOPOLOGY:
+        if gpu != 0:
+            raise ExecutorError("8-GPU H100 DDP topology must own physical GPUs 0-7")
+        independent_parent = verified.get("independent_parent_authority")
+        lineage_parent = verified.get("learner_lineage_parent")
+        if (
+            not isinstance(independent_parent, dict)
+            or independent_parent.get("schema_version")
+            != DIRECT_INDEPENDENT_PARENT_AUTHORITY_SCHEMA
+            or not isinstance(lineage_parent, dict)
+            or lineage_parent.get("initializer_kind") != "exact_checkpoint"
+            or not isinstance(verified.get("learner_ablation"), dict)
+            or verified["learner_ablation"].get("diagnostic_only") is not True
+            or verified["learner_ablation"].get("promotion_eligible") is not False
+        ):
+            raise ExecutorError(
+                "h100-8gpu-ddp is restricted to an authenticated independent-"
+                "parent diagnostic ablation"
+            )
+        gpus = H100_8GPU_DDP_GPUS
     else:
         gpus = (gpu,)
     bound = dict(verified.get("bound_recipe", verified["recipe"]))
@@ -3404,6 +3434,7 @@ def _verify_ddp_canary_receipt(
     *,
     reference_time_ns: int,
     completed_repository_root: Path | None = None,
+    expected_topology: str = B200_8GPU_DDP_TOPOLOGY,
 ) -> dict[str, Any]:
     """Verify one host-local canary at an explicit trusted point in time.
 
@@ -3414,6 +3445,24 @@ def _verify_ddp_canary_receipt(
     a stale canary to acquire a new dose claim.
     """
 
+    canary_contracts = {
+        B200_8GPU_DDP_TOPOLOGY: {
+            "schema_version": ddp_canary.B200_SCHEMA,
+            "model_token": "B200",
+            "runtime_schema_version": "a1-b200-learner-runtime-identity-v1",
+        },
+        H100_8GPU_DDP_TOPOLOGY: {
+            "schema_version": ddp_canary.H100_SCHEMA,
+            "model_token": "H100",
+            "runtime_schema_version": "a1-h100-learner-runtime-identity-v1",
+        },
+    }
+    expected_contract = canary_contracts.get(expected_topology)
+    if expected_contract is None:
+        raise ExecutorError(
+            f"8-GPU canary cannot authorize topology {expected_topology!r}"
+        )
+    expected_model = str(expected_contract["model_token"])
     try:
         path = receipt_path.expanduser().resolve(strict=True)
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -3429,7 +3478,11 @@ def _verify_ddp_canary_receipt(
     created_unix_ns = payload.get("created_unix_ns")
     now_ns = reference_time_ns
     if (
-        payload.get("schema_version") != ddp_canary.SCHEMA
+        payload.get("schema_version") != expected_contract["schema_version"]
+        or (
+            expected_topology == H100_8GPU_DDP_TOPOLOGY
+            and payload.get("training_topology") != H100_8GPU_DDP_TOPOLOGY
+        )
         or payload.get("passed") is not True
         or payload.get("diagnostic_only") is not True
         or payload.get("promotion_eligible") is not False
@@ -3490,7 +3543,10 @@ def _verify_ddp_canary_receipt(
         != payload.get("local_draws_per_rank", -1) * 8
         or not isinstance(payload.get("gpu_names"), list)
         or len(payload["gpu_names"]) != 8
-        or any("B200" not in str(name).upper() for name in payload["gpu_names"])
+        or any(
+            expected_model not in str(name).upper()
+            for name in payload["gpu_names"]
+        )
         or not isinstance(payload.get("gpu_identities"), list)
         or len(payload["gpu_identities"]) != 8
         or any(not isinstance(record, dict) for record in payload["gpu_identities"])
@@ -3501,7 +3557,9 @@ def _verify_ddp_canary_receipt(
         or [record.get("name") for record in payload["gpu_identities"]]
         != payload["gpu_names"]
     ):
-        raise ExecutorError("8-GPU canary did not prove the exact B200 DDP topology")
+        raise ExecutorError(
+            f"8-GPU canary did not prove the exact {expected_model} DDP topology"
+        )
     expected_root = (
         None
         if completed_repository_root is None
@@ -3536,7 +3594,7 @@ def _verify_ddp_canary_receipt(
     if (
         not isinstance(runtime_identity, dict)
         or runtime_identity.get("schema_version")
-        != "a1-b200-learner-runtime-identity-v1"
+        != expected_contract["runtime_schema_version"]
         or not isinstance(python_identity, dict)
         or not isinstance(python_identity.get("implementation"), str)
         or not python_identity.get("implementation")
@@ -3649,13 +3707,21 @@ def bind_ddp_canary(
     """Bind a fresh canary for a new launch using wall-clock freshness only."""
 
     topology = verified.get("training_topology", {})
-    if topology.get("name") != B200_8GPU_DDP_TOPOLOGY:
+    topology_name = topology.get("name")
+    if topology_name not in {
+        B200_8GPU_DDP_TOPOLOGY,
+        H100_8GPU_DDP_TOPOLOGY,
+    }:
         if receipt_path is not None:
             raise ExecutorError("DDP canary receipt is valid only for 8-GPU topology")
         return verified
     if receipt_path is None:
-        raise ExecutorError("8-GPU production topology requires --ddp-canary-receipt")
-    canary = _verify_ddp_canary_receipt(receipt_path, reference_time_ns=time.time_ns())
+        raise ExecutorError("8-GPU topology requires --ddp-canary-receipt")
+    canary = _verify_ddp_canary_receipt(
+        receipt_path,
+        reference_time_ns=time.time_ns(),
+        expected_topology=str(topology_name),
+    )
     if (
         canary["semantic_identity"]["local_batch_size"]
         != topology.get("local_batch_size")
@@ -7964,13 +8030,14 @@ def _active_mps_processes(proc_root: Path = Path("/proc")) -> list[str]:
     return sorted(found)
 
 
-def _probe_b200(
+def _probe_exact_accelerator(
     gpu: int,
     *,
+    model_token: str,
     runner: Callable[..., subprocess.CompletedProcess[Any]] = subprocess.run,
     mps_probe: Callable[[], list[str]] = _active_mps_processes,
 ) -> str:
-    """Fail closed unless ``gpu`` is one idle, directly-owned B200."""
+    """Fail closed unless ``gpu`` is one idle, directly-owned exact model."""
 
     try:
         result = runner(
@@ -7987,7 +8054,7 @@ def _probe_b200(
         )
     except (OSError, subprocess.CalledProcessError) as error:
         raise ExecutorError(
-            f"cannot verify selected B200 GPU {gpu}: {error}"
+            f"cannot verify selected {model_token} GPU {gpu}: {error}"
         ) from error
     rows = [line.strip() for line in result.stdout.splitlines() if line.strip()]
     if len(rows) != 1:
@@ -7998,23 +8065,28 @@ def _probe_b200(
     if len(fields) != 3:
         raise ExecutorError(f"selected GPU {gpu} query is malformed: {rows[0]!r}")
     name, compute_mode_raw, memory_used_raw = fields
-    if "B200" not in name.upper():
-        raise ExecutorError(f"selected GPU {gpu} is not exactly one B200: {name!r}")
+    if model_token not in name.upper():
+        raise ExecutorError(
+            f"selected GPU {gpu} is not exactly one {model_token}: {name!r}"
+        )
     compute_mode = compute_mode_raw.upper().replace("-", "_").replace(" ", "_")
     if compute_mode not in ACCEPTABLE_COMPUTE_MODES:
         raise ExecutorError(
-            f"selected B200 GPU {gpu} has unsafe compute mode {compute_mode_raw!r}; "
+            f"selected {model_token} GPU {gpu} has unsafe compute mode "
+            f"{compute_mode_raw!r}; "
             f"expected Default or Exclusive Process"
         )
     try:
         memory_used_mib = int(memory_used_raw)
     except ValueError as error:
         raise ExecutorError(
-            f"selected B200 GPU {gpu} has unparseable memory usage {memory_used_raw!r}"
+            f"selected {model_token} GPU {gpu} has unparseable memory usage "
+            f"{memory_used_raw!r}"
         ) from error
     if memory_used_mib < 0 or memory_used_mib > MAX_IDLE_GPU_MEMORY_MIB:
         raise ExecutorError(
-            f"selected B200 GPU {gpu} is not idle: memory.used={memory_used_mib} MiB "
+            f"selected {model_token} GPU {gpu} is not idle: "
+            f"memory.used={memory_used_mib} MiB "
             f"(maximum idle allowance {MAX_IDLE_GPU_MEMORY_MIB} MiB)"
         )
 
@@ -8034,21 +8106,48 @@ def _probe_b200(
         mps_processes = mps_probe()
     except (OSError, subprocess.CalledProcessError) as error:
         raise ExecutorError(
-            f"cannot prove selected B200 GPU {gpu} is idle: {error}"
+            f"cannot prove selected {model_token} GPU {gpu} is idle: {error}"
         ) from error
     compute_processes = [
         line.strip() for line in processes.stdout.splitlines() if line.strip()
     ]
     if compute_processes:
         raise ExecutorError(
-            f"selected B200 GPU {gpu} has active compute process(es): {compute_processes}"
+            f"selected {model_token} GPU {gpu} has active compute process(es): "
+            f"{compute_processes}"
         )
     if mps_processes:
         raise ExecutorError(
-            "CUDA MPS is active; the sealed one-B200 learner requires direct exclusive "
+            "CUDA MPS is active; the sealed learner requires direct exclusive "
             f"ownership: {mps_processes}"
         )
     return name
+
+
+def _probe_b200(
+    gpu: int,
+    *,
+    runner: Callable[..., subprocess.CompletedProcess[Any]] = subprocess.run,
+    mps_probe: Callable[[], list[str]] = _active_mps_processes,
+) -> str:
+    """Fail closed unless ``gpu`` is one idle, directly-owned B200."""
+
+    return _probe_exact_accelerator(
+        gpu, model_token="B200", runner=runner, mps_probe=mps_probe
+    )
+
+
+def _probe_h100(
+    gpu: int,
+    *,
+    runner: Callable[..., subprocess.CompletedProcess[Any]] = subprocess.run,
+    mps_probe: Callable[[], list[str]] = _active_mps_processes,
+) -> str:
+    """Fail closed unless ``gpu`` is one idle, directly-owned H100."""
+
+    return _probe_exact_accelerator(
+        gpu, model_token="H100", runner=runner, mps_probe=mps_probe
+    )
 
 
 def _raise_nofile_limit() -> None:
@@ -11982,6 +12081,7 @@ def _replay_completed_ablation_receipt_authority(
         Path(canary_path),
         reference_time_ns=authenticated_started_unix_ns,
         completed_repository_root=historical_root,
+        expected_topology=str(topology["name"]),
     )
     reconstructed = _bind_verified_ddp_canary(reconstructed, canary)
 
@@ -13342,9 +13442,17 @@ def execute(
     receipt: Path,
     gpu: int,
     runner: Callable[..., subprocess.CompletedProcess[Any]] = subprocess.run,
-    probe: Callable[[int], str] = _probe_b200,
+    probe: Callable[[int], str] | None = None,
 ) -> dict[str, Any]:
     """Execute one dose while owning every physical GPU in its topology."""
+
+    topology_name = verified.get("training_topology", {}).get("name")
+    if probe is None:
+        probe = (
+            _probe_h100
+            if topology_name == H100_8GPU_DDP_TOPOLOGY
+            else _probe_b200
+        )
 
     recovered = _recover_terminal_complete_receipt(
         verified=verified,
@@ -13466,7 +13574,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--gpu",
         type=int,
         default=0,
-        help="physical B200 index (8-GPU topology requires 0 and owns GPUs 0-7)",
+        help="physical GPU index (an 8-GPU topology requires 0 and owns GPUs 0-7)",
     )
     parser.add_argument(
         "--topology",
@@ -13478,7 +13586,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--ddp-canary-receipt",
         type=Path,
         default=None,
-        help="required same-host NCCL/sampler canary receipt for 8-GPU DDP",
+        help=(
+            "required same-host exact-accelerator NCCL/sampler canary receipt "
+            "for 8-GPU DDP"
+        ),
     )
     parser.add_argument(
         "--ablation-id",

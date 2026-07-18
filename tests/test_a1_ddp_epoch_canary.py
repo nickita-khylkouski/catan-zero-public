@@ -1,8 +1,29 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from tools import a1_ddp_epoch_canary as canary
+
+
+def test_h100_canary_has_a_distinct_explicit_authority() -> None:
+    parser = canary.build_parser()
+    args = parser.parse_args(
+        ["--out", "/tmp/canary.json", "--accelerator", "h100"]
+    )
+
+    assert args.accelerator == "h100"
+    assert canary.H100_SCHEMA != canary.B200_SCHEMA
+    assert canary.ACCELERATOR_CONTRACTS["h100"] == {
+        "model_token": "H100",
+        "schema_version": canary.H100_SCHEMA,
+        "runtime_schema_version": "a1-h100-learner-runtime-identity-v1",
+        "topology": "h100-8gpu-ddp",
+    }
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            ["--out", "/tmp/canary.json", "--accelerator", "generic-gpu"]
+        )
 
 
 def test_rank_slices_reconstruct_one_shared_weighted_global_draw() -> None:

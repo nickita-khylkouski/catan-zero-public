@@ -1314,18 +1314,27 @@ def test_b200_8gpu_topology_requires_same_host_canary_receipt(
         executor.bind_ddp_canary(bound, None)
 
 
-def _ddp_canary_payload(*, created_unix_ns: int) -> dict:
+def _ddp_canary_payload(
+    *,
+    created_unix_ns: int,
+    model: str = "B200",
+    topology: str = executor.B200_8GPU_DDP_TOPOLOGY,
+) -> dict:
     identities = [
         {
             "physical_index": rank,
             "uuid": f"GPU-{rank:02d}",
             "pci_bus_id": f"00000000:{rank:02x}:00.0",
-            "name": "NVIDIA B200",
+            "name": f"NVIDIA {model}",
         }
         for rank in range(8)
     ]
     payload = {
-        "schema_version": executor.ddp_canary.SCHEMA,
+        "schema_version": (
+            executor.ddp_canary.H100_SCHEMA
+            if model == "H100"
+            else executor.ddp_canary.B200_SCHEMA
+        ),
         "passed": True,
         "diagnostic_only": True,
         "promotion_eligible": False,
@@ -1355,10 +1364,14 @@ def _ddp_canary_payload(*, created_unix_ns: int) -> dict:
         },
         "padded_global_draws": 12_288,
         "local_draws_per_rank": 1_536,
-        "gpu_names": ["NVIDIA B200"] * 8,
+        "gpu_names": [f"NVIDIA {model}"] * 8,
         "gpu_identities": identities,
         "runtime_identity": {
-            "schema_version": "a1-b200-learner-runtime-identity-v1",
+            "schema_version": (
+                "a1-h100-learner-runtime-identity-v1"
+                if model == "H100"
+                else "a1-b200-learner-runtime-identity-v1"
+            ),
             "python": {
                 "implementation": "CPython",
                 "version": f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
@@ -1385,6 +1398,8 @@ def _ddp_canary_payload(*, created_unix_ns: int) -> dict:
             "sha256": executor._file_sha256(Path(executor.train_bc.__file__).resolve()),
         },
     }
+    if model == "H100":
+        payload["training_topology"] = topology
     payload["receipt_sha256"] = executor._value_sha256(payload)
     return payload
 
@@ -1407,6 +1422,71 @@ def test_b200_8gpu_topology_accepts_exact_local_canary_receipt(
     assert result["ddp_canary"]["global_draw_sha256"] == payload[
         "global_draw_sha256"
     ]
+
+
+def test_h100_8gpu_topology_is_diagnostic_direct_parent_only(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(
+        executor.ExecutorError,
+        match="authenticated independent-parent diagnostic ablation",
+    ):
+        executor.bind_training_topology(
+            _verified(tmp_path),
+            topology=executor.H100_8GPU_DDP_TOPOLOGY,
+            gpu=0,
+        )
+
+
+def test_h100_8gpu_topology_preserves_dose_and_accepts_only_h100_canary(
+    tmp_path: Path,
+) -> None:
+    verified = _production_trainer_verified(tmp_path)
+    verified["independent_parent_authority"] = {
+        "schema_version": executor.DIRECT_INDEPENDENT_PARENT_AUTHORITY_SCHEMA,
+        "authority_sha256": _SHA,
+    }
+    verified["learner_lineage_parent"] = {
+        "initializer_kind": "exact_checkpoint",
+    }
+    verified["learner_ablation"] = {
+        "diagnostic_only": True,
+        "promotion_eligible": False,
+        "bound_recipe": dict(verified["recipe"]),
+    }
+    bound = executor.bind_training_topology(
+        verified,
+        topology=executor.H100_8GPU_DDP_TOPOLOGY,
+        gpu=0,
+    )
+    assert bound["training_topology"] == {
+        "schema_version": "a1-one-dose-training-topology-v1",
+        "name": executor.H100_8GPU_DDP_TOPOLOGY,
+        "world_size": 8,
+        "physical_gpus": list(range(8)),
+        "local_batch_size": 512,
+        "grad_accum_steps": 1,
+        "global_batch_size": 4096,
+        "dose_preserving": True,
+    }
+    assert executor._effective_global_batch_size(bound["recipe"]) == 4096
+    assert executor._expected_optimizer_steps(bound) == 2
+
+    h100_payload = _ddp_canary_payload(
+        created_unix_ns=executor.time.time_ns(),
+        model="H100",
+        topology=executor.H100_8GPU_DDP_TOPOLOGY,
+    )
+    h100_receipt = tmp_path / "h100-ddp-canary.json"
+    h100_receipt.write_text(json.dumps(h100_payload), encoding="utf-8")
+    admitted = executor.bind_ddp_canary(bound, h100_receipt)
+    assert admitted["ddp_canary"]["receipt_sha256"] == h100_payload["receipt_sha256"]
+
+    b200_payload = _ddp_canary_payload(created_unix_ns=executor.time.time_ns())
+    b200_receipt = tmp_path / "b200-ddp-canary.json"
+    b200_receipt.write_text(json.dumps(b200_payload), encoding="utf-8")
+    with pytest.raises(executor.ExecutorError, match="exact H100 DDP topology"):
+        executor.bind_ddp_canary(bound, b200_receipt)
 
 
 def test_b200_8gpu_topology_rejects_stale_canary_receipt(
@@ -4092,6 +4172,23 @@ def test_b200_preflight_accepts_idle_default_or_exclusive_process() -> None:
         )
         == "NVIDIA B200"
     )
+
+
+def test_h100_preflight_accepts_idle_h100_and_rejects_b200() -> None:
+    assert (
+        executor._probe_h100(
+            0,
+            runner=_gpu_query_runner(identity="NVIDIA H100 80GB HBM3, Default, 0\n"),
+            mps_probe=lambda: [],
+        )
+        == "NVIDIA H100 80GB HBM3"
+    )
+    with pytest.raises(executor.ExecutorError, match="not exactly one H100"):
+        executor._probe_h100(
+            0,
+            runner=_gpu_query_runner(identity="NVIDIA B200, Default, 0\n"),
+            mps_probe=lambda: [],
+        )
 
 
 @pytest.mark.parametrize(
