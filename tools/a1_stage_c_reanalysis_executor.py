@@ -1095,7 +1095,10 @@ def _merge_qualification_partitions(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def _verify_receipt(
-    path: Path, *, require_current_runtime: bool = False
+    path: Path,
+    *,
+    require_current_runtime: bool = False,
+    verified_plan: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     receipt_path, receipt = alignment._load_json(  # noqa: SLF001
         path, where="Stage-C reconstruction receipt"
@@ -1109,10 +1112,14 @@ def _verify_receipt(
     plan_ref = receipt.get("stage_c_plan")
     if not isinstance(plan_ref, Mapping):
         raise ExecutorError("Stage-C reconstruction receipt lost its plan")
-    plan = alignment._verify_plan(Path(str(plan_ref["path"])))  # noqa: SLF001
+    plan = (
+        alignment._verify_plan(Path(str(plan_ref["path"])))  # noqa: SLF001
+        if verified_plan is None
+        else verified_plan
+    )
     if (
-        plan_ref.get("file_sha256")
-        != alignment._file_sha256(Path(str(plan_ref["path"])))  # noqa: SLF001
+        plan_ref.get("path") != plan.get("path")
+        or plan_ref.get("file_sha256") != plan.get("file_sha256")
         or plan_ref.get("plan_sha256") != plan["plan_sha256"]
         or receipt.get("source_game_trace_qualification")
         != plan.get("source_game_trace_qualification")
@@ -2278,7 +2285,9 @@ def _verify_execution_partition(
         raise ExecutorError("Stage-C execution partition row count drifted")
 
 
-def _verify_execution_receipt(path: Path) -> dict[str, Any]:
+def _verify_execution_receipt(
+    path: Path, *, shared_authority: Mapping[str, Any] | None = None
+) -> dict[str, Any]:
     receipt_path, receipt = alignment._load_json(  # noqa: SLF001
         path, where="Stage-C execution receipt"
     )
@@ -2294,16 +2303,29 @@ def _verify_execution_receipt(path: Path) -> dict[str, Any]:
         raise ExecutorError("Stage-C execution receipt digest drifted")
     qualification_ref = receipt["qualification_receipt"]
     qualification_path = Path(str(qualification_ref["path"]))
-    qualification = _verify_receipt(qualification_path)
-    if (
-        qualification_ref.get("file_sha256")
-        != alignment._file_sha256(qualification_path)  # noqa: SLF001
-        or qualification_ref.get("receipt_sha256") != qualification["receipt_sha256"]
-    ):
-        raise ExecutorError("Stage-C qualification binding drifted")
-    plan = alignment._verify_plan(  # noqa: SLF001
-        Path(str(receipt["stage_c_plan"]["path"]))
-    )
+    if shared_authority is None:
+        plan = alignment._verify_plan(  # noqa: SLF001
+            Path(str(receipt["stage_c_plan"]["path"]))
+        )
+        qualification = _verify_receipt(
+            qualification_path, verified_plan=plan
+        )
+        if (
+            qualification_ref.get("file_sha256")
+            != alignment._file_sha256(qualification_path)  # noqa: SLF001
+            or qualification_ref.get("receipt_sha256")
+            != qualification["receipt_sha256"]
+        ):
+            raise ExecutorError("Stage-C qualification binding drifted")
+    else:
+        if (
+            receipt.get("stage_c_plan") != shared_authority.get("stage_c_plan")
+            or qualification_ref
+            != shared_authority.get("qualification_receipt")
+        ):
+            raise ExecutorError("Stage-C execution shared authority drifted")
+        plan = shared_authority["plan"]
+        qualification = shared_authority["qualification"]
     target = plan["target_policy_target_identity"]
     if (
         receipt.get("target_policy_target_identity_sha256") != target["identity_sha256"]
@@ -2311,7 +2333,7 @@ def _verify_execution_receipt(path: Path) -> dict[str, Any]:
         or receipt.get("target_operator_contract") != target["authority"]["contract"]
     ):
         raise ExecutorError("Stage-C execution target identity drifted")
-    if (
+    if shared_authority is None and (
         alignment._file_sha256(_target_checkpoint(plan))
         != target[  # noqa: SLF001
             "producer_checkpoint"
@@ -2799,10 +2821,20 @@ def _verify_merge_receipt(path: Path) -> dict[str, Any]:
         or stated != _value_sha256(unsigned)
     ):
         raise ExecutorError("Stage-C merge receipt digest drifted")
-    executions = [
-        _verify_execution_receipt(Path(str(reference["path"])))
-        for reference in receipt["execution_receipts"]
-    ]
+    execution_refs = receipt["execution_receipts"]
+    if not execution_refs:
+        raise ExecutorError("Stage-C merge contains no execution receipts")
+    first_execution = _verify_execution_receipt(
+        Path(str(execution_refs[0]["path"]))
+    )
+    executions = [first_execution]
+    executions.extend(
+        _verify_execution_receipt(
+            Path(str(reference["path"])),
+            shared_authority=first_execution,
+        )
+        for reference in execution_refs[1:]
+    )
     for reference, execution in zip(
         receipt["execution_receipts"], executions, strict=True
     ):
@@ -2826,9 +2858,20 @@ def _verify_merge_receipt(path: Path) -> dict[str, Any]:
         receipt["reliability"] = _neutral_reliability_receipt(
             int(receipt["counts"]["rows"])
         )
-    if not executions:
-        raise ExecutorError("Stage-C merge contains no execution receipts")
     first = executions[0]
+    replayed_plan = alignment._verify_plan(  # noqa: SLF001
+        Path(str(first["stage_c_plan"]["path"]))
+    )
+    if replayed_plan != first["plan"]:
+        raise ExecutorError("Stage-C shared plan changed during merge verification")
+    replayed_qualification = _verify_receipt(
+        Path(str(first["qualification_receipt"]["path"])),
+        verified_plan=replayed_plan,
+    )
+    if replayed_qualification != first["qualification"]:
+        raise ExecutorError(
+            "Stage-C shared qualification changed during merge verification"
+        )
     partitions = int(first["partition"]["partitions"])
     expected_partitioning = _execution_partitioning_identity(first)
     stated_partitioning = receipt.get("execution_partitioning")
