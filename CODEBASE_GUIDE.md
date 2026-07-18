@@ -281,6 +281,119 @@ tools/loop.py + one sealed turn config
 - `tests/test_production_loop.py`
 - `tests/test_evaluator_shared_payload.py`
 
+### Exact Model Input and Readout
+
+The canonical inference surface is the native Rust entity featurizer, not the
+legacy flat Python observation. One position is represented as:
+
+| Surface | Shape | Strategic content |
+|---|---:|---|
+| Hex tokens | `19 × 13` | coordinates, terrain, number/pips, robber |
+| Vertex tokens | `54 × 24` | owner/building, production, ports, robber adjacency |
+| Edge tokens | `72 × 8` | ownership and local incidence |
+| Player tokens | `4 × 31` | public score/pieces/awards/road length plus actor-private cards |
+| Global token | `1 × 43` | prompt/rule state, bank, dev deck, actor identities |
+| History tokens | `64 × 41` | bounded meaningful public strategic events |
+| Legal actions | `A × 50` | action type, arguments, targets, resource payload |
+| Dynamic action context | `A × 18` | production, ports, road expansion, victim/discard/trade facts |
+| Static action residual | `A × 22` | catalog identity and typed resource/target information |
+| Public deduction | `4 × 11` | opponent resource deduction and dev-card posterior |
+| Target/topology IDs | variable | action-to-entity targets and board incidence |
+
+The actor sees its exact resources, development-card identities and
+playability, dev-card-used-this-turn, Road Building/free-road state, and
+discard remainder. Opponent secret identities remain masked. In the current
+two-player game, opponent resources are exactly derivable from bank
+conservation and the actor's hand; opponent development cards are represented
+by a deck-conservation posterior rather than secret truth.
+
+The model encodes typed board/player/global tokens at width 640, applies one
+topology residual and a six-layer Transformer, then gives every legal action
+its addressed entity, static/dynamic context, and one cross-attention pass over
+state and ordered public history. Policy produces masked legal-action logits.
+Value is not absent: it has a private Transformer suffix, legal-action
+affordance summaries, a scalar win readout, and a final-VP auxiliary.
+
+**Remaining representation ceilings:**
+
+1. Scratch and migrated-parent routes do not yet use the exact-resource signal
+   identically.
+2. One topology message-passing step weakly represents long road components,
+   forks, blocks, and multi-hop extension threats.
+3. Opponent dev-card belief is conservation-based, not conditioned on observed
+   opponent choices or card age.
+4. The commissioned teacher uses adapter V2 while the learner uses V6, so new
+   learner information cannot improve the search policy that produced its
+   target.
+5. The value readout predicts a scalar mean without calibrated epistemic or
+   return uncertainty.
+
+**Trace this path in:**
+
+- `src/catan_zero/search/neural_rust_mcts.py`
+- `src/catan_zero/rl/entity_token_features_rust.py`
+- `src/catan_zero/rl/entity_token_features.py`
+- `src/catan_zero/rl/meaningful_history.py`
+- `src/catan_zero/rl/action_features.py`
+- `src/catan_zero/rl/entity_token_policy.py`
+- `src/catan_zero/rl/relational_trunks.py`
+
+### Training Readiness
+
+There are two distinct readiness states:
+
+- **Parent update:** commissioned and empirically useful. It reloads exact
+  parent bytes with fresh Adam, uses a bounded short dose, and independently
+  controls mature trunk/action learning rates.
+- **Fresh scratch:** not commissioned. It still needs a selected
+  LR/warmup/horizon, a representation contract matching the intended native
+  V8 input surface, and an authenticated coherent-public n128 corpus.
+
+Do not interpret optimizer steps as a stable dose after changing the active
+sampler. Report base rows, policy-active rows, objective-weighted mass,
+parent-policy KL, layerwise update RMS, and unique-game coverage separately.
+Every arm must independently reload its declared initializer; candidate
+chaining confounds both dose and baseline.
+
+The present short-dose evidence favors protecting mature action-local modules:
+reducing the shared action encoder and fresh action-local adapter learning
+rates improved held-out policy closure while leaving the value path at its
+measured rate. Reducing value-head LR alone was dominated and should not be
+silently folded into the production recipe.
+
+### Counterfactual and Reanalysis Path
+
+The repository already contains the safe first version of "what if another
+move were chosen" supervision. A coherent search at one authenticated public
+root returns a legal-aligned prior, visit policy, raw Q, completed Q, selected
+action, and reliability evidence for every legal action. Therefore:
+
+```text
+regret(a) = max(completed_Q) - completed_Q(a)
+```
+
+provides action-level counterfactual supervision without mutating the
+authoritative game or launching a separate rollout for every move.
+
+The vertical path is:
+
+1. select unique, multi-action roots stratified by phase, width, surprise, and
+   reliability;
+2. reconstruct meaningful public history;
+3. rerun the exact coherent-public teacher with bound operator identity;
+4. materialize a sparse overlay over the immutable corpus;
+5. train only from authenticated targets whose checkpoint, operator, belief,
+   chance, symmetry, and search-budget contracts match.
+
+`tools/a1_stage_c_teacher_alignment.py`,
+`tools/a1_stage_c_reanalysis_executor.py`, and
+`tools/a1_stage_c_learner_overlay.py` own this route. Historical
+`target_scores` are raw visited-action Q and must not be relabeled as completed
+Q. Completed-Q values and masks need their own legal-aligned materialization
+and opt-in objective; `afterstate_target` is also evidence until a learner
+explicitly consumes it. Keep the existing Q loss off rather than feeding it
+ambiguous semantics.
+
 ---
 
 *End of Guide*
