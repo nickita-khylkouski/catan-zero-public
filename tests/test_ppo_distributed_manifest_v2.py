@@ -4,6 +4,8 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 import json
 from pathlib import Path
+from threading import Barrier
+import time
 
 import pytest
 
@@ -53,6 +55,26 @@ def test_v2_binding_refuses_template_and_historical_v1_root(tmp_path: Path) -> N
         dist.bind_run_manifest(legacy_root, _bound_manifest())
 
 
+def test_historical_v1_binding_refuses_existing_v2_root(tmp_path: Path) -> None:
+    root = tmp_path / "v2"
+    dist.bind_run_manifest(root, _bound_manifest())
+    checkpoint = tmp_path / "parent.pt"
+    checkpoint.write_bytes(b"parent")
+
+    with pytest.raises(RuntimeError, match="v2 manifest root"):
+        dist.bind_run_contract(
+            root,
+            init_checkpoint=checkpoint,
+            architecture="entity_graph",
+            gamma=1.0,
+            gae_lambda=0.95,
+            behavior_temperature=1.0,
+        )
+
+    assert dist.run_manifest_path(root).is_file()
+    assert not dist.run_contract_path(root).exists()
+
+
 def test_v2_binding_is_exact_and_idempotent(tmp_path: Path) -> None:
     manifest = _bound_manifest()
     root = tmp_path / "run"
@@ -82,6 +104,86 @@ def test_v2_binding_concurrent_same_manifest_converges(tmp_path: Path) -> None:
 
     assert results == [results[0]] * len(results)
     assert results[0]["manifest_sha256"] == manifest.sha256()
+
+
+def test_concurrent_weight_publishers_receive_distinct_intact_versions(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "run"
+    publishers = 8
+    start = Barrier(publishers)
+
+    def publish(index: int) -> dist.PublishedVersion:
+        payload = f"publisher-{index}".encode()
+        start.wait()
+
+        def save(path: str) -> None:
+            Path(path).write_bytes(payload)
+            # Keep the transaction open long enough for every competing caller
+            # to reach publication; without shared serialization they all pick
+            # the same next version and temporary pathname.
+            time.sleep(0.01)
+
+        published = dist.publish_weights(root, save, step=index)
+        assert Path(published.path).read_bytes() == payload
+        return published
+
+    with ThreadPoolExecutor(max_workers=publishers) as executor:
+        results = list(executor.map(publish, range(publishers)))
+
+    assert sorted(result.version for result in results) == list(
+        range(1, publishers + 1)
+    )
+    latest = dist.read_version(root)
+    assert latest is not None
+    assert latest.version == publishers
+    assert Path(latest.path).is_file()
+
+
+def test_learner_cold_start_reuses_actor_bootstrap_version_and_first_dose(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "run"
+    actor_weights, actor_published = dist.publish_initial_weights(
+        root, lambda path: Path(path).write_bytes(b"initializer")
+    )
+    shard = dist.write_trajectory_shard(
+        root,
+        "actor",
+        0,
+        [{"first_dose": True}],
+        policy_version=actor_weights.version,
+    )
+
+    learner_weights, learner_published = dist.publish_initial_weights(
+        root,
+        lambda _path: pytest.fail("learner must not republish actor bootstrap"),
+    )
+
+    assert actor_published is True
+    assert learner_published is False
+    assert learner_weights == actor_weights
+    assert list(
+        dist.iter_unconsumed_shards(
+            root,
+            min_policy_version=learner_weights.version,
+            max_policy_version=learner_weights.version,
+        )
+    ) == [shard]
+
+
+def test_learner_cold_start_refuses_unrecoverable_advanced_publication(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "run"
+    dist.publish_weights(
+        root, lambda path: Path(path).write_bytes(b"learned"), step=4
+    )
+
+    with pytest.raises(RuntimeError, match="without a recoverable learner checkpoint"):
+        dist.publish_initial_weights(
+            root, lambda path: Path(path).write_bytes(b"initializer")
+        )
 
 
 def test_v2_binding_rejects_manifest_mismatch(tmp_path: Path) -> None:
@@ -211,6 +313,40 @@ def test_consumption_receipt_survives_queue_and_marker_cleanup(tmp_path: Path) -
     assert not marker.exists()
     assert receipt.exists()
     assert dist.trajectory_is_complete(root, shard)
+
+
+def test_consumed_marker_is_not_pruned_when_payload_deletion_failed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "transient-delete-failure"
+    shard = dist.write_trajectory_shard(
+        root, "worker", 0, [{"trajectory": 1}], policy_version=1
+    )
+    real_remove = dist.os.remove
+    attempts = 0
+
+    def fail_once(path: str | Path) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise OSError("transient storage error")
+        real_remove(path)
+
+    monkeypatch.setattr(dist.os, "remove", fail_once)
+    with pytest.raises(RuntimeError, match="failed to delete consumed PPO shard"):
+        dist.mark_consumed(root, shard)
+
+    marker = dist.consumed_dir(root) / "worker__shard_000000.pkl"
+    assert shard.exists()
+    assert marker.exists()
+    assert dist.prune_consumed_markers(root, older_than_secs=0.0) == 0
+    assert list(dist.iter_unconsumed_shards(root)) == []
+
+    dist.mark_consumed(root, shard)
+    assert not shard.exists()
+    assert dist.prune_consumed_markers(root, older_than_secs=0.0) == 1
+    assert list(dist.iter_unconsumed_shards(root)) == []
 
 
 def test_absolute_shard_finalizes_under_relative_run_root(

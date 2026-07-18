@@ -95,6 +95,9 @@ class LearnerConfig:
     init_checkpoint: str
     architecture: str = CANONICAL_PPO_ARCHITECTURE
     device: str = "auto"
+    # Initial learner RNG. In v2 this is derived from the manifest-bound actor
+    # seed so the first minibatch order/dropout stream is part of run identity.
+    seed: int = 1
 
     # pull / staleness
     shards_per_step: int = 16
@@ -210,6 +213,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     g.add_argument(
         "--device", default="auto", help="auto|cpu|cuda|cuda:N for the learner."
     )
+    g.add_argument("--seed", type=int, default=1)
 
     g = p.add_argument_group("pull / staleness")
     g.add_argument("--shards-per-step", type=int, default=16)
@@ -521,6 +525,7 @@ def _manifest_config_values(manifest: PPORunManifest) -> dict[str, Any]:
         "gamma": actor.gamma,
         "gae_lambda": actor.gae_lambda,
         "behavior_temperature": actor.action_temperature,
+        "seed": actor.seed,
         "shards_per_step": learner.shards_per_step,
         "max_staleness": learner.max_staleness,
         "max_steps": learner.max_steps,
@@ -605,6 +610,7 @@ def resolve_config(
         "init_checkpoint": args.init_checkpoint or "",
         "architecture": args.architecture,
         "device": args.device,
+        "seed": args.seed,
         "shards_per_step": args.shards_per_step,
         "max_staleness": args.max_staleness,
         "poll_secs": args.poll_secs,
@@ -1578,7 +1584,7 @@ def _finalize_consumed_frontier(
             ) from error
         dist.mark_consumed(root, shard)
         marker = dist.consumed_dir(root) / relative_text.replace("/", "__")
-        if shard.exists() and not marker.exists():
+        if shard.exists() or not marker.exists():
             raise RuntimeError(f"failed to finalize consumed PPO shard: {shard}")
 
 
@@ -2015,6 +2021,12 @@ def train(
     resume_ckpt = (
         find_resume_checkpoint(root) if getattr(config, "resume", True) else None
     )
+    if resume_ckpt is None:
+        random.seed(int(config.seed))
+        np.random.seed(int(config.seed))
+        torch.manual_seed(int(config.seed))
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(int(config.seed))
     if resume_ckpt is not None:
         bc_anchor = load_frozen_bc_anchor(
             config.init_checkpoint, architecture=config.architecture, device=device
@@ -2090,13 +2102,23 @@ def train(
     _maybe_commit(volume_commit_fn)
 
     if resume_ckpt is None:
-        # Fresh run: publish the warm-started weights as the first version. FIX H2: commit so
-        # actors see current.pt immediately.
-        published = dist.publish_weights(root, policy.save, step=step)
+        # Actor bootstrap may already have published this exact initializer and
+        # generated version-1 trajectories. Reuse that publication atomically;
+        # republishing the same model as v2 would discard the entire first dose
+        # when exact-version/no-V-trace learning is selected.
+        published, newly_published = dist.publish_initial_weights(root, policy.save)
         current_version = published.version
-        _maybe_commit(volume_commit_fn)
+        if newly_published:
+            _maybe_commit(volume_commit_fn)
         print(
-            {"event": "published", "version": current_version, "step": step}, flush=True
+            {
+                "event": (
+                    "published" if newly_published else "reused_actor_bootstrap"
+                ),
+                "version": current_version,
+                "step": step,
+            },
+            flush=True,
         )
     else:
         # The recovery checkpoint commits this input frontier before publishing or

@@ -27,10 +27,13 @@ returned path with its own loader. Pure stdlib + pickle; no torch/env import at 
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
+import fcntl
 import hashlib
 import json
 import os
 import pickle
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -55,6 +58,31 @@ COMPLETED_DIRNAME = "trajectory_completed"
 CHECKPOINTS_DIRNAME = "checkpoints"
 LEAGUE_DIRNAME = "league"
 EVAL_DIRNAME = "eval"
+WEIGHTS_PUBLISH_LOCK_FILENAME = ".weights-publish.lock"
+
+_PROCESS_RUN_BINDING_LOCK = threading.Lock()
+_PROCESS_WEIGHTS_PUBLISH_LOCK = threading.Lock()
+
+
+@contextmanager
+def _exclusive_file_lock(path: Path, process_lock: threading.Lock):
+    """Serialize a filesystem transaction across threads and processes."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with process_lock:
+        descriptor = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            yield
+        finally:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            os.close(descriptor)
+
+
+def _run_binding_lock_path(root: Path) -> Path:
+    # Keep the coordination file outside the run root so it cannot make an
+    # otherwise pristine v2 root look like it already contains runtime data.
+    return root.parent / f".{root.name}.run-binding.lock"
 
 
 # ----------------------------------------------------------------------------- paths
@@ -133,7 +161,7 @@ def checkpoint_sha256(path: str | os.PathLike) -> str:
     return digest.hexdigest()
 
 
-def bind_run_contract(
+def _bind_run_contract_locked(
     root: str | os.PathLike,
     *,
     init_checkpoint: str | os.PathLike,
@@ -145,6 +173,10 @@ def bind_run_contract(
     """Atomically create or verify the immutable PPO initializer/actor contract."""
     root_path = Path(root)
     root_path.mkdir(parents=True, exist_ok=True)
+    if run_manifest_path(root_path).exists():
+        raise RuntimeError(
+            "refusing to bind historical v1 contract over a v2 manifest root"
+        )
     checkpoint = Path(init_checkpoint).resolve()
     payload = {
         "schema": RUN_CONTRACT_SCHEMA,
@@ -189,6 +221,32 @@ def bind_run_contract(
         except FileNotFoundError:
             pass
     return verify_existing()
+
+
+def bind_run_contract(
+    root: str | os.PathLike,
+    *,
+    init_checkpoint: str | os.PathLike,
+    architecture: str,
+    gamma: float,
+    gae_lambda: float,
+    behavior_temperature: float,
+) -> dict[str, Any]:
+    """Atomically create/verify v1 identity without crossing a v2 run root."""
+
+    root_path = Path(root)
+    root_path.mkdir(parents=True, exist_ok=True)
+    with _exclusive_file_lock(
+        _run_binding_lock_path(root_path), _PROCESS_RUN_BINDING_LOCK
+    ):
+        return _bind_run_contract_locked(
+            root_path,
+            init_checkpoint=init_checkpoint,
+            architecture=architecture,
+            gamma=gamma,
+            gae_lambda=gae_lambda,
+            behavior_temperature=behavior_temperature,
+        )
 
 
 class RunManifestError(RuntimeError):
@@ -245,7 +303,7 @@ def _assert_pristine_v2_root(root: Path) -> None:
         )
 
 
-def bind_run_manifest(
+def _bind_run_manifest_locked(
     root: str | os.PathLike, manifest: PPORunManifest
 ) -> dict[str, Any]:
     """Atomically bind an exact, executable v2 manifest to a new production root.
@@ -316,6 +374,19 @@ def bind_run_manifest(
     return verify_existing()
 
 
+def bind_run_manifest(
+    root: str | os.PathLike, manifest: PPORunManifest
+) -> dict[str, Any]:
+    """Atomically bind v2 identity without racing a legacy v1 binder."""
+
+    root_path = Path(root)
+    root_path.mkdir(parents=True, exist_ok=True)
+    with _exclusive_file_lock(
+        _run_binding_lock_path(root_path), _PROCESS_RUN_BINDING_LOCK
+    ):
+        return _bind_run_manifest_locked(root_path, manifest)
+
+
 # ------------------------------------------------------------------- weight versioning
 @dataclass(frozen=True)
 class PublishedVersion:
@@ -346,7 +417,9 @@ def _gc_versioned_weights(root: str | os.PathLike, *, keep: int = KEEP_VERSIONED
     return removed
 
 
-def publish_weights(root: str | os.PathLike, save_fn: Callable[[str], Any], *, step: int) -> PublishedVersion:
+def _publish_weights_locked(
+    root: str | os.PathLike, save_fn: Callable[[str], Any], *, step: int
+) -> PublishedVersion:
     """Atomically publish new weights so version and bytes can NEVER disagree (FIX H1).
 
     ``save_fn(tmp_path)`` must write a loadable checkpoint. The protocol:
@@ -393,6 +466,48 @@ def publish_weights(root: str | os.PathLike, save_fn: Callable[[str], Any], *, s
 
     _gc_versioned_weights(root)
     return PublishedVersion(version=version, step=int(step), updated_at=meta["updated_at"], path=str(final))
+
+
+def publish_weights(
+    root: str | os.PathLike, save_fn: Callable[[str], Any], *, step: int
+) -> PublishedVersion:
+    """Publish one monotonically versioned checkpoint transaction at a time."""
+
+    pdir = policy_dir(root)
+    pdir.mkdir(parents=True, exist_ok=True)
+    with _exclusive_file_lock(
+        pdir / WEIGHTS_PUBLISH_LOCK_FILENAME,
+        _PROCESS_WEIGHTS_PUBLISH_LOCK,
+    ):
+        return _publish_weights_locked(root, save_fn, step=step)
+
+
+def publish_initial_weights(
+    root: str | os.PathLike, save_fn: Callable[[str], Any]
+) -> tuple[PublishedVersion, bool]:
+    """Publish version 1 only when the run has no existing policy.
+
+    Actor bootstrap and learner cold start can arrive in either order. They
+    must converge on the first publication; incrementing the version for the
+    same initializer makes already-generated version-1 shards immediately
+    stale under exact-version PPO.
+    """
+
+    pdir = policy_dir(root)
+    pdir.mkdir(parents=True, exist_ok=True)
+    with _exclusive_file_lock(
+        pdir / WEIGHTS_PUBLISH_LOCK_FILENAME,
+        _PROCESS_WEIGHTS_PUBLISH_LOCK,
+    ):
+        existing = read_version(root)
+        if existing is not None:
+            if existing.step != 0:
+                raise RuntimeError(
+                    "cold-start PPO learner found published weights beyond step 0 "
+                    "without a recoverable learner checkpoint"
+                )
+            return existing, False
+        return _publish_weights_locked(root, save_fn, step=0), True
 
 
 def read_version(root: str | os.PathLike) -> PublishedVersion | None:
@@ -879,6 +994,17 @@ def prune_consumed_markers(root: str | os.PathLike, *, older_than_secs: float) -
         if not marker.is_file():
             continue
         try:
+            worker_id, separator, shard_name = marker.name.rpartition("__")
+            queued_shard = trajectories_dir(root, worker_id) / shard_name
+            if (
+                separator
+                and worker_id
+                and shard_name.startswith("shard_")
+                and queued_shard.exists()
+            ):
+                # A prior deletion did not complete. Retain the marker so the
+                # queued bytes cannot become eligible for a second update.
+                continue
             if marker.stat().st_mtime < cutoff:
                 marker.unlink()
                 pruned += 1
@@ -902,14 +1028,18 @@ def mark_consumed(root: str | os.PathLike, shard_path: str | os.PathLike) -> Non
     marker.parent.mkdir(parents=True, exist_ok=True)
     try:
         marker.touch()  # record ingestion first
-    except OSError:
-        pass
+    except OSError as error:
+        raise RuntimeError(
+            f"failed to record consumed PPO shard marker: {marker}"
+        ) from error
     try:
         os.remove(shard_path)  # reclaim space; ignore if already gone
     except FileNotFoundError:
         pass
-    except OSError:
-        pass
+    except OSError as error:
+        raise RuntimeError(
+            f"failed to delete consumed PPO shard payload: {shard_path}"
+        ) from error
 
 
 if __name__ == "__main__":  # lightweight self-test (no torch/env needed)

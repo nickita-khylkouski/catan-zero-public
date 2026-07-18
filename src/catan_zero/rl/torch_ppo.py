@@ -1605,6 +1605,15 @@ def ppo_update(
                 else:
                     approx_kl = per_sample_kl.new_tensor(0.0)
                     clip_fraction = per_sample_clipped.new_tensor(0.0)
+            candidate_approx_kl = float(approx_kl.item())
+            if target_kl > 0.0 and candidate_approx_kl > target_kl:
+                # This KL describes the current (pre-step) policy. Once it is
+                # already outside the trust region, applying this minibatch
+                # would knowingly take one additional unconstrained update.
+                last_approx_kl = candidate_approx_kl
+                last_clip_fraction = float(clip_fraction.item())
+                early_stop = True
+                break
             if kl_coef > 0.0:
                 log_policy = nn.functional.log_softmax(masked, dim=-1)
                 per_sample_old_policy_kl = (
@@ -1648,14 +1657,11 @@ def ppo_update(
             last_value_loss = float(value_loss.item())
             last_q_value_loss = float(q_value_loss.item())
             last_entropy = float(entropy.item())
-            last_approx_kl = float(approx_kl.item())
+            last_approx_kl = candidate_approx_kl
             last_old_policy_kl = float(old_policy_kl.item())
             last_ema_policy_kl = float(ema_policy_kl.item())
             last_clip_fraction = float(clip_fraction.item())
             minibatches += 1
-            if target_kl > 0.0 and last_approx_kl > target_kl:
-                early_stop = True
-                break
         if early_stop:
             break
 
@@ -2113,6 +2119,14 @@ def _ppo_update_entity_graph_body(
                 else:
                     approx_kl = per_sample_kl.new_tensor(0.0)
                     clip_fraction = per_sample_clipped.new_tensor(0.0)
+            candidate_approx_kl = float(approx_kl.item())
+            if target_kl > 0.0 and candidate_approx_kl > target_kl:
+                # Refuse the violating minibatch before optimizer.step(); the
+                # old ordering detected the breach and still applied it.
+                last_approx_kl = candidate_approx_kl
+                last_clip_fraction = float(clip_fraction.item())
+                early_stop = True
+                break
             if ema_policy is not None and ema_policy_kl_coef > 0.0:
                 with torch.no_grad():
                     ema_outputs = _entity_graph_outputs(
@@ -2154,13 +2168,10 @@ def _ppo_update_entity_graph_body(
             last_value_loss = float(value_loss.item())
             last_q_value_loss = float(q_value_loss.item())
             last_entropy = float(entropy.item())
-            last_approx_kl = float(approx_kl.item())
+            last_approx_kl = candidate_approx_kl
             last_ema_policy_kl = float(ema_policy_kl.item())
             last_clip_fraction = float(clip_fraction.item())
             minibatches += 1
-            if target_kl > 0.0 and last_approx_kl > target_kl:
-                early_stop = True
-                break
         if early_stop:
             break
 

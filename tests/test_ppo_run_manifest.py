@@ -137,6 +137,14 @@ def test_manifest_rejects_nonfinite_python_float() -> None:
         PPORunManifest.from_dict(value)
 
 
+def test_manifest_rejects_temperature_below_executed_clamp() -> None:
+    value = _payload()
+    value["spec"]["actor"]["action_temperature"] = 1e-7
+
+    with pytest.raises(ManifestError, match=r">= 1e-06"):
+        PPORunManifest.from_dict(value)
+
+
 def test_zero_initializer_is_allowed_only_for_explicit_template() -> None:
     value = _payload()
     value["status"] = "bound"

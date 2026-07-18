@@ -155,7 +155,10 @@ class PPOActorSpec:
             action_temperature=_number(
                 value["action_temperature"],
                 where="spec.actor.action_temperature",
-                minimum=1e-12,
+                # All actor/learner policy math clamps temperatures to 1e-6.
+                # Reject smaller manifest values so distinct hashes cannot
+                # silently execute identical science.
+                minimum=1e-6,
             ),
             value_shaping_coef=_number(
                 value["value_shaping_coef"],
