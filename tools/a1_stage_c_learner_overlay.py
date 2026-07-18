@@ -43,6 +43,7 @@ for root in (REPO_ROOT, REPO_ROOT / "tools"):
         sys.path.insert(0, str(root))
 
 from tools import a1_b200_active_policy_campaign as active_campaign  # noqa: E402
+from tools import a1_post_wave_stage_c_admission as post_wave_admission  # noqa: E402
 from tools import a1_stage_c_reanalysis_executor as stage_c  # noqa: E402
 from tools import a1_stage_c_teacher_alignment as alignment  # noqa: E402
 from tools import train_bc  # noqa: E402
@@ -65,6 +66,12 @@ COMPLETED_Q_VALUE_COLUMN = "completed_q_values"
 COMPLETED_Q_MASK_COLUMN = "completed_q_mask"
 SAMPLING_ARMS = frozenset({"PRODUCTION_WEIGHTED", "STRATEGIC_BALANCED"})
 DEFAULT_PRODUCTION_WEIGHT_CAP = 4.0
+SUPPORTED_BASE_ADMISSION_SCHEMAS = frozenset(
+    {
+        active_campaign.ADMISSION_SCHEMA,
+        post_wave_admission.ADMISSION_SCHEMA,
+    }
+)
 ROOT_BREADTH_REQUIRED_PHASES = alignment.ROOT_BREADTH_REQUIRED_PHASES
 ROOT_BREADTH_DECISION_BINS = alignment.ROOT_BREADTH_DECISION_BINS
 ROOT_BREADTH_CONTRACT = alignment.ROOT_BREADTH_CONTRACT
@@ -419,6 +426,160 @@ def _load_json(path: Path, *, where: str) -> tuple[Path, dict[str, Any]]:
     return resolved, payload
 
 
+def _source_policy_semantics(admission: Mapping[str, Any]) -> dict[str, Any]:
+    """Normalize immutable source-policy authority across admission generations.
+
+    The historical 8,192-game admission authorizes its stored coherent targets.
+    The production post-wave admission deliberately does not: its states and
+    outcomes are reusable, but every learner-visible policy target must come
+    from the Stage-C patch.  Keeping these cases explicit prevents a schema
+    adapter from accidentally reactivating the quarantined historical rows.
+    """
+
+    schema = admission.get("schema_version")
+    corpus = admission.get("corpus")
+    if not isinstance(corpus, Mapping):
+        raise OverlayError("Stage-C base admission has no corpus semantics")
+    if schema == active_campaign.ADMISSION_SCHEMA:
+        policy = admission.get("policy_distillation_contract")
+        if (
+            not isinstance(policy, Mapping)
+            or corpus.get("stored_policy_target_distillation_eligible") is not True
+            or policy.get("coherent_public_n128_only") is not True
+            or policy.get("legacy_pimc_rows_allowed") is not False
+        ):
+            raise OverlayError("legacy Stage-C base policy authority drifted")
+        result = {
+            "source_admission_schema": str(schema),
+            "stored_policy_target_distillation_eligible": True,
+            "stored_policy_targets_are_historical_operator_only": False,
+            "current_teacher_requires_reanalysis": False,
+            "state_reanalysis_eligible": bool(
+                corpus.get("state_reanalysis_eligible")
+            ),
+            "legacy_pimc_rows_allowed": False,
+        }
+    elif schema == post_wave_admission.ADMISSION_SCHEMA:
+        policy = admission.get("policy_target_policy")
+        if (
+            not isinstance(policy, Mapping)
+            or corpus.get("stored_policy_target_distillation_eligible") is not False
+            or corpus.get("state_reanalysis_eligible") is not True
+            or policy.get("stored_targets_are_historical_operator_only") is not True
+            or policy.get("current_teacher_requires_reanalysis") is not True
+            or policy.get("legacy_pimc_rows_allowed") is not False
+        ):
+            raise OverlayError("post-wave Stage-C policy quarantine drifted")
+        result = {
+            "source_admission_schema": str(schema),
+            "stored_policy_target_distillation_eligible": False,
+            "stored_policy_targets_are_historical_operator_only": True,
+            "current_teacher_requires_reanalysis": True,
+            "state_reanalysis_eligible": True,
+            "legacy_pimc_rows_allowed": False,
+        }
+    else:
+        raise OverlayError(f"unsupported Stage-C base admission schema: {schema!r}")
+    result["semantics_sha256"] = _value_sha256(result)
+    return result
+
+
+def _load_base_admission(
+    path: Path,
+) -> tuple[Path, dict[str, Any], dict[str, Any]]:
+    """Dispatch to the schema's original verifier; never relax legacy checks."""
+
+    candidate_path, candidate = _load_json(path, where="Stage-C base admission")
+    schema = candidate.get("schema_version")
+    try:
+        if schema == active_campaign.ADMISSION_SCHEMA:
+            resolved, admission = active_campaign._load_admission(  # noqa: SLF001
+                candidate_path
+            )
+        elif schema == post_wave_admission.ADMISSION_SCHEMA:
+            resolved, admission = post_wave_admission.verify_admission(candidate_path)
+        else:
+            raise OverlayError(
+                f"unsupported Stage-C base admission schema: {schema!r}"
+            )
+    except (
+        active_campaign.CampaignError,
+        post_wave_admission.AdmissionError,
+    ) as error:
+        raise OverlayError(f"Stage-C base admission refused: {error}") from error
+    return resolved, admission, _source_policy_semantics(admission)
+
+
+def _load_plan_source_admission(
+    plan: Mapping[str, Any],
+) -> tuple[Path, dict[str, Any], dict[str, Any]]:
+    """Replay the plan-bound admission and its row-level quarantine decision."""
+
+    reference = plan.get("source_corpus_admission")
+    if not isinstance(reference, Mapping):
+        raise OverlayError("Stage-C plan lost its source admission")
+    path, admission, semantics = _load_base_admission(
+        Path(str(reference.get("path", "")))
+    )
+    if (
+        _file_sha256(path) != reference.get("file_sha256")
+        or admission.get("admission_sha256") != reference.get("admission_sha256")
+    ):
+        raise OverlayError("Stage-C plan source admission bytes drifted")
+
+    overlay_ref = plan.get("eligibility_overlay")
+    if not isinstance(overlay_ref, Mapping):
+        raise OverlayError("Stage-C plan lost its eligibility overlay")
+    overlay_path, eligibility = _load_json(
+        Path(str(overlay_ref.get("path", ""))),
+        where="Stage-C eligibility overlay",
+    )
+    counts = eligibility.get("counts")
+    target_matches = plan.get("target_identity_matches_stored_policy")
+    if (
+        _file_sha256(overlay_path) != overlay_ref.get("file_sha256")
+        or eligibility.get("overlay_sha256") != overlay_ref.get("overlay_sha256")
+        or not isinstance(counts, Mapping)
+        or eligibility.get("policy_quarantine_changes_value_eligibility") is not False
+        or eligibility.get(
+            "policy_quarantine_changes_state_reanalysis_eligibility"
+        )
+        is not False
+        or not isinstance(target_matches, bool)
+    ):
+        raise OverlayError("Stage-C plan policy quarantine evidence drifted")
+    active = int(counts.get("stored_policy_active_rows", -1))
+    eligible = int(counts.get("stored_policy_eligible_rows", -1))
+    quarantined = int(counts.get("stored_policy_quarantined_rows", -1))
+    if (
+        active < 0
+        or eligible < 0
+        or quarantined < 0
+        or eligible + quarantined != active
+        or (target_matches and quarantined != 0)
+        or (not target_matches and (eligible != 0 or quarantined != active))
+    ):
+        raise OverlayError("Stage-C row-level policy quarantine counts drifted")
+    if (
+        semantics["current_teacher_requires_reanalysis"] is True
+        and target_matches is not False
+    ):
+        raise OverlayError(
+            "post-wave admission requires a different reanalysed target operator"
+        )
+    semantics = {
+        **semantics,
+        "target_identity_matches_stored_policy": target_matches,
+        "stored_policy_active_rows": active,
+        "stored_policy_eligible_rows": eligible,
+        "stored_policy_quarantined_rows": quarantined,
+        "derived_overlay_historical_policy_targets_active": False,
+    }
+    semantics.pop("semantics_sha256", None)
+    semantics["semantics_sha256"] = _value_sha256(semantics)
+    return path, admission, semantics
+
+
 def _completed_q_binding(
     *,
     merge: Mapping[str, Any],
@@ -680,6 +841,7 @@ def _export_sampling_population(
     *,
     plan: Mapping[str, Any],
     eligibility: Mapping[str, Any],
+    source_admission: Mapping[str, Any],
     base_root: Path,
     patch: Mapping[str, np.ndarray],
     output: Path,
@@ -736,13 +898,7 @@ def _export_sampling_population(
     phases = np.asarray(data["phase"][candidate_rows]).astype(str)
     legal_widths = legal_widths_all[candidate_rows]
     surprise = alignment._policy_surprise(data, candidate_rows)  # noqa: SLF001
-    source_admission_path = Path(str(plan["source_corpus_admission"]["path"])).resolve(
-        strict=True
-    )
     try:
-        _admission_path, source_admission = active_campaign._load_admission(  # noqa: SLF001
-            source_admission_path
-        )
         validation_ref = source_admission["corpus"]["validation_manifest"]
         validation = train_bc._load_validation_game_seed_manifest_for_training(  # noqa: SLF001
             Path(str(validation_ref["path"])),
@@ -751,7 +907,7 @@ def _export_sampling_population(
             validation_max_samples=0,
             validation_game_seed_ranges=[],
         )
-    except (active_campaign.CampaignError, KeyError, SystemExit) as error:
+    except (KeyError, SystemExit) as error:
         raise OverlayError(
             f"Stage-C selector validation split refused: {error}"
         ) from error
@@ -840,6 +996,9 @@ def _export(args: argparse.Namespace) -> dict[str, Any]:
         raise OverlayError(f"Stage-C merge export refused: {error}") from error
 
     base_root = Path(str(eligibility["corpus"]["path"])).resolve(strict=True)
+    source_admission_path, source_admission, source_policy_semantics = (
+        _load_plan_source_admission(plan)
+    )
     meta_path, meta = _load_json(
         base_root / "corpus_meta.json", where="base corpus metadata"
     )
@@ -878,6 +1037,7 @@ def _export(args: argparse.Namespace) -> dict[str, Any]:
     sampling_population = _export_sampling_population(
         plan=plan,
         eligibility=eligibility,
+        source_admission=source_admission,
         base_root=base_root,
         patch=arrays,
         output=output,
@@ -919,6 +1079,12 @@ def _export(args: argparse.Namespace) -> dict[str, Any]:
             "row_count": int(meta["row_count"]),
             "flat_count": int(meta["flat_count"]),
             "legal_width": int(meta["legal_width"]),
+            "base_admission": {
+                "schema_version": source_admission["schema_version"],
+                "file_sha256": _file_sha256(source_admission_path),
+                "admission_sha256": source_admission["admission_sha256"],
+            },
+            "source_policy_semantics": source_policy_semantics,
         },
         "target_policy_target_identity_sha256": merge[
             "target_policy_target_identity_sha256"
@@ -991,6 +1157,39 @@ def _load_export(
         is not True
     ):
         raise OverlayError("Stage-C learner export schema/digest/semantics drifted")
+    source_corpus = manifest.get("source_corpus")
+    source_admission = (
+        source_corpus.get("base_admission")
+        if isinstance(source_corpus, Mapping)
+        else None
+    )
+    source_semantics = (
+        source_corpus.get("source_policy_semantics")
+        if isinstance(source_corpus, Mapping)
+        else None
+    )
+    semantics_unsigned = (
+        dict(source_semantics) if isinstance(source_semantics, Mapping) else {}
+    )
+    semantics_stated = semantics_unsigned.pop("semantics_sha256", None)
+    if (
+        not isinstance(source_admission, Mapping)
+        or source_admission.get("schema_version")
+        not in SUPPORTED_BASE_ADMISSION_SCHEMAS
+        or not isinstance(source_admission.get("file_sha256"), str)
+        or not isinstance(source_admission.get("admission_sha256"), str)
+        or not isinstance(source_semantics, Mapping)
+        or source_semantics.get("source_admission_schema")
+        != source_admission.get("schema_version")
+        or source_semantics.get("legacy_pimc_rows_allowed") is not False
+        or source_semantics.get(
+            "derived_overlay_historical_policy_targets_active"
+        )
+        is not False
+        or semantics_stated != _value_sha256(semantics_unsigned)
+    ):
+        raise OverlayError("Stage-C exported source-policy authority drifted")
+
     patch_ref = manifest.get("patch")
     merge_ref = manifest.get("source_merge_receipt")
     subset_ref = manifest.get("sampling_population", {}).get("selected_subset")
@@ -1524,21 +1723,80 @@ def _selected_sampling_weights(
     return weights.astype(np.float32), report
 
 
+def _derived_policy_distillation_contract(
+    *,
+    base_admission: Mapping[str, Any],
+    source_policy_semantics: Mapping[str, Any],
+    selected_rows: int,
+    root_breadth_inventory_sha256: str,
+    target_policy_target_identity_sha256: str,
+) -> dict[str, Any]:
+    """Authorize only the newly materialized Stage-C policy rows."""
+
+    existing = base_admission.get("policy_distillation_contract")
+    contract = copy.deepcopy(dict(existing)) if isinstance(existing, Mapping) else {}
+    contract.update(
+        {
+            "coherent_public_n128_only": True,
+            "legacy_pimc_rows_allowed": False,
+            "policy_active_rows": int(selected_rows),
+            "stage_c_reanalysis_only": True,
+            "historical_policy_targets_active": False,
+            "source_admission_schema": source_policy_semantics[
+                "source_admission_schema"
+            ],
+            "source_stored_policy_target_distillation_eligible": bool(
+                source_policy_semantics[
+                    "stored_policy_target_distillation_eligible"
+                ]
+            ),
+            "source_stored_policy_quarantined_rows": int(
+                source_policy_semantics["stored_policy_quarantined_rows"]
+            ),
+            "root_breadth_inventory_sha256": root_breadth_inventory_sha256,
+            "target_policy_target_identity_sha256": (
+                target_policy_target_identity_sha256
+            ),
+        }
+    )
+    return contract
+
+
 def _materialize(args: argparse.Namespace) -> dict[str, Any]:
     export_path, export, patch, subset = _load_export(args.export_manifest)
     try:
-        base_admission_path, base_admission = active_campaign._load_admission(  # noqa: SLF001
+        (
+            base_admission_path,
+            base_admission,
+            base_source_policy_semantics,
+        ) = _load_base_admission(
             args.base_admission
         )
-    except active_campaign.CampaignError as error:
+    except OverlayError as error:
         raise OverlayError(f"base coherent admission refused: {error}") from error
     base_root = args.base_corpus.expanduser().resolve(strict=True)
     base_meta_path, base_meta = _load_json(
         base_root / "corpus_meta.json", where="base corpus metadata"
     )
     source_binding = export["source_corpus"]
+    exported_admission = source_binding.get("base_admission")
+    exported_semantics = source_binding.get("source_policy_semantics")
+    base_semantics_unsigned = dict(base_source_policy_semantics)
+    base_semantics_unsigned.pop("semantics_sha256", None)
     if (
-        Path(str(base_admission["corpus"]["data_path"])).resolve(strict=True)
+        not isinstance(exported_admission, Mapping)
+        or exported_admission.get("schema_version")
+        != base_admission.get("schema_version")
+        or exported_admission.get("file_sha256")
+        != _file_sha256(base_admission_path)
+        or exported_admission.get("admission_sha256")
+        != base_admission.get("admission_sha256")
+        or not isinstance(exported_semantics, Mapping)
+        or any(
+            exported_semantics.get(key) != value
+            for key, value in base_semantics_unsigned.items()
+        )
+        or Path(str(base_admission["corpus"]["data_path"])).resolve(strict=True)
         != base_root
         or _file_sha256(base_meta_path) != source_binding["corpus_meta_file_sha256"]
         or base_meta.get("payload_inventory_sha256")
@@ -1547,6 +1805,7 @@ def _materialize(args: argparse.Namespace) -> dict[str, Any]:
         or int(base_meta.get("flat_count", -1)) != int(source_binding["flat_count"])
     ):
         raise OverlayError("portable Stage-C export binds a different base corpus")
+    source_policy_semantics = dict(exported_semantics)
 
     output = args.output_root.expanduser().resolve(strict=False)
     if output.exists():
@@ -1776,6 +2035,7 @@ def _materialize(args: argparse.Namespace) -> dict[str, Any]:
 
         admission = copy.deepcopy(base_admission)
         admission.pop("admission_sha256", None)
+        admission["status"] = "admitted_for_diagnostic_policy_distillation"
         corpus = admission["corpus"]
         corpus.update(
             {
@@ -1787,15 +2047,27 @@ def _materialize(args: argparse.Namespace) -> dict[str, Any]:
                 "incompatible_policy_active_rows": 0,
             }
         )
-        admission["policy_distillation_contract"].update(
-            {
-                "policy_active_rows": int(projection["selected_rows"]),
-                "stage_c_reanalysis_only": True,
-                "root_breadth_inventory_sha256": root_breadth["inventory_sha256"],
+        source_target_policy = admission.pop("policy_target_policy", None)
+        if source_target_policy is not None:
+            admission["source_policy_target_policy"] = source_target_policy
+            admission["policy_target_policy"] = {
+                "stored_targets_are_current_stage_c_operator_only": True,
+                "historical_policy_targets_active": False,
+                "legacy_pimc_rows_allowed": False,
                 "target_policy_target_identity_sha256": export[
                     "target_policy_target_identity_sha256"
                 ],
             }
+        admission["policy_distillation_contract"] = (
+            _derived_policy_distillation_contract(
+                base_admission=base_admission,
+                source_policy_semantics=source_policy_semantics,
+                selected_rows=int(projection["selected_rows"]),
+                root_breadth_inventory_sha256=root_breadth["inventory_sha256"],
+                target_policy_target_identity_sha256=export[
+                    "target_policy_target_identity_sha256"
+                ],
+            )
         )
         admission["stage_c_policy_overlay"] = {
             "schema_version": ADMISSION_OVERLAY_SCHEMA,
@@ -1820,6 +2092,13 @@ def _materialize(args: argparse.Namespace) -> dict[str, Any]:
             ),
             "base_value_rows_retained": True,
             "historical_policy_targets_active": False,
+            "source_admission": {
+                "path": str(base_admission_path),
+                "file_sha256": _file_sha256(base_admission_path),
+                "admission_sha256": base_admission["admission_sha256"],
+                "schema_version": base_admission["schema_version"],
+            },
+            "source_policy_semantics": source_policy_semantics,
             "sampling_distribution": sampling_report,
             "root_breadth": root_breadth,
         }
@@ -1839,6 +2118,49 @@ def _materialize(args: argparse.Namespace) -> dict[str, Any]:
         raise
 
 
+def _verify_overlay_source_authority(
+    admission: Mapping[str, Any], overlay: Mapping[str, Any]
+) -> None:
+    """Replay the immutable base admission behind a post-wave overlay."""
+
+    schema = admission.get("schema_version")
+    source_ref = overlay.get("source_admission")
+    source_semantics = overlay.get("source_policy_semantics")
+    # Preserve verification compatibility for already materialized legacy
+    # overlays. New exports of either schema always carry the stronger source
+    # binding below.
+    if schema == active_campaign.ADMISSION_SCHEMA and source_ref is None:
+        return
+    if not isinstance(source_ref, Mapping) or not isinstance(
+        source_semantics, Mapping
+    ):
+        raise OverlayError("Stage-C overlay lost its source-policy authority")
+    source_path, source_admission, base_semantics = _load_base_admission(
+        Path(str(source_ref.get("path", "")))
+    )
+    base_semantics_unsigned = dict(base_semantics)
+    base_semantics_unsigned.pop("semantics_sha256", None)
+    source_unsigned = dict(source_semantics)
+    source_stated = source_unsigned.pop("semantics_sha256", None)
+    if (
+        source_ref.get("schema_version") != source_admission.get("schema_version")
+        or source_ref.get("schema_version") != schema
+        or source_ref.get("file_sha256") != _file_sha256(source_path)
+        or source_ref.get("admission_sha256")
+        != source_admission.get("admission_sha256")
+        or source_stated != _value_sha256(source_unsigned)
+        or any(
+            source_semantics.get(key) != value
+            for key, value in base_semantics_unsigned.items()
+        )
+        or source_semantics.get(
+            "derived_overlay_historical_policy_targets_active"
+        )
+        is not False
+    ):
+        raise OverlayError("Stage-C overlay source-policy authority drifted")
+
+
 def verify_overlay_admission(path: Path) -> dict[str, Any]:
     """Verify the portable Stage-C binding on a derived coherent admission."""
 
@@ -1849,9 +2171,18 @@ def verify_overlay_admission(path: Path) -> dict[str, Any]:
     completed_q_binding = (
         overlay.get("completed_q_binding") if isinstance(overlay, dict) else None
     )
+    corpus = admission.get("corpus")
+    policy_contract = admission.get("policy_distillation_contract")
     if (
-        admission.get("schema_version") != active_campaign.ADMISSION_SCHEMA
+        admission.get("schema_version") not in SUPPORTED_BASE_ADMISSION_SCHEMAS
+        or admission.get("status") != "admitted_for_diagnostic_policy_distillation"
+        or admission.get("diagnostic_only") is not True
+        or admission.get("promotion_eligible") is not False
         or stated != _value_sha256(unsigned)
+        or not isinstance(corpus, Mapping)
+        or corpus.get("stored_policy_target_distillation_eligible") is not True
+        or corpus.get("incompatible_policy_active_rows") != 0
+        or not isinstance(policy_contract, Mapping)
         or not isinstance(overlay, dict)
         or overlay.get("schema_version") != ADMISSION_OVERLAY_SCHEMA
         or overlay.get("historical_policy_targets_active") is not False
@@ -1874,15 +2205,47 @@ def verify_overlay_admission(path: Path) -> dict[str, Any]:
         or int(overlay.get("selected_training_policy_rows", 0))
         + int(overlay.get("selected_validation_policy_rows", 0))
         != int(overlay.get("selected_policy_rows", 0))
-        or admission.get("policy_distillation_contract", {}).get(
-            "stage_c_reanalysis_only"
-        )
-        is not True
+        or policy_contract.get("stage_c_reanalysis_only") is not True
+        or policy_contract.get("coherent_public_n128_only") is not True
+        or policy_contract.get("legacy_pimc_rows_allowed") is not False
+        or int(policy_contract.get("policy_active_rows", -1))
+        != int(overlay.get("selected_policy_rows", 0))
+        or policy_contract.get("target_policy_target_identity_sha256")
+        != overlay.get("target_policy_target_identity_sha256")
         or overlay.get("sampling_distribution", {}).get("schema_version")
         != SAMPLING_SCHEMA
         or overlay.get("sampling_distribution", {}).get("arm") not in SAMPLING_ARMS
     ):
         raise OverlayError("Stage-C overlay admission digest/semantics drifted")
+    _verify_overlay_source_authority(admission, overlay)
+    if overlay.get("source_admission") is not None and (
+        policy_contract.get("historical_policy_targets_active") is not False
+        or policy_contract.get("source_admission_schema")
+        != admission.get("schema_version")
+    ):
+        raise OverlayError("Stage-C derived policy contract drifted")
+    if admission.get("schema_version") == post_wave_admission.ADMISSION_SCHEMA:
+        policy_target = admission.get("policy_target_policy")
+        source_policy_target = admission.get("source_policy_target_policy")
+        if (
+            not isinstance(policy_target, Mapping)
+            or not isinstance(source_policy_target, Mapping)
+            or policy_target.get(
+                "stored_targets_are_current_stage_c_operator_only"
+            )
+            is not True
+            or policy_target.get("historical_policy_targets_active") is not False
+            or policy_target.get("legacy_pimc_rows_allowed") is not False
+            or policy_target.get("target_policy_target_identity_sha256")
+            != overlay.get("target_policy_target_identity_sha256")
+            or source_policy_target.get(
+                "stored_targets_are_historical_operator_only"
+            )
+            is not True
+            or source_policy_target.get("current_teacher_requires_reanalysis")
+            is not True
+        ):
+            raise OverlayError("post-wave Stage-C policy authority drifted")
     receipt_ref = overlay.get("materialization_receipt")
     if not isinstance(receipt_ref, dict):
         raise OverlayError("Stage-C overlay admission lost materialization receipt")
