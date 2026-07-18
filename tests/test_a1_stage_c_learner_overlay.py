@@ -736,6 +736,34 @@ def test_two_stage_c_sampling_arms_share_roots_but_not_measure() -> None:
     )
 
 
+@pytest.mark.parametrize("arm", sorted(overlay.SAMPLING_ARMS))
+def test_every_materializer_sampling_arm_is_accepted_by_trainer(arm: str) -> None:
+    class _Corpus(dict):
+        meta = {
+            "stage_c_policy_overlay": {
+                "sampling_distribution": {
+                    "schema_version": overlay.SAMPLING_SCHEMA,
+                    "column": overlay.SAMPLING_COLUMN,
+                    "arm": arm,
+                }
+            }
+        }
+
+    data = _Corpus(
+        stage_c_policy_sampling_weight=np.asarray(
+            [1.0, 0.0, 1.0], dtype=np.float32
+        ),
+        policy_weight_multiplier=np.asarray([1.0, 0.0, 1.0], dtype=np.float32),
+    )
+
+    weights, source = train_bc._stage_c_policy_aux_base_measure(  # noqa: SLF001
+        data, np.asarray([0, 1, 2], dtype=np.int64)
+    )
+
+    assert weights.tolist() == [1.0, 0.0, 1.0]
+    assert source == f"stage_c_{arm.lower()}"
+
+
 def test_rare_action_balanced_sampling_raises_observed_teacher_mass() -> None:
     rows = 100
     subset = {

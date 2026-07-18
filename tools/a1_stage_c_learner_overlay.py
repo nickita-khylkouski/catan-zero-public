@@ -68,13 +68,7 @@ POLICY_TEACHER = "stage_c_coherent_n128_reanalysis"
 SAMPLING_COLUMN = "stage_c_policy_sampling_weight"
 COMPLETED_Q_VALUE_COLUMN = "completed_q_values"
 COMPLETED_Q_MASK_COLUMN = "completed_q_mask"
-SAMPLING_ARMS = frozenset(
-    {
-        "PRODUCTION_WEIGHTED",
-        "STRATEGIC_BALANCED",
-        "RARE_ACTION_BALANCED",
-    }
-)
+SAMPLING_ARMS = train_bc.STAGE_C_POLICY_SAMPLING_ARMS
 DEFAULT_PRODUCTION_WEIGHT_CAP = 4.0
 RARE_STRATEGIC_ACTION_TYPES = (
     "PLAY_MONOPOLY",

@@ -45036,6 +45036,15 @@ def _compose_stage_c_policy_surprise_sampling_weights(
     return combined
 
 
+STAGE_C_POLICY_SAMPLING_ARMS = frozenset(
+    {
+        "PRODUCTION_WEIGHTED",
+        "STRATEGIC_BALANCED",
+        "RARE_ACTION_BALANCED",
+    }
+)
+
+
 def _stage_c_policy_aux_base_measure(
     data,
     train_indices: np.ndarray,
@@ -45055,8 +45064,7 @@ def _stage_c_policy_aux_base_measure(
             "a1-stage-c-policy-sampling-distribution-v2",
         }
         or sampling.get("column") != "stage_c_policy_sampling_weight"
-        or sampling.get("arm")
-        not in {"PRODUCTION_WEIGHTED", "STRATEGIC_BALANCED"}
+        or sampling.get("arm") not in STAGE_C_POLICY_SAMPLING_ARMS
         or "stage_c_policy_sampling_weight" not in data
     ):
         raise SystemExit("Stage-C policy sampling contract is malformed")
