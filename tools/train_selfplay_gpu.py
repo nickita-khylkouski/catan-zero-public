@@ -23,6 +23,13 @@ def main() -> None:
     parser.add_argument("--override-decisions", type=int, default=0)
     args = parser.parse_args()
     config = load_config(args.config)
+    if config.get("schema") == "canonical_entity_ppo_run_v2":
+        raise SystemExit(
+            "tools/train_selfplay_gpu.py is the legacy flat/xdim PPO launcher and "
+            "does not accept canonical_entity_ppo_run_v2 manifests; launch "
+            "tools/run_local_entity_ppo_shards.py for actors and "
+            "tools/ppo_distributed_learner.py for the learner"
+        )
     rank, world_size, local_rank = _init_distributed()
     device = _device_for_rank(local_rank)
     seed = int(config.get("seed", 1)) + rank * 100_003
