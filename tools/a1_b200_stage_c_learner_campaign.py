@@ -463,6 +463,8 @@ def _require_paired_weighted_behavior_metrics(
 ) -> dict[str, float]:
     if not isinstance(value, dict):
         raise CampaignError(f"{where} paired weighted metrics are missing")
+    if set(candidate) != set(parent):
+        raise CampaignError(f"{where} parent metric keys differ")
     try:
         paired_probability = float(value["row_probability"])
     except (KeyError, TypeError, ValueError) as error:
@@ -484,8 +486,6 @@ def _require_paired_weighted_behavior_metrics(
         raise CampaignError(f"{where} paired deltas are missing")
     projected: dict[str, float] = {}
     for key in candidate:
-        if key not in parent:
-            raise CampaignError(f"{where} parent metric keys differ")
         expected = float(candidate[key]) - float(parent[key])
         try:
             actual = float(deltas[key])
