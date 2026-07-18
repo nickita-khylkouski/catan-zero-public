@@ -19,6 +19,37 @@ class LineageDoseError(ValueError):
     """Invalid initialization or cumulative learner-dose provenance."""
 
 
+def _validate_completed_q_exposure(
+    *,
+    stream: str,
+    active_rows: int,
+    effective_weight_exposure: float,
+    sampled_policy_rows: int,
+    enabled: bool | None = None,
+) -> None:
+    """Reject completed-Q exposure that cannot descend from sampled policy rows."""
+
+    if active_rows > sampled_policy_rows:
+        raise LineageDoseError(
+            f"completed-Q {stream} active-row exposure exceeds sampled "
+            f"{stream} policy rows"
+        )
+    has_active_rows = active_rows > 0
+    has_effective_weight = effective_weight_exposure > 0.0
+    if has_active_rows != has_effective_weight:
+        raise LineageDoseError(
+            f"completed-Q {stream} active rows/effective weight exposure disagree"
+        )
+    if enabled is True and not has_active_rows:
+        raise LineageDoseError(
+            f"enabled completed-Q {stream} objective realized no exposure"
+        )
+    if enabled is False and has_active_rows:
+        raise LineageDoseError(
+            f"disabled completed-Q {stream} objective reported exposure"
+        )
+
+
 def exact_objective_exposure_from_training_report(
     report_payload: Mapping[str, Any],
 ) -> dict[str, Any]:
@@ -171,6 +202,20 @@ def exact_objective_exposure_from_training_report(
                 completed_q_base_active_rows += raw
             else:
                 completed_q_aux_active_rows += raw
+    _validate_completed_q_exposure(
+        stream="base",
+        active_rows=completed_q_base_active_rows,
+        effective_weight_exposure=completed_q_base_exposure,
+        sampled_policy_rows=values["policy_base_active_rows"],
+        enabled=completed_q_base_enabled,
+    )
+    _validate_completed_q_exposure(
+        stream="aux",
+        active_rows=completed_q_aux_active_rows,
+        effective_weight_exposure=completed_q_aux_exposure,
+        sampled_policy_rows=values["policy_aux_active_rows"],
+        enabled=completed_q_aux_enabled,
+    )
     result = {
         "measurement_status": "bound_exactly",
         "measurement_scope": "current_dose",
@@ -441,6 +486,22 @@ def validate_lineage_dose(value: Any) -> dict[str, Any]:
             + objective["policy_aux_active_sampled_rows"]
         ):
             raise LineageDoseError("lineage exact objective exposure arithmetic drift")
+        _validate_completed_q_exposure(
+            stream="base",
+            active_rows=objective["completed_q_base_active_rows"],
+            effective_weight_exposure=float(
+                objective["completed_q_base_effective_weight_exposure"]
+            ),
+            sampled_policy_rows=objective["policy_base_active_sampled_rows"],
+        )
+        _validate_completed_q_exposure(
+            stream="aux",
+            active_rows=objective["completed_q_aux_active_rows"],
+            effective_weight_exposure=float(
+                objective["completed_q_aux_effective_weight_exposure"]
+            ),
+            sampled_policy_rows=objective["policy_aux_active_sampled_rows"],
+        )
     else:
         raise LineageDoseError("lineage objective-specific exposure schema drift")
     current_rows = _positive_int(value.get("current_sampled_rows"), "current_sampled_rows")

@@ -253,6 +253,133 @@ def test_training_report_reconstructs_exact_objective_exposure() -> None:
     }
 
 
+def _completed_q_training_report() -> dict[str, object]:
+    return {
+        "training_row_draws": 6_144,
+        "training_row_draws_semantics": (
+            "base_sampler_draw_events; may repeat rows; excludes_policy_aux"
+        ),
+        "base_training_row_draws": 6_144,
+        "policy_aux_training_row_draws": 128,
+        "policy_base_active_training_row_draws": 1_399,
+        "policy_active_training_row_draws": 1_527,
+        "value_active_training_row_draws": 6_144,
+        "total_training_row_draws": 6_272,
+        "policy_base_active_rows": 1_399,
+        "policy_aux_active_rows": 128,
+        "policy_total_active_rows": 1_527,
+        "value_active_rows": 6_144,
+        "policy_kl_anchor_eligible_rows": 0,
+        "completed_q_loss_weight": 0.25,
+        "policy_aux_completed_q_loss_weight": 0.25,
+        "metrics": [
+            {
+                "loss_denominators": {
+                    "completed_q_loss": 12.5,
+                    "policy_aux_completed_q_loss": 3.5,
+                },
+                "completed_q_active_rows": 100,
+                "policy_aux_completed_q_active_rows": 20,
+            }
+        ],
+    }
+
+
+@pytest.mark.parametrize(
+    ("case", "match"),
+    (
+        ("base_exceeds_policy", "exceeds sampled base policy rows"),
+        ("aux_exceeds_policy", "exceeds sampled aux policy rows"),
+        ("base_rows_without_mass", "active rows/effective weight exposure disagree"),
+        ("base_mass_without_rows", "active rows/effective weight exposure disagree"),
+        ("enabled_base_without_exposure", "enabled completed-Q base objective"),
+        ("disabled_base_with_exposure", "disabled completed-Q base objective"),
+    ),
+)
+def test_training_report_rejects_impossible_completed_q_exposure(
+    case: str,
+    match: str,
+) -> None:
+    report = _completed_q_training_report()
+    metric = report["metrics"][0]
+    denominators = metric["loss_denominators"]
+    if case == "base_exceeds_policy":
+        metric["completed_q_active_rows"] = 1_400
+    elif case == "aux_exceeds_policy":
+        metric["policy_aux_completed_q_active_rows"] = 129
+    elif case == "base_rows_without_mass":
+        denominators["completed_q_loss"] = 0.0
+    elif case == "base_mass_without_rows":
+        metric["completed_q_active_rows"] = 0
+    elif case == "enabled_base_without_exposure":
+        metric["completed_q_active_rows"] = 0
+        denominators["completed_q_loss"] = 0.0
+    elif case == "disabled_base_with_exposure":
+        report["completed_q_loss_weight"] = 0.0
+    else:  # pragma: no cover - parameter table is exhaustive
+        raise AssertionError(case)
+
+    with pytest.raises(lineage.LineageDoseError, match=match):
+        lineage.exact_objective_exposure_from_training_report(report)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "match"),
+    (
+        (
+            "completed_q_base_active_rows",
+            21,
+            "exceeds sampled base policy rows",
+        ),
+        (
+            "completed_q_aux_active_rows",
+            11,
+            "exceeds sampled aux policy rows",
+        ),
+        (
+            "completed_q_base_effective_weight_exposure",
+            0.0,
+            "active rows/effective weight exposure disagree",
+        ),
+        (
+            "completed_q_aux_active_rows",
+            0,
+            "active rows/effective weight exposure disagree",
+        ),
+    ),
+)
+def test_bound_lineage_rejects_impossible_completed_q_exposure(
+    field: str,
+    value: object,
+    match: str,
+) -> None:
+    exposure = {
+        "measurement_status": "bound_exactly",
+        "measurement_scope": "current_dose",
+        "base_sampled_rows": 100,
+        "policy_base_active_sampled_rows": 20,
+        "policy_aux_active_sampled_rows": 10,
+        "policy_active_sampled_rows": 30,
+        "value_active_sampled_rows": 100,
+        "anchor_eligible_sampled_rows": 0,
+        "completed_q_base_effective_weight_exposure": 5.0,
+        "completed_q_aux_effective_weight_exposure": 2.0,
+        "completed_q_base_active_rows": 20,
+        "completed_q_aux_active_rows": 10,
+        "completed_q_exposure_measurement_status": "bound_exactly",
+    }
+    exposure[field] = value
+
+    with pytest.raises(lineage.LineageDoseError, match=match):
+        lineage.direct_lineage_dose(
+            declared_producer_sha256=PRODUCER,
+            init_checkpoint_sha256=PRODUCER,
+            current_sampled_rows=100,
+            current_optimizer_steps=1,
+            objective_exposure=exposure,
+        )
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     (
