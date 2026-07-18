@@ -506,6 +506,40 @@ def test_public_card_lr_multiplier_overrides_trunk_group_for_shared_freeze_surfa
     assert set(assigned) == set(expected)
 
 
+def test_unit_public_card_multiplier_keeps_residual_at_base_lr_not_trunk_lr() -> (
+    None
+):
+    policy = _make_entity_policy(
+        public_card_count_features=True,
+        public_card_count_residual_bias=False,
+    )
+    groups = _build_optimizer_param_groups(
+        policy.model,
+        base_lr=2e-4,
+        value_lr_mult=1.0,
+        public_card_lr_mult=1.0,
+        trunk_lr_mult=0.25,
+        architecture="entity_graph",
+    )
+
+    by_name = {group["_group_name"]: group for group in groups}
+    assert set(by_name) == {"base", "trunk"}
+    assert by_name["base"]["lr"] == pytest.approx(2e-4)
+    assert by_name["trunk"]["lr"] == pytest.approx(2e-4 * 0.25)
+
+    public_card_ids = {
+        id(parameter)
+        for parameter in policy.model.public_card_count_residual.parameters()
+        if parameter.requires_grad
+    }
+    assert public_card_ids <= {
+        id(parameter) for parameter in by_name["base"]["params"]
+    }
+    assert public_card_ids.isdisjoint(
+        {id(parameter) for parameter in by_name["trunk"]["params"]}
+    )
+
+
 def test_public_card_lr_multiplier_refuses_legacy_biased_residual() -> None:
     policy = _make_entity_policy(
         public_card_count_features=True,

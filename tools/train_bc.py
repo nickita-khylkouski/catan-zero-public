@@ -40779,6 +40779,16 @@ def _build_optimizer_param_groups(
                 "upgrade with the v2/v3 bias-free receipt."
             )
     public_card_param_ids = {id(p) for p in public_card_params}
+    # ``--public-card-lr-mult 1.0`` means base LR, not "inherit whichever
+    # multiplier owns the enclosing trunk freeze surface".  Resolve the
+    # complete residual parameter set even when the dedicated non-unit group
+    # is disabled so --trunk-lr-mult cannot silently slow a fresh public-card
+    # adapter.  A non-unit public-card multiplier still owns the same tensors
+    # through ``public_card_param_ids`` below.
+    public_card_residual_param_ids = {
+        id(parameter)
+        for parameter in _params_under(("public_card_count_residual",))
+    }
     # V7's exact-resource adapter belongs to the trunk *freeze* surface because
     # it changes the shared representation consumed by policy and value.  It is
     # nevertheless a fresh, zero-output residual and must commission at base LR
@@ -40805,7 +40815,10 @@ def _build_optimizer_param_groups(
             # from the mature trunk. When both controls are active, the
             # narrower public-card group owns these parameters.
             if id(parameter)
-            not in public_card_param_ids | commissioning_adapter_param_ids
+            not in (
+                public_card_residual_param_ids
+                | commissioning_adapter_param_ids
+            )
         ]
         if float(trunk_lr_mult) != 1.0
         else []
