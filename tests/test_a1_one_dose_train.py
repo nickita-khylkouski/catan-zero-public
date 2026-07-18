@@ -2375,6 +2375,40 @@ def test_policy_aux_active_dose_is_typed_and_command_bound(
     ).policy_aux_active_batch_size == 128
 
 
+def test_policy_aux_opening_value_mix_is_explicit_ablation_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    verified = _verified(tmp_path)
+    verified["reviewed_lock_file_sha256"] = verified["lock_file_sha256"]
+    code_binding = _reviewed_ablation_code_binding()
+    monkeypatch.setattr(
+        executor,
+        "_current_ablation_code_binding",
+        lambda lock: code_binding,
+    )
+    derived = executor.bind_learner_ablation(
+        verified,
+        ablation_id="opening-value-25",
+        overrides_json=(
+            '{"policy_aux_active_batch_size":64,'
+            '"policy_aux_loss_weight":0.1,'
+            '"policy_aux_opening_value_mix_fraction":0.25}'
+        ),
+        reviewed_code_tree_sha256=code_binding["code_tree_sha256"],
+    )
+
+    command = executor.build_train_command(
+        derived,
+        python=Path(sys.executable),
+        checkpoint=tmp_path / "candidate.pt",
+        report=tmp_path / "report.json",
+    )
+    assert _option(command, "--policy-aux-opening-value-mix-fraction") == "0.25"
+    assert derived["learner_ablation"]["recipe_drift"][
+        "policy_aux_opening_value_mix_fraction"
+    ] == {"contract": "disabled with policy_aux_active_batch_size=0", "effective": 0.25}
+
+
 def test_policy_game_weight_can_be_isolated_as_a_generic_ablation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -1496,6 +1496,18 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--policy-aux-opening-value-mix-fraction",
+        type=float,
+        default=0.0,
+        help=(
+            "Reuse the existing policy-AUX forward for terminal-outcome value "
+            "supervision on BUILD_INITIAL_SETTLEMENT and BUILD_INITIAL_ROAD. "
+            "The scalar value objective becomes (1-alpha)*base + "
+            "alpha*aux_opening, preserving the total value coefficient. "
+            "0 is an exact no-op; a positive value requires an active AUX batch."
+        ),
+    )
+    parser.add_argument(
         "--policy-aux-sampling-mode",
         choices=POLICY_AUX_SAMPLING_MODES,
         default=POLICY_AUX_SAMPLING_LEGACY_REPLACEMENT_V1,
@@ -6444,6 +6456,7 @@ def _preflight_flywheel_diagnostic_derivative(
         optional_lr_dose_keys = {
             "policy_aux_active_batch_size",
             "policy_aux_loss_weight",
+            "policy_aux_opening_value_mix_fraction",
         }
         science_profile_keys = {public_card_key, surprise_key}
         allowed_additions = {
@@ -6510,10 +6523,15 @@ def _preflight_flywheel_diagnostic_derivative(
                 policy_aux_loss_weight = effective_overrides.get(
                     "policy_aux_loss_weight"
                 )
+                policy_aux_opening_value_mix_fraction = effective_overrides.get(
+                    "policy_aux_opening_value_mix_fraction", 0.0
+                )
                 campaign_lr_dose_valid = (
                     campaign_lr_dose_valid
                     and type(policy_aux_loss_weight) is float
                     and 0.0 < policy_aux_loss_weight <= 4.0
+                    and type(policy_aux_opening_value_mix_fraction) is float
+                    and 0.0 <= policy_aux_opening_value_mix_fraction <= 1.0
                 )
             canonical_parent_dose_valid = False
             if isinstance(canonical_config_binding, dict):
@@ -7865,6 +7883,7 @@ def _validate_composite_learner_recipe_authorization(
         "value_player_outcome_balance_mode": str,
         "policy_aux_active_batch_size": int,
         "policy_aux_loss_weight": float,
+        "policy_aux_opening_value_mix_fraction": float,
         "policy_loss_weight": float,
         "policy_surprise_weight": float,
         "public_card_lr_mult": float,
@@ -10882,6 +10901,10 @@ def _effective_a1_learner_training_recipe(
     if int(getattr(args, "policy_aux_active_batch_size", 0)) > 0:
         effective["policy_aux_active_batch_size"] = int(args.policy_aux_active_batch_size)
         effective["policy_aux_loss_weight"] = float(args.policy_aux_loss_weight)
+        if float(args.policy_aux_opening_value_mix_fraction) != 0.0:
+            effective["policy_aux_opening_value_mix_fraction"] = float(
+                args.policy_aux_opening_value_mix_fraction
+            )
     # Additive provenance: old authenticated recipes remain byte-for-byte valid
     # when the backward-compatible flag is off, while future rank-offset runs
     # bind the trajectory-changing opt-in explicitly.
@@ -13750,6 +13773,10 @@ def _validate_a1_learner_training_recipe(
     if int(getattr(args, "policy_aux_active_batch_size", 0)) > 0:
         authorized_extra_fields.add("policy_aux_active_batch_size")
         authorized_extra_fields.add("policy_aux_loss_weight")
+        if "policy_aux_opening_value_mix_fraction" in effective:
+            authorized_extra_fields.add(
+                "policy_aux_opening_value_mix_fraction"
+            )
         if "policy_aux_sampling_mode" in effective:
             authorized_extra_fields.add("policy_aux_sampling_mode")
     if "value_trunk_grad_scale" in effective:
@@ -13821,6 +13848,13 @@ def _validate_a1_learner_training_recipe(
             "contract": "disabled with policy_aux_active_batch_size=0",
             "effective": float(effective["policy_aux_loss_weight"]),
         }
+        if float(effective.get("policy_aux_opening_value_mix_fraction", 0.0)) != 0.0:
+            drift["policy_aux_opening_value_mix_fraction"] = {
+                "contract": "disabled with policy_aux_active_batch_size=0",
+                "effective": float(
+                    effective["policy_aux_opening_value_mix_fraction"]
+                ),
+            }
         if (
             effective.get(
                 "policy_aux_sampling_mode",
@@ -15915,6 +15949,17 @@ def main(
         args.policy_aux_loss_weight
     ) <= 0.0:
         raise SystemExit("--policy-aux-loss-weight must be finite and > 0")
+    opening_value_mix = float(args.policy_aux_opening_value_mix_fraction)
+    if not math.isfinite(opening_value_mix) or not 0.0 <= opening_value_mix <= 1.0:
+        raise SystemExit(
+            "--policy-aux-opening-value-mix-fraction must be finite and in [0, 1]"
+        )
+    if opening_value_mix > 0.0:
+        if int(args.policy_aux_active_batch_size) <= 0:
+            raise SystemExit(
+                "--policy-aux-opening-value-mix-fraction requires "
+                "--policy-aux-active-batch-size > 0"
+            )
     if (
         not math.isfinite(float(args.policy_aux_completed_q_loss_weight))
         or float(args.policy_aux_completed_q_loss_weight) < 0.0
@@ -16634,6 +16679,14 @@ def main(
         resolved_scalar_value_weight,
         resolved_categorical_value_weight,
     ) = _resolve_value_objective_weights(args)
+    if (
+        float(args.policy_aux_opening_value_mix_fraction) > 0.0
+        and float(resolved_scalar_value_weight) <= 0.0
+    ):
+        raise SystemExit(
+            "--policy-aux-opening-value-mix-fraction requires an active "
+            "scalar value objective"
+        )
     args.scalar_value_loss_contract = _scalar_value_loss_contract(args)
     args.value_gradient_routing = _value_trunk_gradient_routing(
         args,
@@ -19477,6 +19530,8 @@ def main(
             "policy_base_loss": 0.0,
             "policy_aux_loss": 0.0,
             "value_loss": 0.0,
+            "value_base_loss": 0.0,
+            "policy_aux_opening_value_loss": 0.0,
             "scalar_value_mse_diagnostic": 0.0,
             "final_vp_loss": 0.0,
             "q_loss": 0.0,
@@ -19504,6 +19559,8 @@ def main(
             "policy_base_loss": 0.0,
             "policy_aux_loss": 0.0,
             "value_loss": 0.0,
+            "value_base_loss": 0.0,
+            "policy_aux_opening_value_loss": 0.0,
             "scalar_value_mse_diagnostic": 0.0,
             "final_vp_loss": 0.0,
             "q_loss": 0.0,
@@ -19564,6 +19621,7 @@ def main(
         epoch_post_policy_dose_value_routing_updates = 0
         epoch_post_policy_dose_shared_freeze_updates = 0
         epoch_value_active_count = 0.0
+        epoch_policy_aux_opening_value_active_count = 0.0
         epoch_anchor_eligible_count = 0.0
         epoch_policy_kl_weighted_objective_sum = 0.0
         epoch_policy_kl_coefficient_row_sum = 0.0
@@ -19931,6 +19989,9 @@ def main(
                             "policy_aux_loss_weight": float(
                                 args.policy_aux_loss_weight
                             ),
+                            "policy_aux_opening_value_mix_fraction": float(
+                                args.policy_aux_opening_value_mix_fraction
+                            ),
                             "policy_aux_phase_loss_weights": (
                                 policy_aux_phase_loss_weights
                             ),
@@ -20030,6 +20091,40 @@ def main(
                     data, source_global_rows, value_active_row_mask
                 )
             )
+            aux_opening_value_mix = float(
+                args.policy_aux_opening_value_mix_fraction
+            )
+            aux_opening_value_active_mask = None
+            if aux_source_rows is not None and aux_opening_value_mix > 0.0:
+                aux_rows_array = np.asarray(aux_source_rows, dtype=np.int64)
+                aux_opening_value_active_mask = np.isin(
+                    np.asarray(data["phase"][aux_rows_array]).astype(
+                        str, copy=False
+                    ),
+                    ("BUILD_INITIAL_SETTLEMENT", "BUILD_INITIAL_ROAD"),
+                ) & (
+                    np.asarray(training_value_sample_weights)[
+                        aux_rows_array
+                    ]
+                    > 0.0
+                )
+                aux_value_component_dose = (
+                    _value_component_active_dose_for_batch(
+                        data,
+                        aux_rows_array,
+                        aux_opening_value_active_mask,
+                    )
+                )
+                if aux_value_component_dose is not None:
+                    if batch_value_component_dose is None:
+                        batch_value_component_dose = {}
+                    for component_id, active_rows in (
+                        aux_value_component_dose.items()
+                    ):
+                        batch_value_component_dose[component_id] = (
+                            batch_value_component_dose.get(component_id, 0.0)
+                            + active_rows
+                        )
             if batch_value_component_dose is not None:
                 for component_id, active_rows in batch_value_component_dose.items():
                     epoch_value_component_dose[component_id] += active_rows
@@ -20043,9 +20138,12 @@ def main(
                         policy_weights=np.asarray(training_policy_sample_weights)[
                             source_global_rows
                         ],
-                        value_weights=np.asarray(training_value_sample_weights)[
-                            source_global_rows
-                        ],
+                        value_weights=(
+                            np.asarray(training_value_sample_weights)[
+                                source_global_rows
+                            ]
+                            * (1.0 - aux_opening_value_mix)
+                        ),
                         value_active_mask=value_active_row_mask,
                         draw_stream="base",
                         policy_objective_fraction=(
@@ -20058,19 +20156,27 @@ def main(
                         epoch_training_strata_dose.get(key, 0.0) + float(value)
                     )
                 if aux_source_rows is not None:
+                    aux_rows_array = np.asarray(
+                        aux_source_rows, dtype=np.int64
+                    )
+                    if aux_opening_value_active_mask is None:
+                        aux_opening_value_active_mask = np.zeros(
+                            len(aux_rows_array), dtype=np.bool_
+                        )
                     realized_aux_strata = _flatten_training_strata_dose(
                         _training_strata_dose_for_batch(
                             data,
-                            np.asarray(aux_source_rows, dtype=np.int64),
+                            aux_rows_array,
                             policy_weights=np.asarray(training_policy_sample_weights)[
                                 aux_source_rows
                             ],
-                            value_weights=np.zeros(
-                                len(aux_source_rows), dtype=np.float32
+                            value_weights=(
+                                np.asarray(training_value_sample_weights)[
+                                    aux_rows_array
+                                ]
+                                * aux_opening_value_mix
                             ),
-                            value_active_mask=np.zeros(
-                                len(aux_source_rows), dtype=np.bool_
-                            ),
+                            value_active_mask=aux_opening_value_active_mask,
                             draw_stream="policy_aux",
                             policy_stream_coefficient=float(
                                 args.policy_aux_loss_weight
@@ -20340,6 +20446,9 @@ def main(
             epoch_value_active_count += float(
                 batch_metrics.get("value_active_count", 0)
             )
+            epoch_policy_aux_opening_value_active_count += float(
+                batch_metrics.get("policy_aux_opening_value_active_count", 0)
+            )
             epoch_anchor_eligible_count += float(
                 batch_metrics.get("policy_kl_anchor_eligible_rows", 0)
             )
@@ -20394,6 +20503,8 @@ def main(
             for key in (
                 "policy_loss",
                 "value_loss",
+                "value_base_loss",
+                "policy_aux_opening_value_loss",
                 "scalar_value_mse_diagnostic",
                 "final_vp_loss",
                 "q_loss",
@@ -20700,8 +20811,18 @@ def main(
                     .resolve()
                 )
                 snapshot_scalar_weight = cumulative_scalar_training_weight + (
-                    _reduce_scalar_sum(
-                        float(epoch_extra_denominators["value_loss"]), ddp
+                    (1.0 - float(args.policy_aux_opening_value_mix_fraction))
+                    * _reduce_scalar_sum(
+                        float(epoch_extra_denominators["value_base_loss"]), ddp
+                    )
+                    + float(args.policy_aux_opening_value_mix_fraction)
+                    * _reduce_scalar_sum(
+                        float(
+                            epoch_extra_denominators[
+                                "policy_aux_opening_value_loss"
+                            ]
+                        ),
+                        ddp,
                     )
                 )
                 snapshot_categorical_weight = (
@@ -20907,8 +21028,15 @@ def main(
         epoch_aux_subgoal_denominators = _reduce_named_sums(
             epoch_aux_subgoal_denominators, ddp
         )
-        cumulative_scalar_training_weight += float(
-            epoch_extra_denominators["value_loss"]
+        cumulative_scalar_training_weight += (
+            (1.0 - float(args.policy_aux_opening_value_mix_fraction))
+            * float(epoch_extra_denominators["value_base_loss"])
+            + float(args.policy_aux_opening_value_mix_fraction)
+            * float(
+                epoch_extra_denominators[
+                    "policy_aux_opening_value_loss"
+                ]
+            )
         )
         cumulative_categorical_training_weight += float(
             epoch_extra_denominators["value_categorical_loss"]
@@ -20951,6 +21079,9 @@ def main(
         )
         value_active_count_total = _reduce_scalar_sum(
             float(epoch_value_active_count), ddp
+        )
+        policy_aux_opening_value_active_count_total = _reduce_scalar_sum(
+            float(epoch_policy_aux_opening_value_active_count), ddp
         )
         anchor_eligible_count_total = _reduce_scalar_sum(
             float(epoch_anchor_eligible_count), ddp
@@ -21083,8 +21214,19 @@ def main(
         )
         policy_loss_epoch = policy_stream_epoch["policy_loss"]
         value_loss_epoch = _metric_from_sum_denominator(
-            epoch_extra_sums["value_loss"], epoch_extra_denominators["value_loss"]
+            epoch_extra_sums["value_base_loss"],
+            epoch_extra_denominators["value_base_loss"],
         )
+        policy_aux_opening_value_loss_epoch = _metric_from_sum_denominator(
+            epoch_extra_sums["policy_aux_opening_value_loss"],
+            epoch_extra_denominators["policy_aux_opening_value_loss"],
+        )
+        opening_value_mix = float(args.policy_aux_opening_value_mix_fraction)
+        if opening_value_mix > 0.0:
+            value_loss_epoch = (
+                (1.0 - opening_value_mix) * value_loss_epoch
+                + opening_value_mix * policy_aux_opening_value_loss_epoch
+            )
         scalar_value_mse_diagnostic_epoch = _metric_from_sum_denominator(
             epoch_extra_sums["scalar_value_mse_diagnostic"],
             epoch_extra_denominators["scalar_value_mse_diagnostic"],
@@ -21461,6 +21603,10 @@ def main(
                     ),
                 },
                 "value_active_rows": int(value_active_count_total),
+                "policy_aux_opening_value_active_rows": int(
+                    policy_aux_opening_value_active_count_total
+                ),
+                "policy_aux_opening_value_mix_fraction": opening_value_mix,
                 "policy_kl_anchor_eligible_rows": int(
                     anchor_eligible_count_total
                 ),
@@ -21484,6 +21630,13 @@ def main(
                     "observations": epoch_objective_gradient_observations,
                 },
                 "value_loss": value_loss_epoch,
+                "value_base_loss": _metric_from_sum_denominator(
+                    epoch_extra_sums["value_base_loss"],
+                    epoch_extra_denominators["value_base_loss"],
+                ),
+                "policy_aux_opening_value_loss": (
+                    policy_aux_opening_value_loss_epoch
+                ),
                 "scalar_value_mse_diagnostic": (
                     scalar_value_mse_diagnostic_epoch
                 ),
@@ -21877,9 +22030,39 @@ def main(
                 validation_indices,
                 policy_aux_validation_loss_weights,
             )
+            aux_opening_value_mix = float(
+                args.policy_aux_opening_value_mix_fraction
+            )
+            aux_opening_value_loss_weights = np.zeros(
+                len(validation_indices), dtype=np.float64
+            )
+            if aux_opening_value_mix > 0.0:
+                validation_phases = np.asarray(
+                    data["phase"][validation_indices]
+                ).astype(str, copy=False)
+                opening_rows = np.isin(
+                    validation_phases,
+                    ("BUILD_INITIAL_SETTLEMENT", "BUILD_INITIAL_ROAD"),
+                )
+                aux_opening_value_loss_weights = (
+                    np.asarray(
+                        policy_aux_validation_sampling_weights,
+                        dtype=np.float64,
+                    )
+                    * np.asarray(
+                        value_sample_weights[validation_indices],
+                        dtype=np.float64,
+                    )
+                    * opening_rows.astype(np.float64)
+                )
+                if float(aux_opening_value_loss_weights.sum()) <= 0.0:
+                    raise SystemExit(
+                        "policy AUX opening-value validation measure has no "
+                        "positive held-out mass"
+                    )
             aux_value_weights = _IndexedValidationWeights(
                 validation_indices,
-                np.zeros(len(validation_indices), dtype=np.float64),
+                aux_opening_value_loss_weights,
             )
             validation_policy_aux = evaluate_bc_batches(
                 policy,
@@ -21893,7 +22076,7 @@ def main(
                 args.soft_target_source,
                 args.soft_target_min_legal_coverage,
                 1.0,
-                0.0,
+                1.0 if aux_opening_value_mix > 0.0 else 0.0,
                 0.0,
                 0.0,
                 _parse_prefixes(args.q_skip_teacher_prefixes),
@@ -21904,6 +22087,12 @@ def main(
                 args.advantage_weight_floor,
                 ddp,
                 args.amp,
+                policy_target_blend_semantics=str(
+                    args.policy_target_blend_semantics
+                ),
+                truncated_vp_margin_value_weight=float(
+                    args.truncated_vp_margin_value_weight
+                ),
                 policy_kl_anchor_weight=0.0,
                 policy_kl_anchor_direction=str(args.policy_kl_anchor_direction),
                 data_sharded=bool(args.ddp_shard_data),
@@ -22012,6 +22201,8 @@ def main(
                     if policy_kl_controller is None
                     else float(policy_kl_controller.coefficient)
                 ),
+                scalar_value_loss_weight=float(resolved_scalar_value_weight),
+                opening_value_mix_fraction=aux_opening_value_mix,
             )
             policy_aux_validation_evidence = {
                 "measure": "held_out_conditioned_policy_aux",
@@ -22024,6 +22215,15 @@ def main(
                 ),
                 "policy_loss_measure": "conditioned_sampling_x_policy_weight",
                 "policy_kl_measure": "conditioned_sampling",
+                "opening_value_mix_fraction": aux_opening_value_mix,
+                "opening_value_loss_weight_mass": float(
+                    aux_opening_value_loss_weights.sum()
+                ),
+                "opening_value_measure": (
+                    "conditioned_sampling_x_value_weight_x_opening_phase"
+                    if aux_opening_value_mix > 0.0
+                    else "disabled"
+                ),
                 "metrics": validation_policy_aux,
             }
             if isinstance(base_wrapper, dict):
@@ -23051,6 +23251,9 @@ def main(
         ),
         "policy_aux_active_batch_size": int(args.policy_aux_active_batch_size),
         "policy_aux_loss_weight": float(args.policy_aux_loss_weight),
+        "policy_aux_opening_value_mix_fraction": float(
+            args.policy_aux_opening_value_mix_fraction
+        ),
         "policy_aux_sampling_mode": str(args.policy_aux_sampling_mode),
         "policy_aux_global_draw_offset": int(policy_aux_global_draw_offset),
         "policy_aux_active_rows": int(
@@ -24373,6 +24576,7 @@ def _train_entity_batch(
     policy_aux_batch: np.ndarray | None = None,
     policy_aux_sample_weights: np.ndarray | None = None,
     policy_aux_loss_weight: float = 1.0,
+    policy_aux_opening_value_mix_fraction: float = 0.0,
     policy_aux_phase_loss_weights: Mapping[str, float] | None = None,
     measure_objective_gradient_interference: bool = False,
     measure_aux_gradient_geometry_only: bool = False,
@@ -24575,6 +24779,14 @@ def _train_entity_batch(
             policy_aux_kl_anchor_loss_sum,
             policy_aux_kl_anchor_loss_denominator,
         ) = _zero_loss_parts(policy.device)
+        policy_aux_opening_value_loss = torch.tensor(
+            0.0, dtype=torch.float32, device=policy.device
+        )
+        (
+            policy_aux_opening_value_loss_sum,
+            policy_aux_opening_value_loss_denominator,
+        ) = _zero_loss_parts(policy.device)
+        policy_aux_opening_value_active_count = 0
         if policy_aux_batch is not None:
             if policy_aux_data is None or policy_aux_sample_weights is None:
                 raise ValueError("incomplete policy auxiliary batch inputs")
@@ -24609,12 +24821,85 @@ def _train_entity_batch(
                 aux_legal_ids,
                 return_q=float(policy_aux_completed_q_loss_weight) != 0.0,
                 return_final_vp=False,
+                value_trunk_grad_scale=value_trunk_grad_scale,
                 symmetry=symmetry,
                 symmetry_rng=symmetry_rng,
                 symmetry_rank=symmetry_rank,
                 symmetry_world_size=symmetry_world_size,
                 symmetry_relabel_events=symmetry_relabel_events,
             )
+            if float(policy_aux_opening_value_mix_fraction) > 0.0:
+                aux_phases = np.asarray(
+                    policy_aux_data["phase"][policy_aux_batch]
+                ).astype(str, copy=False)
+                aux_opening_mask = torch.as_tensor(
+                    np.isin(
+                        aux_phases,
+                        ("BUILD_INITIAL_SETTLEMENT", "BUILD_INITIAL_ROAD"),
+                    ),
+                    dtype=torch.bool,
+                    device=policy.device,
+                )
+                (
+                    _aux_outcome_targets,
+                    _aux_vp_targets,
+                    _aux_has_outcome,
+                    _aux_has_vp_target,
+                    aux_value_targets,
+                    aux_value_has_outcome,
+                    aux_outcome_confidence,
+                ) = _value_targets(
+                    policy_aux_data,
+                    policy_aux_batch,
+                    policy.device,
+                    vps_to_win,
+                    truncated_vp_margin_value_weight=(
+                        truncated_vp_margin_value_weight
+                    ),
+                )
+                if aux_value_targets is None or "value" not in aux_outputs:
+                    raise ValueError(
+                        "opening-value AUX stream has no scalar outcome target"
+                    )
+                aux_value_weights = torch.as_tensor(
+                    value_sample_weights[policy_aux_batch],
+                    dtype=torch.float32,
+                    device=policy.device,
+                )
+                aux_value_error, _aux_value_mse, _aux_value_prediction = (
+                    _scalar_value_objective_errors(
+                        aux_outputs["value"],
+                        aux_value_targets,
+                        objective=scalar_value_objective,
+                        readout=scalar_value_loss_readout,
+                        scale=scalar_value_loss_scale,
+                    )
+                )
+                aux_opening_value_mask = (
+                    aux_opening_mask & aux_value_has_outcome
+                )
+                (
+                    policy_aux_opening_value_loss_sum,
+                    policy_aux_opening_value_loss_denominator,
+                ) = _weighted_loss_parts(
+                    aux_value_error,
+                    aux_value_weights * aux_outcome_confidence,
+                    mask=aux_opening_value_mask,
+                )
+                policy_aux_opening_value_loss = _weighted_mean_loss(
+                    aux_value_error,
+                    aux_value_weights * aux_outcome_confidence,
+                    mask=aux_opening_value_mask,
+                )
+                policy_aux_opening_value_active_count = int(
+                    (
+                        aux_opening_value_mask
+                        & (
+                            aux_value_weights * aux_outcome_confidence
+                            > 0.0
+                        )
+                    ).sum().item()
+                )
             if float(policy_kl_anchor_weight) != 0.0 or bool(
                 policy_kl_anchor_measure
             ):
@@ -24823,6 +25108,28 @@ def _train_entity_batch(
                 scalar_value_mse_diagnostic_denominator,
             ) = _zero_loss_parts(policy.device)
             value_active_count = 0
+        base_value_loss = value_loss
+        opening_value_mix = float(policy_aux_opening_value_mix_fraction)
+        if opening_value_mix > 0.0:
+            if policy_aux_batch is None:
+                raise ValueError(
+                    "opening-value AUX mix enabled without an AUX batch"
+                )
+            value_loss = (
+                (1.0 - opening_value_mix) * base_value_loss
+                + opening_value_mix * policy_aux_opening_value_loss
+            )
+            # The mixed objective is a sum of two independently normalized
+            # means, so no row-weight denominator can represent it exactly.
+            # Report one sufficient-statistic unit per rank/batch; DDP-scaled
+            # rank losses then average back to the exact global mixed mean.
+            combined_value_loss_sum = value_loss
+            combined_value_loss_denominator = torch.tensor(
+                1.0, dtype=torch.float32, device=policy.device
+            )
+        else:
+            combined_value_loss_sum = value_loss_sum
+            combined_value_loss_denominator = value_loss_denominator
         if vp_targets is not None and "final_vp" in outputs:
             vp_error = nn.functional.mse_loss(outputs["final_vp"], vp_targets, reduction="none")
             final_vp_loss = _weighted_mean_loss(
@@ -25516,8 +25823,28 @@ def _train_entity_batch(
         if policy_aux_batch is not None
         else 0.0,
         "policy_aux_loss_coefficient": float(policy_aux_loss_weight),
-        "value_loss_weighted_sum": float(value_loss_sum.item()),
-        "value_loss_weight_sum": float(value_loss_denominator.item()),
+        "policy_aux_opening_value_mix_fraction": float(
+            policy_aux_opening_value_mix_fraction
+        ),
+        "value_base_loss": float(base_value_loss.item()),
+        "value_base_loss_weighted_sum": float(value_loss_sum.item()),
+        "value_base_loss_weight_sum": float(value_loss_denominator.item()),
+        "policy_aux_opening_value_loss": float(
+            policy_aux_opening_value_loss.item()
+        ),
+        "policy_aux_opening_value_loss_weighted_sum": float(
+            policy_aux_opening_value_loss_sum.item()
+        ),
+        "policy_aux_opening_value_loss_weight_sum": float(
+            policy_aux_opening_value_loss_denominator.item()
+        ),
+        "policy_aux_opening_value_active_count": int(
+            policy_aux_opening_value_active_count
+        ),
+        "value_loss_weighted_sum": float(combined_value_loss_sum.item()),
+        "value_loss_weight_sum": float(
+            combined_value_loss_denominator.item()
+        ),
         "scalar_value_mse_diagnostic_weighted_sum": float(
             scalar_value_mse_diagnostic_sum.item()
         ),
@@ -25961,6 +26288,8 @@ def _combine_policy_aux_validation_metrics(
     policy_loss_weight: float,
     policy_aux_loss_weight: float,
     policy_kl_anchor_weight: float = 0.0,
+    scalar_value_loss_weight: float = 0.0,
+    opening_value_mix_fraction: float = 0.0,
 ) -> dict:
     """Reconstruct the exact two-stream policy objective used by training.
 
@@ -25979,12 +26308,18 @@ def _combine_policy_aux_validation_metrics(
     coefficient = float(policy_aux_loss_weight)
     policy_coefficient = float(policy_loss_weight)
     anchor_coefficient = float(policy_kl_anchor_weight)
+    value_coefficient = float(scalar_value_loss_weight)
+    opening_mix = float(opening_value_mix_fraction)
     if not math.isfinite(coefficient) or coefficient < 0.0:
         raise ValueError("policy AUX validation coefficient is invalid")
     if not math.isfinite(policy_coefficient) or policy_coefficient < 0.0:
         raise ValueError("policy validation coefficient is invalid")
     if not math.isfinite(anchor_coefficient) or anchor_coefficient < 0.0:
         raise ValueError("policy KL validation coefficient is invalid")
+    if not math.isfinite(value_coefficient) or value_coefficient < 0.0:
+        raise ValueError("scalar value validation coefficient is invalid")
+    if not math.isfinite(opening_mix) or not 0.0 <= opening_mix <= 1.0:
+        raise ValueError("opening-value validation mix is invalid")
 
     base_policy = float(base_metrics["policy_loss"])
     aux_policy = float(aux_metrics["policy_loss"])
@@ -25992,10 +26327,19 @@ def _combine_policy_aux_validation_metrics(
     aux_anchor = float(aux_metrics.get("policy_kl_anchor_loss", 0.0))
     combined_policy = base_policy + coefficient * aux_policy
     combined_anchor = base_anchor + coefficient * aux_anchor
+    base_value = float(base_metrics.get("value_loss", 0.0))
+    aux_opening_value = float(aux_metrics.get("value_loss", 0.0))
+    combined_value = (
+        (1.0 - opening_mix) * base_value
+        + opening_mix * aux_opening_value
+    )
     combined_loss = (
         float(base_metrics["loss"])
         + policy_coefficient * coefficient * aux_policy
         + anchor_coefficient * coefficient * aux_anchor
+        + value_coefficient * opening_mix * (
+            aux_opening_value - base_value
+        )
     )
     base_anchor_denominator = float(
         (base_metrics.get("loss_denominators") or {}).get(
@@ -26038,6 +26382,10 @@ def _combine_policy_aux_validation_metrics(
             "policy_base_loss": base_policy,
             "policy_aux_loss": aux_policy,
             "policy_aux_loss_weight": coefficient,
+            "value_loss": combined_value,
+            "value_base_loss": base_value,
+            "policy_aux_opening_value_loss": aux_opening_value,
+            "policy_aux_opening_value_mix_fraction": opening_mix,
             "policy_kl_anchor_loss": combined_anchor,
             "policy_kl_anchor_base_loss": base_anchor,
             "policy_kl_anchor_aux_loss": aux_anchor,

@@ -70,6 +70,37 @@ def test_policy_aux_validation_reconstructs_the_training_objective() -> None:
     assert combined["policy_aux_validation_effective_weight_sum"] == 3.0
 
 
+def test_policy_aux_validation_reconstructs_opening_value_mix() -> None:
+    combined = _combine_policy_aux_validation_metrics(
+        {
+            # 0.5 policy + 0.25 * 2.0 value = 1.0.
+            "loss": 1.0,
+            "policy_loss": 0.5,
+            "value_loss": 2.0,
+        },
+        {
+            "samples": 10,
+            "policy_loss": 1.0,
+            "value_loss": 0.8,
+            "loss_denominators": {
+                "policy_loss": 5.0,
+                "value_loss": 3.0,
+            },
+        },
+        policy_loss_weight=1.0,
+        policy_aux_loss_weight=0.1,
+        scalar_value_loss_weight=0.25,
+        opening_value_mix_fraction=0.25,
+    )
+
+    assert combined["policy_loss"] == pytest.approx(0.6)
+    assert combined["value_loss"] == pytest.approx(1.7)
+    assert combined["value_base_loss"] == 2.0
+    assert combined["policy_aux_opening_value_loss"] == 0.8
+    # Base loss + AUX policy + replacement of 25% of the scalar value term.
+    assert combined["loss"] == pytest.approx(1.025)
+
+
 def test_policy_aux_validation_preserves_base_common_uniform_value_metric() -> None:
     common = {
         "schema_version": "common-uniform-clean-outcome-scalar-mse-v1",

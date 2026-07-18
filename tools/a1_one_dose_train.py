@@ -284,6 +284,7 @@ A1_LEARNER_ABLATION_FIELDS = frozenset(
         "policy_loss_weight",
         "policy_aux_active_batch_size",
         "policy_aux_loss_weight",
+        "policy_aux_opening_value_mix_fraction",
         "policy_aux_sampling_mode",
         "completed_q_loss_weight",
         "policy_aux_completed_q_loss_weight",
@@ -4065,10 +4066,18 @@ def bind_learner_ablation(
             )
     aux_batch_declared = "policy_aux_active_batch_size" in overrides
     aux_weight_declared = "policy_aux_loss_weight" in overrides
+    aux_opening_value_declared = (
+        "policy_aux_opening_value_mix_fraction" in overrides
+    )
     if aux_batch_declared != aux_weight_declared:
         raise ExecutorError(
             "policy AUX ablations must declare policy_aux_active_batch_size and "
             "policy_aux_loss_weight together; batch size is not an objective dose"
+        )
+    if aux_opening_value_declared and not aux_batch_declared:
+        raise ExecutorError(
+            "policy_aux_opening_value_mix_fraction requires the policy AUX "
+            "batch and loss fields in the same ablation"
         )
     bound = dict(verified["recipe"])
     effective = dict(bound)
@@ -4092,6 +4101,8 @@ def bind_learner_ablation(
     effective["per_game_value_weight_mode"] = "equal"
     if aux_batch_declared:
         effective["policy_aux_loss_weight"] = 1.0
+    if aux_opening_value_declared:
+        effective["policy_aux_opening_value_mix_fraction"] = 0.0
     if "value_trunk_grad_scale" in overrides:
         effective["value_trunk_grad_scale"] = 1.0
     for key, value in overrides.items():
@@ -4138,6 +4149,7 @@ def bind_learner_ablation(
             in {
                 "value_trunk_grad_scale",
                 "policy_aux_loss_weight",
+                "policy_aux_opening_value_mix_fraction",
                 "action_module_lr_mult",
                 "public_card_lr_mult",
                 "shared_action_lr_mult",
@@ -4198,6 +4210,7 @@ def bind_learner_ablation(
         "policy_loss_weight": (0.0, None, True),
         "policy_aux_active_batch_size": (0.0, None, True),
         "policy_aux_loss_weight": (0.0, 4.0, False),
+        "policy_aux_opening_value_mix_fraction": (0.0, 1.0, True),
         "completed_q_loss_weight": (0.0, None, True),
         "policy_aux_completed_q_loss_weight": (0.0, None, True),
         "soft_target_weight": (0.0, 1.0, True),
@@ -4340,6 +4353,13 @@ def bind_learner_ablation(
             "contract": "disabled with policy_aux_active_batch_size=0",
             "effective": effective["policy_aux_loss_weight"],
         }
+        if float(effective.get("policy_aux_opening_value_mix_fraction", 0.0)) != 0.0:
+            drift["policy_aux_opening_value_mix_fraction"] = {
+                "contract": "disabled with policy_aux_active_batch_size=0",
+                "effective": effective[
+                    "policy_aux_opening_value_mix_fraction"
+                ],
+            }
     if effective.get("value_trunk_grad_scale", 1.0) != 1.0:
         drift["value_trunk_grad_scale"] = {
             "contract": 1.0,
@@ -4781,6 +4801,11 @@ def bind_diagnostic_training_descriptor(
                 derived_overrides["policy_aux_active_batch_size"] = policy_aux_batch
                 derived_overrides["policy_aux_loss_weight"] = float(
                     effective_recipe["policy_aux_loss_weight"]
+                )
+                derived_overrides["policy_aux_opening_value_mix_fraction"] = float(
+                    effective_recipe.get(
+                        "policy_aux_opening_value_mix_fraction", 0.0
+                    )
                 )
 
     derived = copy.deepcopy(base)
@@ -6871,6 +6896,13 @@ def _build_direct_train_command(
                 str(recipe["policy_aux_loss_weight"]),
             ]
         )
+        if "policy_aux_opening_value_mix_fraction" in recipe:
+            command.extend(
+                [
+                    "--policy-aux-opening-value-mix-fraction",
+                    str(recipe["policy_aux_opening_value_mix_fraction"]),
+                ]
+            )
     central_binding = verified.get("central_learner_binding")
     learner_ablation = verified.get("learner_ablation")
     stage_c_final_binding = verified.get("stage_c_final_replication_binding")
@@ -11267,6 +11299,9 @@ def _verify_training_outputs(
         expected_draws = {
             "policy_aux_active_batch_size": int(recipe["policy_aux_active_batch_size"]),
             "policy_aux_loss_weight": float(recipe["policy_aux_loss_weight"]),
+            "policy_aux_opening_value_mix_fraction": float(
+                recipe.get("policy_aux_opening_value_mix_fraction", 0.0)
+            ),
             "base_training_row_draws": int(exposure["base_sampled_rows"]),
             "policy_aux_training_row_draws": int(
                 exposure["policy_aux_active_sampled_rows"]

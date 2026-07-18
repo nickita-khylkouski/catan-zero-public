@@ -99,6 +99,9 @@ _CANONICAL_RUNTIME_DEFAULTS: dict[str, Any] = {
     # authenticated completed-Q rows and a nonzero weight explicitly.
     "completed_q_loss_weight": 0.0,
     "policy_aux_completed_q_loss_weight": 0.0,
+    # Diagnostic opening-value reuse is opt-in through the sealed ablation
+    # authority. Historical canonical recipes remain an exact zero/no-op.
+    "policy_aux_opening_value_mix_fraction": 0.0,
     "allow_legacy_action_mask_upgrade": False,
     "acknowledge_diagnostic_outcome_conditioned_policy_distillation": False,
     "a1_learner_ablation_id": "",
