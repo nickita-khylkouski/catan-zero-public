@@ -286,6 +286,30 @@ def _snapshot_policy(source: Path, destination: Path) -> str:
     return snapshot_sha256
 
 
+def _snapshot_available_policy(
+    root: Path,
+    published: dist.PublishedVersion,
+    destination: Path,
+) -> tuple[dist.PublishedVersion, str]:
+    """Pin the selected version, retrying from current if GC won the race."""
+
+    candidate = published
+    for _attempt in range(dist.KEEP_VERSIONED_WEIGHTS + 2):
+        try:
+            digest = _snapshot_policy(Path(candidate.path), destination)
+            return candidate, digest
+        except (OSError, RuntimeError):
+            destination.unlink(missing_ok=True)
+            latest = dist.read_version(root)
+            if latest is None:
+                break
+            candidate = latest
+    raise RuntimeError(
+        "cannot pin an available actor policy checkpoint while learner "
+        "publication/GC is advancing"
+    )
+
+
 def _prepare_launch_unlocked(
     args: argparse.Namespace, published: Any, launch_id: str
 ) -> dict[str, Any]:
@@ -343,7 +367,9 @@ def _prepare_launch_unlocked(
             # A snapshot without its staged binding is from a crash before any
             # launch identity became authoritative and is safe to reconstruct.
             snapshot.unlink(missing_ok=True)
-            snapshot_sha256 = _snapshot_policy(Path(published.path), snapshot)
+            published, snapshot_sha256 = _snapshot_available_policy(
+                root, published, snapshot
+            )
             policy_version = int(published.version)
             policy_step = int(getattr(published, "step", 0))
             policy_updated_at = float(getattr(published, "updated_at", 0.0))

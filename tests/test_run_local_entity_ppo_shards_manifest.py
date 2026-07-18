@@ -668,6 +668,45 @@ def test_launch_policy_snapshot_survives_versioned_weight_gc(tmp_path: Path) -> 
     assert Path(published.path).read_bytes() == b"version one"
 
 
+def test_launch_snapshot_retries_current_policy_when_selected_version_was_gc_d(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "initializer.pt"
+    checkpoint.write_bytes(b"initializer")
+    args, _manifest = actor.resolve_config(
+        [
+            "--run-base",
+            str(tmp_path),
+            "--run-name",
+            "read-snapshot-gc-race",
+            "--checkpoint",
+            str(checkpoint),
+            "--launch-id",
+            "raced-launch",
+        ]
+    )
+    root = dist.run_root(args.run_base, args.run_name)
+    selected = dist.publish_weights(
+        root, lambda path: Path(path).write_bytes(b"version one"), step=1
+    )
+    latest = selected
+    for version in range(2, dist.KEEP_VERSIONED_WEIGHTS + 2):
+        latest = dist.publish_weights(
+            root,
+            lambda path, version=version: Path(path).write_bytes(
+                f"version {version}".encode()
+            ),
+            step=version,
+        )
+    assert not Path(selected.path).exists()
+
+    launch = actor._prepare_launch(args, selected)  # noqa: SLF001
+
+    assert launch["policy_version"] == latest.version
+    assert launch["policy_step"] == latest.step
+    assert Path(launch["checkpoint"]).read_bytes() == Path(latest.path).read_bytes()
+
+
 def test_orphan_policy_snapshot_is_recovered_before_launch_binding(
     tmp_path: Path,
 ) -> None:
