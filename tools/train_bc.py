@@ -3474,8 +3474,13 @@ def _optimizer_lr_dose_attestation(
     updates = int(applied_updates)
     if updates < 0 or len(lr_area_by_group) != len(optimizer.param_groups):
         raise ValueError("invalid optimizer LR-dose accounting")
-    groups = []
-    semantic_identities: set[tuple[str, str]] = set()
+    # AdamW splits one semantic group into decay/no-decay physical groups.  The
+    # two partitions have the same scheduled LR integral, so aggregate their
+    # tensor inventory while verifying that the dose stayed identical.  This
+    # keeps durable evidence keyed by the scientific knob ("value",
+    # "shared_action", ...) instead of anonymous optimizer indices.
+    groups_by_name: dict[str, dict[str, object]] = {}
+    physical_identities: set[tuple[str, str]] = set()
     for index, (area, group) in enumerate(
         zip(lr_area_by_group, optimizer.param_groups, strict=True)
     ):
@@ -3493,21 +3498,63 @@ def _optimizer_lr_dose_attestation(
                 "optimizer LR-dose groups require stable semantic identity"
             )
         semantic_identity = (group_name, decay_role)
-        if semantic_identity in semantic_identities:
+        if semantic_identity in physical_identities:
             raise ValueError(
                 "optimizer LR-dose semantic group identities must be unique"
             )
-        semantic_identities.add(semantic_identity)
-        groups.append(
-            {
-                "group_index": int(index),
-                "group_name": group_name,
-                "weight_decay_role": decay_role,
-                "base_lr": float(group.get("base_lr", group["lr"])),
+        physical_identities.add(semantic_identity)
+
+        name = group_name
+        base_lr = float(group.get("base_lr", group["lr"]))
+        current_lr = float(group["lr"])
+        if (
+            not math.isfinite(base_lr)
+            or base_lr < 0.0
+            or not math.isfinite(current_lr)
+            or current_lr < 0.0
+        ):
+            raise ValueError(
+                "optimizer group learning rates must be finite and non-negative"
+            )
+        parameter_tensors = len(group["params"])
+        parameters = sum(int(parameter.numel()) for parameter in group["params"])
+        if parameter_tensors < 0 or parameters < 0:
+            raise ValueError("optimizer parameter counts must be non-negative")
+
+        existing = groups_by_name.get(name)
+        if existing is None:
+            groups_by_name[name] = {
+                "semantic_group_name": name,
+                "optimizer_group_indices": [int(index)],
+                "optimizer_group_count": 1,
+                "parameter_tensors": int(parameter_tensors),
+                "parameters": int(parameters),
+                "base_lr": base_lr,
                 "integrated_lr_area": area,
                 "mean_applied_lr": area / updates if updates > 0 else None,
             }
+            continue
+        if (
+            float(existing["base_lr"]) != base_lr
+            or float(existing["integrated_lr_area"]) != area
+        ):
+            raise ValueError(
+                "AdamW decay partitions for semantic optimizer group "
+                f"{name!r} received different LR doses"
+            )
+        existing["optimizer_group_indices"].append(int(index))
+        existing["optimizer_group_count"] = (
+            int(existing["optimizer_group_count"]) + 1
         )
+        existing["parameter_tensors"] = (
+            int(existing["parameter_tensors"]) + parameter_tensors
+        )
+        existing["parameters"] = int(existing["parameters"]) + parameters
+
+    groups = list(groups_by_name.values())
+    if len(groups) != len({str(group["semantic_group_name"]) for group in groups}):
+        raise ValueError("optimizer semantic parameter-group names must be unique")
+
     multiplier_sum = float(schedule_multiplier_sum)
     if not math.isfinite(multiplier_sum) or multiplier_sum < 0.0:
         raise ValueError("schedule multiplier area must be finite and non-negative")
@@ -20990,6 +21037,7 @@ def main(
         lr_area_by_group=optimizer_lr_area_by_group,
         optimizer=optimizer,
     )
+    optimizer_fused_report_fields = _optimizer_fused_report_fields(optimizer)
     training_information_surface = {
         **(training_information_surface or {}),
         "policy_training_signal": policy_training_signal,
@@ -21417,7 +21465,7 @@ def main(
         "max_grad_norm": float(args.max_grad_norm),
         "gradient_clipping_enabled": bool(float(args.max_grad_norm) > 0.0),
         "weight_decay": float(args.weight_decay),
-        "fused_optimizer": bool(args.fused_optimizer),
+        **optimizer_fused_report_fields,
         "hidden_size": int(args.hidden_size),
         "mask_hidden_info": bool(args.mask_hidden_info),
         "hard_action_target_admission": hard_action_target_admission,
@@ -38919,7 +38967,7 @@ def _split_adamw_weight_decay_groups(
         metadata = {
             key: value
             for key, value in group.items()
-            if key not in {"params", "weight_decay"}
+            if key not in {"params", "weight_decay", "weight_decay_role"}
         }
         if decay_params:
             result.append(
@@ -39209,23 +39257,47 @@ def _make_optimizer(params, args, device):
     grouped_input = bool(param_groups and isinstance(param_groups[0], dict))
     if grouped_input:
         # --value-lr-mult path: `params` is already a list of param-group dicts (see
-        # `_build_optimizer_param_groups`), each carrying its own "lr". Drop any
-        # non-trainable stragglers per group (mirrors the flat-list branch below).
-        trainable_params = [
-            {
+        # `_build_optimizer_param_groups`), each carrying its own "lr".  Keep the
+        # semantic group name in public optimizer state/checkpoints; reports and
+        # resume validation must distinguish equal-LR value/shared-action groups.
+        trainable_params = []
+        source_names: set[str] = set()
+        for index, group in enumerate(param_groups):
+            raw_name = group.get("_group_name")
+            if not isinstance(raw_name, str) or not raw_name.strip():
+                raise ValueError(
+                    f"optimizer source parameter group {index} lacks a semantic name"
+                )
+            name = raw_name.strip()
+            if name in source_names:
+                raise ValueError(
+                    f"optimizer semantic source group name is not unique: {name!r}"
+                )
+            source_names.add(name)
+            normalized = {
                 **{key: value for key, value in group.items() if key != "_group_name"},
-                "group_name": str(group.get("_group_name", "unnamed")),
+                "group_name": name,
                 "weight_decay_role": "no_decay",
                 "params": [p for p in group["params"] if p.requires_grad],
             }
-            for group in param_groups
-        ]
+            trainable_params.append(normalized)
         if not any(group["params"] for group in trainable_params):
             raise SystemExit("no trainable parameters found for BC optimizer")
     else:
-        trainable_params = [parameter for parameter in param_groups if parameter.requires_grad]
-        if not trainable_params:
+        flat_trainable_params = [
+            parameter for parameter in param_groups if parameter.requires_grad
+        ]
+        if not flat_trainable_params:
             raise SystemExit("no trainable parameters found for BC optimizer")
+        trainable_params = [
+            {
+                "params": flat_trainable_params,
+                "lr": float(args.lr),
+                "base_lr": float(args.lr),
+                "group_name": "historical_flat",
+                "weight_decay_role": "no_decay",
+            }
+        ]
     optimizer_name = str(args.optimizer).lower()
     weight_decay = float(args.weight_decay)
     # AUDIT FIX (weight-decay silent no-op): plain torch.optim.Adam's weight_decay
@@ -39248,34 +39320,101 @@ def _make_optimizer(params, args, device):
     if optimizer_name == "adamw":
         kwargs["weight_decay"] = weight_decay
         if weight_decay != 0.0:
-            normalized_groups = (
-                trainable_params
-                if grouped_input
-                else [
-                    {
-                        "params": trainable_params,
-                        "group_name": "historical_flat",
-                        "weight_decay_role": "no_decay",
-                    }
-                ]
-            )
             trainable_params = _split_adamw_weight_decay_groups(
-                normalized_groups,
+                trainable_params,
                 weight_decay=weight_decay,
             )
-    if bool(args.fused_optimizer) and str(device).startswith("cuda"):
+    fused_requested = bool(args.fused_optimizer)
+    fused_attempted = fused_requested and str(device).startswith("cuda")
+    if fused_attempted:
         kwargs["fused"] = True
+    fallback_after_type_error = False
     try:
         optimizer = cls(trainable_params, **kwargs)
     except TypeError:
         if "fused" not in kwargs:
             raise
         kwargs.pop("fused", None)
+        fallback_after_type_error = True
         optimizer = cls(trainable_params, **kwargs)
-    for group in optimizer.param_groups:
-        group.setdefault("group_name", "historical_flat")
-        group.setdefault("weight_decay_role", "no_decay")
+
+    seen_physical_identities: set[tuple[str, str]] = set()
+    for index, group in enumerate(optimizer.param_groups):
+        raw_name = group.get("group_name")
+        raw_partition = group.get("weight_decay_role")
+        if not isinstance(raw_name, str) or not raw_name.strip():
+            raise ValueError(
+                f"constructed optimizer group {index} lacks a semantic name"
+            )
+        if not isinstance(raw_partition, str) or not raw_partition.strip():
+            raise ValueError(
+                f"constructed optimizer group {index} lacks a decay partition"
+            )
+        name = raw_name.strip()
+        partition = raw_partition.strip()
+        physical_identity = (name, partition)
+        if physical_identity in seen_physical_identities:
+            raise ValueError(
+                "constructed optimizer physical group identity is not unique: "
+                f"{name}/{partition}"
+            )
+        seen_physical_identities.add(physical_identity)
+        base_group_lr = float(group.get("base_lr", group["lr"]))
+        if not math.isfinite(base_group_lr) or base_group_lr < 0.0:
+            raise ValueError(
+                "constructed optimizer base LRs must be finite and non-negative"
+            )
+    optimizer._catan_zero_fused_requested = fused_requested
+    optimizer._catan_zero_fused_attempted = fused_attempted
+    optimizer._catan_zero_fused_effective = bool(
+        optimizer.defaults.get("fused", False)
+    )
+    optimizer._catan_zero_fused_fallback_after_type_error = (
+        fallback_after_type_error
+    )
     return optimizer
+
+
+def _optimizer_fused_runtime_report(optimizer) -> dict[str, bool]:
+    """Report the realized fused execution mode, not merely the CLI request."""
+
+    fields = {
+        "requested": getattr(optimizer, "_catan_zero_fused_requested", None),
+        "attempted": getattr(optimizer, "_catan_zero_fused_attempted", None),
+        "effective": getattr(optimizer, "_catan_zero_fused_effective", None),
+        "fallback_after_type_error": getattr(
+            optimizer,
+            "_catan_zero_fused_fallback_after_type_error",
+            None,
+        ),
+    }
+    if any(not isinstance(value, bool) for value in fields.values()):
+        raise ValueError("optimizer lacks typed fused-runtime provenance")
+    contradictory = (
+        (fields["effective"] and not fields["attempted"])
+        or (fields["attempted"] and not fields["requested"])
+        or (
+            fields["fallback_after_type_error"]
+            and (not fields["attempted"] or fields["effective"])
+        )
+    )
+    if contradictory:
+        raise ValueError("optimizer fused-runtime provenance is contradictory")
+    return fields
+
+
+def _optimizer_fused_report_fields(optimizer) -> dict[str, object]:
+    """Project fused-runtime provenance into the durable training report."""
+
+    runtime = _optimizer_fused_runtime_report(optimizer)
+    return {
+        # Retain the historical field as the realized mode so downstream
+        # readers cannot mistake an unsupported-backend fallback for fused
+        # execution.  The structured receipt preserves request/attempt detail.
+        "fused_optimizer": bool(runtime["effective"]),
+        "fused_optimizer_requested": bool(runtime["requested"]),
+        "fused_optimizer_runtime": runtime,
+    }
 
 
 def _preflight_required_feature_signal_modules(

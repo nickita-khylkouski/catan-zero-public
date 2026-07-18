@@ -5,6 +5,7 @@ import argparse
 import pytest
 import torch
 
+from tools import train_bc
 from tools.train_bc import _build_optimizer_param_groups, _make_optimizer
 
 
@@ -44,6 +45,14 @@ class _TinyPolicy(torch.nn.Module):
             torch.ones(2, 2),
             requires_grad=False,
         )
+
+
+class _TinySeparatedPolicy(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.backbone = torch.nn.Linear(4, 4)
+        self.value_head = torch.nn.Linear(4, 1)
+        self.action_encoder = torch.nn.Linear(4, 4)
 
 
 def _parameter_group_by_id(optimizer) -> dict[int, dict]:
@@ -122,6 +131,20 @@ def test_adamw_decay_split_preserves_each_lr_group_and_has_no_overlap() -> None:
     )
     optimizer = _make_optimizer(source_groups, _Args(), "cpu")
     by_id = _parameter_group_by_id(optimizer)
+    physical_identities = {
+        (group["group_name"], group["weight_decay_role"])
+        for group in optimizer.param_groups
+    }
+    assert physical_identities == {
+        ("base", "decay"),
+        ("base", "no_decay"),
+        ("value", "decay"),
+        ("value", "no_decay"),
+    }
+    assert {
+        (group["group_name"], group["weight_decay_role"])
+        for group in optimizer.state_dict()["param_groups"]
+    } == physical_identities
 
     value_ids = {
         id(parameter)
@@ -157,4 +180,94 @@ def test_adamw_decay_split_preserves_each_lr_group_and_has_no_overlap() -> None:
         ("base", "no_decay"),
         ("value", "decay"),
         ("value", "no_decay"),
+    }
+
+
+def test_optimizer_dose_distinguishes_value25_from_shared_action25_groups() -> None:
+    def _attested_groups(
+        model: _TinySeparatedPolicy,
+        *,
+        value_lr_mult: float,
+        shared_action_lr_mult: float,
+    ) -> dict[str, dict]:
+        source_groups = _build_optimizer_param_groups(
+            model,
+            base_lr=2e-4,
+            value_lr_mult=value_lr_mult,
+            shared_action_lr_mult=shared_action_lr_mult,
+            architecture="entity_graph",
+        )
+        optimizer = _make_optimizer(source_groups, _Args(), "cpu")
+        dose = train_bc._optimizer_lr_dose_attestation(
+            applied_updates=2,
+            schedule_multiplier_sum=2.0,
+            lr_area_by_group=[
+                2.0 * float(group["base_lr"])
+                for group in optimizer.param_groups
+            ],
+            optimizer=optimizer,
+        )
+        return {
+            str(row["semantic_group_name"]): row
+            for row in dose["parameter_groups"]
+        }
+
+    value_model = _TinySeparatedPolicy()
+    value_groups = _attested_groups(
+        value_model,
+        value_lr_mult=0.25,
+        shared_action_lr_mult=1.0,
+    )
+    shared_model = _TinySeparatedPolicy()
+    shared_groups = _attested_groups(
+        shared_model,
+        value_lr_mult=1.0,
+        shared_action_lr_mult=0.25,
+    )
+
+    assert set(value_groups) == {"base", "value"}
+    assert set(shared_groups) == {"base", "shared_action"}
+    assert value_groups["value"]["parameters"] == sum(
+        parameter.numel() for parameter in value_model.value_head.parameters()
+    )
+    assert shared_groups["shared_action"]["parameters"] == sum(
+        parameter.numel() for parameter in shared_model.action_encoder.parameters()
+    )
+    assert value_groups["value"]["parameter_tensors"] == 2
+    assert value_groups["value"]["optimizer_group_count"] == 2
+    assert shared_groups["shared_action"]["parameter_tensors"] == 2
+    assert shared_groups["shared_action"]["optimizer_group_count"] == 2
+    assert value_groups["value"]["base_lr"] == pytest.approx(5e-5)
+    assert shared_groups["shared_action"]["base_lr"] == pytest.approx(5e-5)
+
+
+def test_fused_typeerror_fallback_reports_effective_runtime_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_adamw = torch.optim.AdamW
+    calls: list[bool] = []
+
+    def _reject_fused(params, **kwargs):
+        calls.append(bool(kwargs.get("fused", False)))
+        if "fused" in kwargs:
+            raise TypeError("test backend rejects fused")
+        return real_adamw(params, **kwargs)
+
+    monkeypatch.setattr(torch.optim, "AdamW", _reject_fused)
+    optimizer = _make_optimizer(
+        _params(),
+        _args(optimizer="adamw", fused_optimizer=True),
+        "cuda:0",
+    )
+
+    assert calls == [True, False]
+    assert train_bc._optimizer_fused_report_fields(optimizer) == {
+        "fused_optimizer": False,
+        "fused_optimizer_requested": True,
+        "fused_optimizer_runtime": {
+            "requested": True,
+            "attempted": True,
+            "effective": False,
+            "fallback_after_type_error": True,
+        },
     }

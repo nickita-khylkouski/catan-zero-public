@@ -116,9 +116,11 @@ def test_optimizer_lr_dose_attests_integrated_area_per_group() -> None:
     assert dose["mean_schedule_multiplier"] == pytest.approx(0.625)
     assert dose["parameter_groups"] == [
         {
-            "group_index": 0,
-            "group_name": "base",
-            "weight_decay_role": "no_decay",
+            "semantic_group_name": "base",
+            "optimizer_group_indices": [0],
+            "optimizer_group_count": 1,
+            "parameter_tensors": 1,
+            "parameters": 1,
             "base_lr": pytest.approx(2.0e-4),
             "integrated_lr_area": pytest.approx(5.0e-4),
             "mean_applied_lr": pytest.approx(1.25e-4),
@@ -135,11 +137,15 @@ def test_optimizer_lr_dose_rejects_ambiguous_semantic_groups() -> None:
         [
             {
                 "params": [left],
+                "lr": 1.0e-4,
+                "base_lr": 1.0e-4,
                 "group_name": "value",
                 "weight_decay_role": "no_decay",
             },
             {
                 "params": [right],
+                "lr": 1.0e-4,
+                "base_lr": 1.0e-4,
                 "group_name": "value",
                 "weight_decay_role": "no_decay",
             },
@@ -152,6 +158,37 @@ def test_optimizer_lr_dose_rejects_ambiguous_semantic_groups() -> None:
             applied_updates=1,
             schedule_multiplier_sum=1.0,
             lr_area_by_group=[1.0e-4, 1.0e-4],
+            optimizer=optimizer,
+        )
+
+
+@pytest.mark.parametrize("field", ["base_lr", "lr", "area"])
+def test_optimizer_lr_dose_rejects_nonfinite_group_values(field: str) -> None:
+    import torch
+
+    parameter = torch.nn.Parameter(torch.tensor(1.0))
+    optimizer = torch.optim.Adam(
+        [
+            {
+                "params": [parameter],
+                "lr": 2.0e-4,
+                "base_lr": 2.0e-4,
+                "group_name": "value",
+                "weight_decay_role": "no_decay",
+            }
+        ]
+    )
+    area = 2.0e-4
+    if field == "area":
+        area = math.nan
+    else:
+        optimizer.param_groups[0][field] = math.nan
+
+    with pytest.raises(ValueError, match="finite"):
+        train_bc._optimizer_lr_dose_attestation(
+            applied_updates=1,
+            schedule_multiplier_sum=1.0,
+            lr_area_by_group=[area],
             optimizer=optimizer,
         )
 
