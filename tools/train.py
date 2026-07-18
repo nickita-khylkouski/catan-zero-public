@@ -711,6 +711,7 @@ def _bind_parent_report(
     report_path: str | Path,
     *,
     initialization: Mapping[str, Any],
+    canonical_authority: Mapping[str, Any],
 ) -> None:
     """Stamp diagnostic canonical runs with exact lineage, never eligibility.
 
@@ -728,6 +729,8 @@ def _bind_parent_report(
         raise SystemExit(f"cannot bind canonical parent report: {error}") from error
     if not isinstance(payload, dict):
         raise SystemExit("canonical parent report must be a JSON object")
+    if not isinstance(canonical_authority, Mapping) or not canonical_authority:
+        raise SystemExit("canonical parent report requires non-empty launch authority")
     steps = payload.get("steps_completed")
     sampled_rows = payload.get("base_training_row_draws")
     if (
@@ -755,6 +758,7 @@ def _bind_parent_report(
         raise SystemExit(f"canonical parent lineage refused: {error}") from error
     payload["a1_lineage_dose"] = dose
     payload["a1_parent_update_initialization"] = dict(initialization)
+    payload["a1_canonical_parent_update_authority"] = dict(canonical_authority)
     payload["promotion_eligible"] = False
     payload["promotion_block_reason"] = (
         "information_contract_migration_uncommissioned"
@@ -812,7 +816,11 @@ def main(argv: Sequence[str] | None = None) -> None:
     # Under torchrun every rank executes this wrapper. train_bc owns report
     # emission on rank zero, so only rank zero may seal the post-run binding.
     if int(os.environ.get("RANK", "0")) == 0:
-        _bind_parent_report(public_args.report, initialization=initialization)
+        _bind_parent_report(
+            public_args.report,
+            initialization=initialization,
+            canonical_authority=engine_args.a1_canonical_parent_update_authority,
+        )
 
 
 def _ensure_runtime_limits() -> None:

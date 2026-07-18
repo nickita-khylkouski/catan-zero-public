@@ -83,6 +83,48 @@ def test_parent_production_recipe_can_collect_two_signal_observations() -> None:
     assert engine["minimum_feature_learning_signal_observations"] == 2
 
 
+def test_parent_report_retains_canonical_launch_authority(tmp_path) -> None:
+    report = tmp_path / "train.report.json"
+    report.write_text(
+        json.dumps(
+            {
+                "steps_completed": 12,
+                "base_training_row_draws": 6_144,
+                # train_bc cannot bind this for an ordinary diagnostic corpus,
+                # but the canonical wrapper still owns the recipe identity.
+                "a1_canonical_parent_update_authority": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+    checkpoint_sha = "sha256:" + ("a" * 64)
+    initialization = {
+        "schema_version": "a1-canonical-parent-initializer-v1",
+        "mode": "exact_parent",
+        "parent": {"sha256": checkpoint_sha},
+        "initializer": {"sha256": checkpoint_sha},
+        "information_contract_migration": None,
+    }
+    authority = {
+        "schema_version": "a1-canonical-parent-update-runtime-authority-v1",
+        "config": str(PARENT_RECIPE),
+        "config_file_sha256": "sha256:" + ("b" * 64),
+        "diagnostic_only": True,
+        "promotion_eligible": False,
+    }
+
+    train._bind_parent_report(  # noqa: SLF001
+        report,
+        initialization=initialization,
+        canonical_authority=authority,
+    )
+
+    bound = json.loads(report.read_text(encoding="utf-8"))
+    assert bound["a1_canonical_parent_update_authority"] == authority
+    assert bound["a1_parent_update_initialization"] == initialization
+    assert bound["promotion_eligible"] is False
+
+
 def test_canonical_memmap_binds_authenticated_validation_manifest(tmp_path) -> None:
     corpus = tmp_path / "corpus"
     corpus.mkdir()
