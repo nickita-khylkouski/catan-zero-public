@@ -164,6 +164,83 @@ def _verified(tmp_path: Path) -> dict:
     }
 
 
+def _direct_stage_c_verified(tmp_path: Path) -> tuple[dict, Path, Path]:
+    verified = _verified(tmp_path)
+    parent = tmp_path / "v15.pt"
+    parent.write_bytes(b"exact-v15-parent")
+    selection_report = tmp_path / "v15-selection.json"
+    parent_recipe = dict(verified["recipe"])
+    parent_recipe.update(
+        {
+            "optimizer": "adamw",
+            "weight_decay": 0.01,
+            "fused_optimizer": True,
+            "resume_optimizer": False,
+        }
+    )
+    selection_report.write_text(
+        json.dumps(
+            {
+                "checkpoint": str(parent.resolve()),
+                "resume_optimizer": False,
+                "optimizer_restored": False,
+                "a1_effective_learner_training_recipe": parent_recipe,
+                "a1_effective_learner_training_recipe_sha256": (
+                    executor._value_sha256(parent_recipe)
+                ),
+            }
+        )
+    )
+    admission = tmp_path / "overlay.admission.json"
+    admission.write_text('{"stage_c":"admitted"}')
+    parent_ref = {
+        "path": str(parent.resolve()),
+        "sha256": executor._file_sha256(parent),
+    }
+    verified.update(
+        {
+            "reviewed_lock_file_sha256": verified["lock_file_sha256"],
+            "data_kind": "coherent_direct_memmap_v1",
+            "coherent_corpus_admission": {},
+            "stage_c_final_corpus_admission": None,
+            "stage_c_teacher": {
+                "target_reanalyzer_checkpoint": parent_ref,
+                "target_policy_target_identity_sha256": "sha256:" + "9" * 64,
+            },
+            "coherent_direct_corpus_binding": {
+                "schema_version": (
+                    executor.train_bc.COHERENT_DIRECT_CORPUS_BINDING_SCHEMA
+                ),
+                "corpus_admission": {
+                    "path": str(admission.resolve()),
+                    "file_sha256": executor._file_sha256(admission),
+                    "admission_sha256": "sha256:" + "8" * 64,
+                },
+                "learner_initializer": None,
+                "binding_sha256": "sha256:" + "7" * 64,
+            },
+        }
+    )
+    return verified, parent, selection_report
+
+
+def _write_direct_parent_authority(
+    tmp_path: Path,
+    *,
+    verified: dict,
+    parent: Path,
+    selection_report: Path,
+) -> Path:
+    path = tmp_path / "direct-parent-authority.json"
+    executor.issue_direct_independent_parent_authority(
+        verified,
+        parent_checkpoint_path=parent,
+        parent_training_report_path=selection_report,
+        output_path=path,
+    )
+    return path
+
+
 def _production_trainer_verified(tmp_path: Path) -> dict:
     verified = _verified(tmp_path)
     event_history_acknowledgements = [
@@ -2276,10 +2353,21 @@ def test_policy_game_weight_ablation_derives_authenticated_descriptor(
 ) -> None:
     verified, base_path, base = _descriptor_bound_production_verified(tmp_path)
     code_sha = "sha256:" + "7" * 64
+    trainer_path = Path(executor.train_bc.__file__).resolve()
     monkeypatch.setattr(
         executor,
         "_current_ablation_code_binding",
-        lambda _lock: {"code_tree_sha256": code_sha, "records": []},
+        lambda _lock: {
+            "code_tree_sha256": code_sha,
+            "records": [
+                {
+                    "kind": "learner_code",
+                    "relative_path": "tools/train_bc.py",
+                    "path": str(trainer_path),
+                    "sha256": executor._file_sha256(trainer_path),
+                }
+            ],
+        },
     )
     arm = executor.bind_learner_ablation(
         verified,
@@ -2508,6 +2596,116 @@ def test_reviewed_public_card_one_dose_renders_exact_eight_b200_command(
         "contract": 1.0,
         "effective": 4.0,
     }
+
+
+def test_direct_stage_c_parent_renders_v15_controls_without_fake_upgrade(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    verified, parent, selection_report = _direct_stage_c_verified(tmp_path)
+    authority = _write_direct_parent_authority(
+        tmp_path,
+        verified=verified,
+        parent=parent,
+        selection_report=selection_report,
+    )
+    bound = executor.bind_direct_independent_parent(verified, authority)
+    code_sha = "sha256:" + "7" * 64
+    trainer_path = Path(executor.train_bc.__file__).resolve()
+    monkeypatch.setattr(
+        executor,
+        "_current_ablation_code_binding",
+        lambda _lock: {
+            "code_tree_sha256": code_sha,
+            "records": [
+                {
+                    "kind": "learner_code",
+                    "relative_path": "tools/train_bc.py",
+                    "path": str(trainer_path),
+                    "sha256": executor._file_sha256(trainer_path),
+                }
+            ],
+        },
+    )
+    arm = executor.bind_learner_ablation(
+        bound,
+        ablation_id="stage-c-v15-direct-p0",
+        overrides_json=json.dumps(
+            {
+                "action_module_lr_mult": 0.25,
+                "policy_aux_completed_q_loss_weight": 0.1,
+                "max_steps": 32,
+                "policy_aux_active_batch_size": 64,
+                "policy_aux_loss_weight": 0.25,
+                "policy_aux_sampling_mode": (
+                    executor.train_bc.POLICY_AUX_SAMPLING_WEIGHTED_CYCLES_V1
+                ),
+                "shared_action_lr_mult": 0.25,
+                "target_reliability_confidence_weighting": True,
+                "target_reliability_confidence_floor": 0.25,
+                "trunk_lr_mult": 0.25,
+            }
+        ),
+        reviewed_code_tree_sha256=code_sha,
+        diagnostic_dose_curve=True,
+        diagnostic_checkpoint_steps="1,2,4,8,12,16,24",
+    )
+    arm = executor.bind_training_topology(
+        arm, topology=executor.B200_8GPU_DDP_TOPOLOGY, gpu=0
+    )
+    command = executor.build_train_command(
+        arm,
+        python=Path(sys.executable),
+        checkpoint=tmp_path / "candidate.pt",
+        report=tmp_path / "report.json",
+    )
+
+    assert arm["architecture_initializer"]["sha256"] == executor._file_sha256(parent)
+    assert arm.get("function_preserving_upgrade") is None
+    assert arm["learner_lineage_parent"]["fresh_optimizer"] is True
+    assert arm["learner_lineage_parent"]["optimizer_family"] == "adamw"
+    assert arm["recipe"]["optimizer"] == "adamw"
+    assert arm["recipe"]["weight_decay"] == pytest.approx(0.01)
+    assert arm["recipe"]["fused_optimizer"] is True
+    assert executor._learner_lineage_parent_sha256(arm) == executor._file_sha256(
+        parent
+    )
+    assert _option(command, "--init-checkpoint") == str(parent.resolve())
+    assert _option(command, "--action-module-lr-mult") == "0.25"
+    assert _option(command, "--completed-q-loss-weight") == "0.0"
+    assert _option(command, "--policy-aux-completed-q-loss-weight") == "0.1"
+    assert _option(command, "--policy-aux-sampling-mode") == (
+        executor.train_bc.POLICY_AUX_SAMPLING_WEIGHTED_CYCLES_V1
+    )
+    assert "--no-resume-optimizer" in command
+
+
+def test_direct_stage_c_parent_rejects_checkpoint_not_used_by_teacher(
+    tmp_path: Path,
+) -> None:
+    verified, parent, selection_report = _direct_stage_c_verified(tmp_path)
+    authority = _write_direct_parent_authority(
+        tmp_path,
+        verified=verified,
+        parent=parent,
+        selection_report=selection_report,
+    )
+    other = tmp_path / "other.pt"
+    other.write_bytes(b"not-the-stage-c-teacher")
+    payload = json.loads(authority.read_text())
+    payload["learner_parent"]["checkpoint"] = {
+        "path": str(other.resolve()),
+        "sha256": executor._file_sha256(other),
+    }
+    unsigned = dict(payload)
+    unsigned.pop("authority_sha256")
+    payload["authority_sha256"] = executor._value_sha256(unsigned)
+    authority.write_text(json.dumps(payload, indent=2, sort_keys=True))
+
+    with pytest.raises(
+        executor.ExecutorError,
+        match="checkpoint/fresh-optimizer authority",
+    ):
+        executor.bind_direct_independent_parent(verified, authority)
 
 
 def test_public_card_lr_multiplier_refuses_every_non_card_initializer(
@@ -3480,10 +3678,15 @@ def test_report_binding_seals_exact_base_value_and_policy_doses(
         "base_sampled_rows": 4_097,
         "policy_base_active_sampled_rows": 1_000,
         "policy_aux_active_sampled_rows": 256,
-        "policy_active_sampled_rows": 1_256,
-        "value_active_sampled_rows": 4_097,
-        "anchor_eligible_sampled_rows": 0,
-    }
+            "policy_active_sampled_rows": 1_256,
+            "value_active_sampled_rows": 4_097,
+            "anchor_eligible_sampled_rows": 0,
+            "completed_q_base_effective_weight_exposure": 0.0,
+            "completed_q_aux_effective_weight_exposure": 0.0,
+            "completed_q_base_active_rows": 0,
+            "completed_q_aux_active_rows": 0,
+            "completed_q_exposure_measurement_status": "bound_exactly",
+        }
     assert dose["current_sampled_rows"] == 4_097
 
 
@@ -3532,10 +3735,15 @@ def test_report_binding_seals_exact_ordinary_production_objective_dose(
         "base_sampled_rows": 4_097,
         "policy_base_active_sampled_rows": 777,
         "policy_aux_active_sampled_rows": 0,
-        "policy_active_sampled_rows": 777,
-        "value_active_sampled_rows": 4_097,
-        "anchor_eligible_sampled_rows": 0,
-    }
+            "policy_active_sampled_rows": 777,
+            "value_active_sampled_rows": 4_097,
+            "anchor_eligible_sampled_rows": 0,
+            "completed_q_base_effective_weight_exposure": 0.0,
+            "completed_q_aux_effective_weight_exposure": 0.0,
+            "completed_q_base_active_rows": 0,
+            "completed_q_aux_active_rows": 0,
+            "completed_q_exposure_measurement_status": "bound_exactly",
+        }
 
 
 def test_exact_policy_dose_binding_refuses_counter_drift(tmp_path: Path) -> None:

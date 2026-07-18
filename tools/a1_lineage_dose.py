@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any, Mapping
 
 LINEAGE_DOSE_SCHEMA = "a1-lineage-dose-v1"
@@ -81,7 +82,96 @@ def exact_objective_exposure_from_training_report(
         raise LineageDoseError(
             "exact anchor-eligible dose exceeds the base draw dose"
         )
-    return {
+    metrics = report_payload.get("metrics")
+    effective_recipe = report_payload.get("a1_effective_learner_training_recipe")
+    if not isinstance(effective_recipe, Mapping):
+        effective_recipe = {}
+    completed_q_base_enabled = float(
+        report_payload.get(
+            "completed_q_loss_weight",
+            effective_recipe.get("completed_q_loss_weight", 0.0),
+        )
+    ) != 0.0
+    completed_q_aux_enabled = float(
+        report_payload.get(
+            "policy_aux_completed_q_loss_weight",
+            effective_recipe.get("policy_aux_completed_q_loss_weight", 0.0),
+        )
+    ) != 0.0
+    if (
+        completed_q_base_enabled or completed_q_aux_enabled
+    ) and not (isinstance(metrics, list) and metrics):
+        raise LineageDoseError(
+            "enabled completed-Q objective lacks exact per-epoch exposure metrics"
+        )
+    completed_q_base_exposure = 0.0
+    completed_q_aux_exposure = 0.0
+    completed_q_base_active_rows = 0
+    completed_q_aux_active_rows = 0
+    for metric in metrics if isinstance(metrics, list) else ():
+        denominators = (
+            metric.get("loss_denominators")
+            if isinstance(metric, Mapping)
+            else None
+        )
+        if not isinstance(denominators, Mapping):
+            raise LineageDoseError(
+                "training report lacks completed-Q exposure denominators"
+            )
+        for key, destination in (
+            ("completed_q_loss", "base"),
+            ("policy_aux_completed_q_loss", "aux"),
+        ):
+            enabled = (
+                completed_q_base_enabled
+                if destination == "base"
+                else completed_q_aux_enabled
+            )
+            if enabled and key not in denominators:
+                raise LineageDoseError(
+                    f"enabled completed-Q objective lacks {key} exposure"
+                )
+            raw = denominators.get(key, 0.0)
+            if (
+                isinstance(raw, bool)
+                or not isinstance(raw, (int, float))
+                or not math.isfinite(float(raw))
+                or float(raw) < 0.0
+            ):
+                raise LineageDoseError(
+                    f"training report has invalid {key} exposure"
+                )
+            if destination == "base":
+                completed_q_base_exposure += float(raw)
+            else:
+                completed_q_aux_exposure += float(raw)
+        for key, destination in (
+            ("completed_q_active_rows", "base"),
+            ("policy_aux_completed_q_active_rows", "aux"),
+        ):
+            enabled = (
+                completed_q_base_enabled
+                if destination == "base"
+                else completed_q_aux_enabled
+            )
+            if enabled and key not in metric:
+                raise LineageDoseError(
+                    f"enabled completed-Q objective lacks {key} count"
+                )
+            raw = metric.get(key, 0)
+            if (
+                isinstance(raw, bool)
+                or not isinstance(raw, int)
+                or raw < 0
+            ):
+                raise LineageDoseError(
+                    f"training report has invalid {key} count"
+                )
+            if destination == "base":
+                completed_q_base_active_rows += raw
+            else:
+                completed_q_aux_active_rows += raw
+    result = {
         "measurement_status": "bound_exactly",
         "measurement_scope": "current_dose",
         "base_sampled_rows": values["base_training_row_draws"],
@@ -93,6 +183,20 @@ def exact_objective_exposure_from_training_report(
             "policy_kl_anchor_eligible_rows"
         ],
     }
+    result.update(
+        {
+            "completed_q_base_effective_weight_exposure": (
+                completed_q_base_exposure
+            ),
+            "completed_q_aux_effective_weight_exposure": (
+                completed_q_aux_exposure
+            ),
+            "completed_q_base_active_rows": completed_q_base_active_rows,
+            "completed_q_aux_active_rows": completed_q_aux_active_rows,
+            "completed_q_exposure_measurement_status": "bound_exactly",
+        }
+    )
+    return result
 
 
 def _positive_int(value: Any, field: str) -> int:
@@ -278,8 +382,46 @@ def validate_lineage_dose(value: Any) -> dict[str, Any]:
             "value_active_sampled_rows",
             "anchor_eligible_sampled_rows",
         }
-        if set(objective) != exact_fields or objective.get("measurement_scope") != "current_dose":
+        completed_q_fields = {
+            "completed_q_base_effective_weight_exposure",
+            "completed_q_aux_effective_weight_exposure",
+            "completed_q_base_active_rows",
+            "completed_q_aux_active_rows",
+            "completed_q_exposure_measurement_status",
+        }
+        if (
+            set(objective) != exact_fields | completed_q_fields
+            or objective.get("measurement_scope") != "current_dose"
+        ):
             raise LineageDoseError("lineage exact objective exposure schema drift")
+        if completed_q_fields.issubset(objective):
+            if objective["completed_q_exposure_measurement_status"] != "bound_exactly":
+                raise LineageDoseError("lineage completed-Q exposure status drift")
+            if any(
+                isinstance(objective[field], bool)
+                or not isinstance(objective[field], (int, float))
+                or not math.isfinite(float(objective[field]))
+                or float(objective[field]) < 0.0
+                for field in (
+                    "completed_q_base_effective_weight_exposure",
+                    "completed_q_aux_effective_weight_exposure",
+                )
+            ):
+                raise LineageDoseError(
+                    "lineage completed-Q exposure must be finite and non-negative"
+                )
+            if any(
+                isinstance(objective[field], bool)
+                or not isinstance(objective[field], int)
+                or objective[field] < 0
+                for field in (
+                    "completed_q_base_active_rows",
+                    "completed_q_aux_active_rows",
+                )
+            ):
+                raise LineageDoseError(
+                    "lineage completed-Q active-row counts must be non-negative integers"
+                )
         numeric_fields = exact_fields - {"measurement_status", "measurement_scope"}
         if any(
             isinstance(objective[field], bool)

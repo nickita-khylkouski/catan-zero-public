@@ -85,6 +85,21 @@ def test_coherent_public_belief_targets_are_admitted():
     assert report["policy_target_completeness"]["hard_action_fallback_rows"] == 0
 
 
+def test_aux_only_completed_q_is_an_active_search_target() -> None:
+    data = _data([TARGET_INFORMATION_REGIME_PUBLIC_COHERENT] * 3)
+    data["completed_q_values"] = np.tile(
+        np.asarray([[0.25, -0.25]], dtype=np.float32), (3, 1)
+    )
+    report = _admit(
+        data,
+        soft_target_weight=0.0,
+        policy_loss_weight=0.0,
+        completed_q_loss_weight=0.0,
+        policy_aux_completed_q_loss_weight=0.1,
+    )
+    assert report["search_target_objectives"] == ["completed_q_target"]
+
+
 def test_coherent_public_belief_rejects_sparse_soft_target_fallback():
     data = _data([TARGET_INFORMATION_REGIME_PUBLIC_COHERENT])
     data["target_policy_mask"][0, 1] = False

@@ -74,6 +74,9 @@ LEARNER_LINEAGE_PARENT_SCHEMA = "a1-learner-lineage-parent-v1"
 INDEPENDENT_PARENT_AUTHORITY_SCHEMA = (
     "a1-independent-diagnostic-learner-parent-authority-v1"
 )
+DIRECT_INDEPENDENT_PARENT_AUTHORITY_SCHEMA = (
+    "a1-direct-independent-diagnostic-learner-parent-authority-v1"
+)
 TRAINING_TRANSACTION_SCHEMA = "a1-one-dose-training-transaction-v1"
 PRODUCTION_TRAINER_AUTHORITY_SCHEMA = "a1-production-trainer-authority-v1"
 SEARCH_EVIDENCE_V1_SCHEMA = "gumbel_root_search_evidence_v1"
@@ -258,7 +261,11 @@ A1_LEARNER_ABLATION_FIELDS = frozenset(
         "lr",
         "lr_warmup_steps",
         "lr_schedule",
+        "optimizer",
+        "weight_decay",
+        "fused_optimizer",
         "value_lr_mult",
+        "action_module_lr_mult",
         "public_card_lr_mult",
         "shared_action_lr_mult",
         "trunk_lr_mult",
@@ -266,6 +273,9 @@ A1_LEARNER_ABLATION_FIELDS = frozenset(
         "policy_loss_weight",
         "policy_aux_active_batch_size",
         "policy_aux_loss_weight",
+        "policy_aux_sampling_mode",
+        "completed_q_loss_weight",
+        "policy_aux_completed_q_loss_weight",
         "policy_target_blend_semantics",
         "soft_target_source",
         "soft_target_weight",
@@ -1053,6 +1063,38 @@ def _input_binding(verified: dict[str, Any]) -> dict[str, Any]:
             else None
         ),
     }
+    direct_parent_authority = verified.get("independent_parent_authority")
+    if (
+        isinstance(direct_parent_authority, Mapping)
+        and direct_parent_authority.get("schema_version")
+        == DIRECT_INDEPENDENT_PARENT_AUTHORITY_SCHEMA
+    ):
+        payload["direct_parent_treatment"] = {
+            "schema_version": "a1-stage-c-direct-parent-treatment-v1",
+            "relationship_to_parent": "new_stage_c_diagnostic_treatment",
+            "dose_matched_continuation": False,
+            "fresh_optimizer": True,
+            "optimizer_family": recipe["optimizer"],
+            "weight_decay": recipe["weight_decay"],
+            "fused_optimizer": recipe["fused_optimizer"],
+            "max_steps": recipe["max_steps"],
+            "global_batch_size": recipe["global_batch_size"],
+            "lr": recipe["lr"],
+            "lr_warmup_steps": recipe["lr_warmup_steps"],
+            "lr_schedule": recipe["lr_schedule"],
+            "policy_kl_anchor_weight": recipe["policy_kl_anchor_weight"],
+            "policy_kl_anchor_direction": recipe.get(
+                "policy_kl_anchor_direction", "forward"
+            ),
+            "policy_kl_target": recipe.get("policy_kl_target"),
+            "effective_recipe_sha256": _value_sha256(recipe),
+            "parent_checkpoint_sha256": verified["architecture_initializer"][
+                "sha256"
+            ],
+            "parent_training_report": copy.deepcopy(
+                direct_parent_authority["learner_parent"]["training_report"]
+            ),
+        }
     if isinstance(verified.get("canonical_parent_update"), dict):
         payload["canonical_parent_update"] = copy.deepcopy(
             verified["canonical_parent_update"]
@@ -2285,6 +2327,41 @@ def _verify_coherent_direct_training_inputs(
         },
     }
     direct_binding["binding_sha256"] = _value_sha256(direct_binding)
+    stage_c_teacher = None
+    if overlay_evidence is not None:
+        overlay_receipt = overlay_evidence.get("receipt")
+        overlay_admission = overlay_evidence.get("admission")
+        overlay_section = (
+            overlay_admission.get("stage_c_policy_overlay")
+            if isinstance(overlay_admission, Mapping)
+            else None
+        )
+        teacher_checkpoint = (
+            overlay_receipt.get("target_reanalyzer_checkpoint")
+            if isinstance(overlay_receipt, Mapping)
+            else None
+        )
+        target_identity = (
+            overlay_section.get("target_policy_target_identity_sha256")
+            if isinstance(overlay_section, Mapping)
+            else None
+        )
+        if (
+            not isinstance(teacher_checkpoint, Mapping)
+            or not isinstance(teacher_checkpoint.get("path"), str)
+            or not isinstance(teacher_checkpoint.get("sha256"), str)
+            or not isinstance(target_identity, str)
+            or not target_identity.startswith("sha256:")
+        ):
+            raise ExecutorError(
+                "Stage-C overlay lost its exact reanalyzer checkpoint identity"
+            )
+        stage_c_teacher = {
+            "target_reanalyzer_checkpoint": copy.deepcopy(
+                dict(teacher_checkpoint)
+            ),
+            "target_policy_target_identity_sha256": target_identity,
+        }
     return {
         "lock": lock,
         "lock_path": lock_path,
@@ -2317,6 +2394,7 @@ def _verify_coherent_direct_training_inputs(
             final_admission if final_admission is not None else payload
         ),
         "stage_c_final_corpus_admission": copy.deepcopy(final_admission),
+        "stage_c_teacher": stage_c_teacher,
         "coherent_direct_corpus_binding": direct_binding,
     }
 
@@ -3856,6 +3934,28 @@ def bind_learner_ablation(
             "aux_subgoal_loss_weight ablation requires the receipt-backed "
             "shared aux-head initializer"
         )
+    optimizer_override_fields = {"optimizer", "weight_decay", "fused_optimizer"}
+    requested_optimizer_overrides = optimizer_override_fields & set(overrides)
+    direct_optimizer_contract = verified.get("direct_parent_optimizer_contract")
+    if requested_optimizer_overrides:
+        if requested_optimizer_overrides != optimizer_override_fields:
+            raise ExecutorError(
+                "direct-parent optimizer override must bind optimizer, "
+                "weight_decay, and fused_optimizer together"
+            )
+        if (
+            not isinstance(direct_optimizer_contract, Mapping)
+            or {
+                key: overrides[key] for key in sorted(optimizer_override_fields)
+            }
+            != {
+                key: direct_optimizer_contract[key]
+                for key in sorted(optimizer_override_fields)
+            }
+        ):
+            raise ExecutorError(
+                "optimizer override differs from direct-parent authority"
+            )
     public_card_lr_override = overrides.get("public_card_lr_mult")
     if type(public_card_lr_override) is float and public_card_lr_override != 1.0:
         bias_free_public_card_modules = {
@@ -3949,9 +4049,12 @@ def bind_learner_ablation(
             in {
                 "value_trunk_grad_scale",
                 "policy_aux_loss_weight",
+                "action_module_lr_mult",
                 "public_card_lr_mult",
                 "shared_action_lr_mult",
                 "trunk_lr_mult",
+                "completed_q_loss_weight",
+                "policy_aux_completed_q_loss_weight",
                 "policy_kl_target",
                 "policy_kl_dual_lr",
                 "policy_kl_max_weight",
@@ -3965,7 +4068,11 @@ def bind_learner_ablation(
             }
             else str
             if key
-            in {"policy_kl_anchor_direction", "policy_target_blend_semantics"}
+            in {
+                "policy_kl_anchor_direction",
+                "policy_target_blend_semantics",
+                "policy_aux_sampling_mode",
+            }
             else type(bound[key])
         )
         if type(value) is not expected_type:
@@ -3974,12 +4081,25 @@ def bind_learner_ablation(
                 f"{expected_type.__name__}, got {type(value).__name__}"
             )
         effective[key] = value
+    if isinstance(direct_optimizer_contract, Mapping):
+        effective_optimizer = {
+            "optimizer": effective.get("optimizer"),
+            "weight_decay": effective.get("weight_decay"),
+            "fused_optimizer": effective.get("fused_optimizer"),
+            "resume_optimizer": effective.get("resume_optimizer"),
+        }
+        if effective_optimizer != dict(direct_optimizer_contract):
+            raise ExecutorError(
+                "effective learner optimizer differs from direct-parent authority"
+            )
     numeric_domains: dict[str, tuple[float | None, float | None, bool]] = {
         "epochs": (1.0, None, True),
         "max_steps": (1.0, None, True),
         "lr": (0.0, None, False),
         "lr_warmup_steps": (0.0, None, True),
+        "weight_decay": (0.0, None, True),
         "value_lr_mult": (0.0, None, False),
+        "action_module_lr_mult": (0.0, 1.0, False),
         "public_card_lr_mult": (0.0, None, False),
         "shared_action_lr_mult": (0.0, 1.0, False),
         "trunk_lr_mult": (0.0, 1.0, False),
@@ -3987,6 +4107,8 @@ def bind_learner_ablation(
         "policy_loss_weight": (0.0, None, True),
         "policy_aux_active_batch_size": (0.0, None, True),
         "policy_aux_loss_weight": (0.0, 4.0, False),
+        "completed_q_loss_weight": (0.0, None, True),
+        "policy_aux_completed_q_loss_weight": (0.0, None, True),
         "soft_target_weight": (0.0, 1.0, True),
         "soft_target_temperature": (0.0, None, False),
         "soft_target_min_legal_coverage": (0.0, 1.0, True),
@@ -4008,6 +4130,7 @@ def bind_learner_ablation(
     }
     enum_domains = {
         "lr_schedule": {"flat", "cosine", "linear"},
+        "optimizer": {"adam", "adamw"},
         "soft_target_source": {"prefer_policy", "prefer_scores", "policy", "scores"},
         "advantage_policy_weighting": {"none", "outcome_value"},
         "per_game_policy_weight_mode": {"equal", "sqrt"},
@@ -4020,6 +4143,7 @@ def bind_learner_ablation(
         "policy_target_blend_semantics": set(
             train_bc.POLICY_TARGET_BLEND_SEMANTICS
         ),
+        "policy_aux_sampling_mode": set(train_bc.POLICY_AUX_SAMPLING_MODES),
     }
     for key, value in overrides.items():
         if key in numeric_domains:
@@ -4135,6 +4259,13 @@ def bind_learner_ablation(
             "contract": 1.0,
             "effective": effective["public_card_lr_mult"],
         }
+    if float(effective.get("action_module_lr_mult", 1.0)) != float(
+        bound.get("action_module_lr_mult", 1.0)
+    ):
+        drift["action_module_lr_mult"] = {
+            "contract": float(bound.get("action_module_lr_mult", 1.0)),
+            "effective": float(effective["action_module_lr_mult"]),
+        }
     if effective.get("shared_action_lr_mult", 1.0) != 1.0:
         drift["shared_action_lr_mult"] = {
             "contract": 1.0,
@@ -4144,6 +4275,26 @@ def bind_learner_ablation(
         drift["trunk_lr_mult"] = {
             "contract": float(bound.get("trunk_lr_mult", 1.0)),
             "effective": effective["trunk_lr_mult"],
+        }
+    if effective.get(
+        "policy_aux_sampling_mode",
+        train_bc.POLICY_AUX_SAMPLING_LEGACY_REPLACEMENT_V1,
+    ) != (
+        train_bc.POLICY_AUX_SAMPLING_LEGACY_REPLACEMENT_V1
+    ):
+        drift["policy_aux_sampling_mode"] = {
+            "contract": train_bc.POLICY_AUX_SAMPLING_LEGACY_REPLACEMENT_V1,
+            "effective": effective["policy_aux_sampling_mode"],
+        }
+    if float(effective.get("completed_q_loss_weight", 0.0)) != 0.0:
+        drift["completed_q_loss_weight"] = {
+            "contract": 0.0,
+            "effective": float(effective["completed_q_loss_weight"]),
+        }
+    if float(effective.get("policy_aux_completed_q_loss_weight", 0.0)) != 0.0:
+        drift["policy_aux_completed_q_loss_weight"] = {
+            "contract": 0.0,
+            "effective": float(effective["policy_aux_completed_q_loss_weight"]),
         }
     if effective.get("per_game_policy_surprise_weighting", False):
         drift["per_game_policy_surprise_weighting"] = {
@@ -6303,6 +6454,10 @@ def _build_direct_train_command(
             str(recipe["final_vp_loss_weight"]),
             "--q-loss-weight",
             str(recipe["q_loss_weight"]),
+            "--completed-q-loss-weight",
+            str(recipe.get("completed_q_loss_weight", 0.0)),
+            "--policy-aux-completed-q-loss-weight",
+            str(recipe.get("policy_aux_completed_q_loss_weight", 0.0)),
             "--policy-kl-anchor-weight",
             str(recipe["policy_kl_anchor_weight"]),
             "--policy-kl-anchor-direction",
@@ -6410,6 +6565,17 @@ def _build_direct_train_command(
         command.append("--target-reliability-confidence-weighting")
     else:
         command.append("--no-target-reliability-confidence-weighting")
+    command.extend(
+        [
+            "--policy-aux-sampling-mode",
+            str(
+                recipe.get(
+                    "policy_aux_sampling_mode",
+                    train_bc.POLICY_AUX_SAMPLING_LEGACY_REPLACEMENT_V1,
+                )
+            ),
+        ]
+    )
     if recipe.get("forced_row_value_action_type_weights"):
         command.extend(
             [
@@ -6943,6 +7109,430 @@ def _verify_independent_parent_authority(
             "independent learner-parent authority differs from verified corpus/upgrade"
         )
     return copy.deepcopy(payload)
+
+
+def _direct_checkpoint_reference(
+    value: object, *, where: str
+) -> dict[str, str]:
+    if not isinstance(value, Mapping) or set(value) != {"path", "sha256"}:
+        raise ExecutorError(f"{where} checkpoint reference shape drift")
+    path, digest = _stable_canonical_regular_file(
+        str(value["path"]), where=f"{where} checkpoint"
+    )
+    if digest != value["sha256"]:
+        raise ExecutorError(f"{where} checkpoint bytes drifted")
+    return {"path": str(path), "sha256": digest}
+
+
+def _direct_parent_optimizer_contract_from_report(
+    report_path: Path, *, parent_checkpoint: Mapping[str, str]
+) -> tuple[dict[str, Any], dict[str, str]]:
+    resolved, report_digest = _stable_canonical_regular_file(
+        report_path, where="direct independent parent training report"
+    )
+    try:
+        report = json.loads(resolved.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise ExecutorError(
+            f"cannot load direct independent parent training report: {error}"
+        ) from error
+    recipe = (
+        report.get("a1_effective_learner_training_recipe")
+        if isinstance(report, Mapping)
+        else None
+    )
+    recipe_sha = (
+        report.get("a1_effective_learner_training_recipe_sha256")
+        if isinstance(report, Mapping)
+        else None
+    )
+    checkpoint_value = report.get("checkpoint") if isinstance(report, Mapping) else None
+    try:
+        report_checkpoint = Path(str(checkpoint_value)).expanduser().resolve(
+            strict=True
+        )
+    except OSError as error:
+        raise ExecutorError(
+            f"direct parent report checkpoint cannot be resolved: {error}"
+        ) from error
+    expected_parent_path = Path(parent_checkpoint["path"]).resolve(strict=True)
+    if (
+        not isinstance(recipe, Mapping)
+        or recipe_sha != _value_sha256(dict(recipe))
+        or report_checkpoint != expected_parent_path
+        or _file_sha256(report_checkpoint) != parent_checkpoint["sha256"]
+        or report.get("resume_optimizer") is not False
+        or report.get("optimizer_restored") is not False
+        or recipe.get("resume_optimizer") is not False
+        or recipe.get("optimizer") not in {"adam", "adamw"}
+        or isinstance(recipe.get("weight_decay"), bool)
+        or not isinstance(recipe.get("weight_decay"), (int, float))
+        or not math.isfinite(float(recipe["weight_decay"]))
+        or float(recipe["weight_decay"]) < 0.0
+        or type(recipe.get("fused_optimizer")) is not bool
+    ):
+        raise ExecutorError(
+            "direct independent parent training report lost exact checkpoint/"
+            "fresh-optimizer authority"
+        )
+    return (
+        {
+            "optimizer": str(recipe["optimizer"]),
+            "weight_decay": float(recipe["weight_decay"]),
+            "fused_optimizer": bool(recipe["fused_optimizer"]),
+            "resume_optimizer": False,
+        },
+        {"path": str(resolved), "file_sha256": report_digest},
+    )
+
+
+def _verify_direct_independent_parent_authority(
+    path: Path,
+    *,
+    verified: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Authenticate an exact Stage-C teacher as a fresh diagnostic parent.
+
+    Unlike the historical independent-parent authority, this path performs no
+    architecture migration.  The initializer must be byte-identical to the
+    checkpoint that produced the admitted Stage-C targets.
+    """
+
+    resolved, file_digest = _stable_canonical_regular_file(
+        path, where="direct independent learner-parent authority"
+    )
+    try:
+        payload = json.loads(resolved.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise ExecutorError(
+            f"cannot load direct independent learner-parent authority: {error}"
+        ) from error
+    expected_keys = {
+        "schema_version",
+        "diagnostic_only",
+        "promotion_eligible",
+        "corpus_binding",
+        "learner_parent",
+        "stage_c_teacher",
+        "optimizer_contract",
+        "fresh_optimizer_required",
+        "authority_sha256",
+    }
+    if not isinstance(payload, dict) or set(payload) != expected_keys:
+        raise ExecutorError("direct independent learner-parent authority shape drift")
+    unsigned = dict(payload)
+    stated = unsigned.pop("authority_sha256", None)
+    if (
+        payload.get("schema_version")
+        != DIRECT_INDEPENDENT_PARENT_AUTHORITY_SCHEMA
+        or payload.get("diagnostic_only") is not True
+        or payload.get("promotion_eligible") is not False
+        or payload.get("fresh_optimizer_required") is not True
+        or stated != _value_sha256(unsigned)
+    ):
+        raise ExecutorError(
+            "direct independent learner-parent authority digest/role drift"
+        )
+
+    admission = payload.get("corpus_binding", {}).get(
+        "coherent_corpus_admission"
+    )
+    if not isinstance(admission, dict) or set(admission) != {
+        "path",
+        "file_sha256",
+        "admission_sha256",
+    }:
+        raise ExecutorError("direct independent parent lost corpus admission")
+    admission_path, admission_digest = _stable_canonical_regular_file(
+        str(admission["path"]), where="direct independent parent corpus admission"
+    )
+    if admission_digest != admission["file_sha256"]:
+        raise ExecutorError("direct independent parent corpus admission bytes drifted")
+
+    data_path = Path(str(verified["data_path"])).expanduser().resolve(strict=True)
+    verified_binding = verified.get("coherent_direct_corpus_binding")
+    verified_admission = (
+        verified_binding.get("corpus_admission")
+        if isinstance(verified_binding, Mapping)
+        else None
+    )
+    if not isinstance(verified_admission, Mapping):
+        raise ExecutorError("verified coherent corpus lost its admission binding")
+    verified_admission = copy.deepcopy(dict(verified_admission))
+    verified_admission["path"] = str(
+        Path(str(verified_admission["path"])).expanduser().resolve(strict=True)
+    )
+    expected_corpus = {
+        "data_path": str(data_path),
+        "corpus_meta_file_sha256": verified.get("corpus_meta_file_sha256"),
+        "payload_inventory_sha256": verified.get("payload_inventory_sha256"),
+        "data_fingerprint": verified.get("data_fingerprint"),
+        "producer_checkpoint": copy.deepcopy(verified.get("producer")),
+        "coherent_corpus_admission": copy.deepcopy(dict(verified_admission)),
+    }
+    teacher = verified.get("stage_c_teacher")
+    if not isinstance(teacher, Mapping):
+        raise ExecutorError(
+            "direct independent parent requires an admitted Stage-C overlay"
+        )
+    expected_teacher = {
+        "target_reanalyzer_checkpoint": _direct_checkpoint_reference(
+            teacher.get("target_reanalyzer_checkpoint"),
+            where="Stage-C target reanalyzer",
+        ),
+        "target_policy_target_identity_sha256": teacher.get(
+            "target_policy_target_identity_sha256"
+        ),
+    }
+    parent_section = payload.get("learner_parent")
+    if not isinstance(parent_section, Mapping) or set(parent_section) != {
+        "checkpoint",
+        "training_report",
+    }:
+        raise ExecutorError("direct independent learner parent shape drift")
+    parent = _direct_checkpoint_reference(
+        parent_section["checkpoint"], where="direct independent learner parent"
+    )
+    report = parent_section["training_report"]
+    if not isinstance(report, Mapping) or set(report) != {"path", "file_sha256"}:
+        raise ExecutorError("direct independent parent training report shape drift")
+    report_optimizer, report_ref = _direct_parent_optimizer_contract_from_report(
+        Path(str(report["path"])), parent_checkpoint=parent
+    )
+    if report_ref["file_sha256"] != report["file_sha256"]:
+        raise ExecutorError("direct independent parent training report bytes drifted")
+    expected_parent = {
+        "checkpoint": parent,
+        "training_report": report_ref,
+    }
+    optimizer_contract = payload.get("optimizer_contract")
+    if (
+        not isinstance(optimizer_contract, Mapping)
+        or set(optimizer_contract)
+        != {"optimizer", "weight_decay", "fused_optimizer", "resume_optimizer"}
+        or optimizer_contract.get("optimizer") not in {"adam", "adamw"}
+        or isinstance(optimizer_contract.get("weight_decay"), bool)
+        or not isinstance(optimizer_contract.get("weight_decay"), (int, float))
+        or not math.isfinite(float(optimizer_contract["weight_decay"]))
+        or float(optimizer_contract["weight_decay"]) < 0.0
+        or type(optimizer_contract.get("fused_optimizer")) is not bool
+        or optimizer_contract.get("resume_optimizer") is not False
+        or dict(optimizer_contract) != report_optimizer
+    ):
+        raise ExecutorError("direct independent parent optimizer authority drift")
+    if (
+        payload.get("corpus_binding") != expected_corpus
+        or payload.get("learner_parent") != expected_parent
+        or payload.get("stage_c_teacher") != expected_teacher
+        or parent != expected_teacher["target_reanalyzer_checkpoint"]
+    ):
+        raise ExecutorError(
+            "direct independent learner parent differs from the admitted Stage-C "
+            "teacher/corpus"
+        )
+    result = copy.deepcopy(payload)
+    result["_authority_file"] = {
+        "path": str(resolved),
+        "file_sha256": file_digest,
+    }
+    return result
+
+
+def issue_direct_independent_parent_authority(
+    verified: Mapping[str, Any],
+    *,
+    parent_checkpoint_path: Path,
+    parent_training_report_path: Path,
+    output_path: Path,
+) -> dict[str, Any]:
+    """Issue the only handoff accepted by the exact Stage-C parent path."""
+
+    teacher = verified.get("stage_c_teacher")
+    if not isinstance(teacher, Mapping):
+        raise ExecutorError(
+            "direct parent authority issuance requires a verified Stage-C overlay"
+        )
+    parent_path, parent_digest = _stable_canonical_regular_file(
+        parent_checkpoint_path, where="direct independent learner parent checkpoint"
+    )
+    parent = {"path": str(parent_path), "sha256": parent_digest}
+    teacher_parent = _direct_checkpoint_reference(
+        teacher.get("target_reanalyzer_checkpoint"),
+        where="Stage-C target reanalyzer",
+    )
+    if parent != teacher_parent:
+        raise ExecutorError(
+            "direct learner parent is not the checkpoint that produced Stage-C targets"
+        )
+    optimizer_contract, report_ref = (
+        _direct_parent_optimizer_contract_from_report(
+            parent_training_report_path, parent_checkpoint=parent
+        )
+    )
+    coherent_binding = verified.get("coherent_direct_corpus_binding")
+    admission = (
+        coherent_binding.get("corpus_admission")
+        if isinstance(coherent_binding, Mapping)
+        else None
+    )
+    if not isinstance(admission, Mapping):
+        raise ExecutorError(
+            "direct parent authority issuance requires coherent corpus admission"
+        )
+    payload: dict[str, Any] = {
+        "schema_version": DIRECT_INDEPENDENT_PARENT_AUTHORITY_SCHEMA,
+        "diagnostic_only": True,
+        "promotion_eligible": False,
+        "corpus_binding": {
+            "data_path": str(
+                Path(str(verified["data_path"])).expanduser().resolve(strict=True)
+            ),
+            "corpus_meta_file_sha256": verified.get("corpus_meta_file_sha256"),
+            "payload_inventory_sha256": verified.get("payload_inventory_sha256"),
+            "data_fingerprint": verified.get("data_fingerprint"),
+            "producer_checkpoint": copy.deepcopy(verified.get("producer")),
+            "coherent_corpus_admission": copy.deepcopy(dict(admission)),
+        },
+        "learner_parent": {
+            "checkpoint": parent,
+            "training_report": report_ref,
+        },
+        "stage_c_teacher": {
+            "target_reanalyzer_checkpoint": teacher_parent,
+            "target_policy_target_identity_sha256": teacher.get(
+                "target_policy_target_identity_sha256"
+            ),
+        },
+        "optimizer_contract": optimizer_contract,
+        "fresh_optimizer_required": True,
+    }
+    payload["authority_sha256"] = _value_sha256(payload)
+    output = output_path.expanduser()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with output.open("x", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+    except FileExistsError as error:
+        raise ExecutorError(
+            f"direct parent authority already exists: {output}"
+        ) from error
+    # Replay the just-issued bytes through the consumer verifier. This proves
+    # the runnable handoff rather than merely serializing a plausible object.
+    replayed = _verify_direct_independent_parent_authority(
+        output.resolve(strict=True), verified=verified
+    )
+    replayed.pop("_authority_file", None)
+    return replayed
+
+
+def bind_direct_independent_parent(
+    verified: dict[str, Any], authority_path: Path
+) -> dict[str, Any]:
+    """Use the exact admitted Stage-C teacher as a fresh diagnostic initializer."""
+
+    if verified.get("learner_ablation") is not None:
+        raise ExecutorError(
+            "direct independent parent must be bound before learner ablation"
+        )
+    if verified.get("stage_c_final_corpus_admission") is not None:
+        raise ExecutorError(
+            "Stage-C final replication cannot use diagnostic direct-parent authority"
+        )
+    if verified.get("function_preserving_upgrade") is not None:
+        raise ExecutorError(
+            "direct independent parent cannot also claim an architecture upgrade"
+        )
+    recipe = verified.get("recipe")
+    if not isinstance(recipe, Mapping) or recipe.get("resume_optimizer") is not False:
+        raise ExecutorError(
+            "direct independent parent requires fresh optimizer-state semantics"
+        )
+    authority = _verify_direct_independent_parent_authority(
+        authority_path, verified=verified
+    )
+    parent = copy.deepcopy(authority["learner_parent"]["checkpoint"])
+    authority_file = authority.pop("_authority_file")
+    comparison = {
+        "schema_version": "a1-diagnostic-independent-parent-v2",
+        "role": "independent_parent",
+        "initializer_kind": "exact_checkpoint",
+        "source": copy.deepcopy(parent),
+        "sealed_producer": copy.deepcopy(verified["producer"]),
+        "authority": {
+            **authority_file,
+            "authority_sha256": authority["authority_sha256"],
+        },
+        "diagnostic_only": True,
+        "promotion_eligible": False,
+    }
+    lineage_parent = {
+        "schema_version": LEARNER_LINEAGE_PARENT_SCHEMA,
+        "role": "diagnostic_independent_parent",
+        "initializer_kind": "exact_checkpoint",
+        "checkpoint": copy.deepcopy(parent),
+        "corpus_producer": copy.deepcopy(verified["producer"]),
+        "independent_parent_authority_sha256": authority["authority_sha256"],
+        "function_preserving_upgrade_receipt_sha256": None,
+        "fresh_optimizer": True,
+        "optimizer_family": authority["optimizer_contract"]["optimizer"],
+        "resume_optimizer": False,
+        "candidate_chaining": False,
+        "diagnostic_only": True,
+        "promotion_eligible": False,
+    }
+    coherent_binding = verified.get("coherent_direct_corpus_binding")
+    if not isinstance(coherent_binding, dict):
+        raise ExecutorError(
+            "direct independent parent requires a coherent direct corpus"
+        )
+    coherent_binding = copy.deepcopy(coherent_binding)
+    coherent_binding["learner_initializer"] = {
+        "role": "diagnostic_exact_parent",
+        "parent_checkpoint_sha256": parent["sha256"],
+        "initializer_checkpoint_sha256": parent["sha256"],
+        "initializer_kind": "exact_checkpoint",
+        "independent_parent_authority_sha256": authority["authority_sha256"],
+        "fresh_optimizer": True,
+        "optimizer_family": authority["optimizer_contract"]["optimizer"],
+        "resume_optimizer": False,
+        "candidate_chaining": False,
+    }
+    coherent_binding.pop("binding_sha256", None)
+    coherent_binding["binding_sha256"] = _value_sha256(coherent_binding)
+    result = dict(verified)
+    effective_recipe = dict(verified["recipe"])
+    effective_recipe.update(
+        {
+            "optimizer": authority["optimizer_contract"]["optimizer"],
+            "weight_decay": authority["optimizer_contract"]["weight_decay"],
+            "fused_optimizer": authority["optimizer_contract"]["fused_optimizer"],
+            "resume_optimizer": False,
+        }
+    )
+    result["recipe"] = effective_recipe
+    result["architecture_initializer"] = copy.deepcopy(parent)
+    result["diagnostic_comparison_source"] = comparison
+    result["independent_parent_authority"] = copy.deepcopy(authority)
+    result["direct_parent_optimizer_contract"] = copy.deepcopy(
+        authority["optimizer_contract"]
+    )
+    result["learner_lineage_parent"] = lineage_parent
+    result["coherent_direct_corpus_binding"] = coherent_binding
+    result["claim_identity_sha256"] = _value_sha256(
+        {
+            "schema_version": "a1-direct-independent-parent-training-identity-v1",
+            "contract_sha256": verified["contract_sha256"],
+            "parent_checkpoint_sha256": parent["sha256"],
+            "independent_parent_authority_sha256": authority["authority_sha256"],
+            "coherent_direct_corpus_binding_sha256": coherent_binding[
+                "binding_sha256"
+            ],
+        }
+    )
+    return result
 
 
 def bind_function_preserving_upgrade(
@@ -9148,9 +9738,27 @@ def _learner_lineage_parent_sha256(verified: Mapping[str, Any]) -> str:
         and parent.get("role") == "diagnostic_independent_parent"
     ):
         authority = verified.get("independent_parent_authority")
+        direct_parent = (
+            isinstance(authority, Mapping)
+            and authority.get("schema_version")
+            == DIRECT_INDEPENDENT_PARENT_AUTHORITY_SCHEMA
+        )
         expected_independent = {
             "schema_version": LEARNER_LINEAGE_PARENT_SCHEMA,
             "role": "diagnostic_independent_parent",
+            **(
+                {
+                    "initializer_kind": "exact_checkpoint",
+                    "fresh_optimizer": True,
+                    "optimizer_family": authority.get("optimizer_contract", {}).get(
+                        "optimizer"
+                    ),
+                    "resume_optimizer": False,
+                    "candidate_chaining": False,
+                }
+                if direct_parent
+                else {}
+            ),
             "checkpoint": copy.deepcopy(
                 diagnostic.get("source") if isinstance(diagnostic, Mapping) else None
             ),
@@ -9172,11 +9780,27 @@ def _learner_lineage_parent_sha256(verified: Mapping[str, Any]) -> str:
             or diagnostic.get("diagnostic_only") is not True
             or diagnostic.get("promotion_eligible") is not False
             or not isinstance(authority, Mapping)
-            or authority.get("schema_version") != INDEPENDENT_PARENT_AUTHORITY_SCHEMA
-            or not isinstance(upgrade, Mapping)
+            or authority.get("schema_version")
+            not in {
+                INDEPENDENT_PARENT_AUTHORITY_SCHEMA,
+                DIRECT_INDEPENDENT_PARENT_AUTHORITY_SCHEMA,
+            }
+            or (not direct_parent and not isinstance(upgrade, Mapping))
+            or (direct_parent and upgrade is not None)
             or not isinstance(checkpoint, Mapping)
             or dict(parent) != expected_independent
-            or checkpoint.get("sha256") != upgrade.get("source_checkpoint_sha256")
+            or (
+                not direct_parent
+                and checkpoint.get("sha256")
+                != upgrade.get("source_checkpoint_sha256")
+            )
+            or (
+                direct_parent
+                and checkpoint.get("sha256")
+                != authority.get("learner_parent", {})
+                .get("checkpoint", {})
+                .get("sha256")
+            )
         ):
             raise ExecutorError(
                 "diagnostic learner lineage parent lost independent-parent authority"
@@ -11283,8 +11907,6 @@ def _replay_completed_ablation_receipt_authority(
     upgrade_receipt_path = (
         upgrade_receipt.get("path") if isinstance(upgrade_receipt, dict) else None
     )
-    if not isinstance(upgrade_receipt_path, str):
-        raise ExecutorError("completed ablation lacks upgrade receipt authority")
     diagnostic_source = input_binding.get("diagnostic_comparison_source")
     independent_authority = (
         diagnostic_source.get("authority")
@@ -11298,11 +11920,27 @@ def _replay_completed_ablation_receipt_authority(
     )
     if not isinstance(independent_authority_path, str):
         raise ExecutorError("completed ablation lacks independent-parent authority")
-    reconstructed = bind_function_preserving_upgrade(
-        replayed,
-        Path(upgrade_receipt_path),
-        independent_parent_authority_path=Path(independent_authority_path),
+    initializer_kind = (
+        diagnostic_source.get("initializer_kind")
+        if isinstance(diagnostic_source, dict)
+        else None
     )
+    if initializer_kind == "exact_checkpoint":
+        if upgrade_receipt_path is not None:
+            raise ExecutorError(
+                "completed direct-parent ablation unexpectedly claims an upgrade"
+            )
+        reconstructed = bind_direct_independent_parent(
+            replayed, Path(independent_authority_path)
+        )
+    else:
+        if not isinstance(upgrade_receipt_path, str):
+            raise ExecutorError("completed ablation lacks upgrade receipt authority")
+        reconstructed = bind_function_preserving_upgrade(
+            replayed,
+            Path(upgrade_receipt_path),
+            independent_parent_authority_path=Path(independent_authority_path),
+        )
     code_binding = learner_ablation.get("code_binding")
     reporting = learner_ablation.get("reporting_contract")
     if not isinstance(code_binding, dict) or not isinstance(reporting, dict):
@@ -13163,11 +13801,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.independent_parent_authority is not None and (
             not args.diagnostic_dose_curve
             or not generic_ablation_requested
-            or args.architecture_upgrade_receipt is None
         ):
             raise ExecutorError(
                 "--independent-parent-authority requires a generic diagnostic "
-                "dose curve and --architecture-upgrade-receipt"
+                "dose curve"
             )
         if args.fresh_policy_distillation_only and not generic_ablation_requested:
             raise ExecutorError(
@@ -13219,6 +13856,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 allow_diagnostic_recent_history_source=bool(args.diagnostic_dose_curve),
                 independent_parent_authority_path=(args.independent_parent_authority),
                 allow_stage_c_final_current_parent=stage_c_final_requested,
+            )
+        elif args.independent_parent_authority is not None:
+            verified = bind_direct_independent_parent(
+                verified, args.independent_parent_authority
             )
         if args.information_contract_migration_receipt is not None:
             verified = bind_information_contract_migration(

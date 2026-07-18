@@ -182,6 +182,11 @@ def test_parent_report_retains_canonical_launch_authority(tmp_path) -> None:
         "policy_active_sampled_rows": 1_399,
         "value_active_sampled_rows": 6_144,
         "anchor_eligible_sampled_rows": 0,
+        "completed_q_base_effective_weight_exposure": 0.0,
+        "completed_q_aux_effective_weight_exposure": 0.0,
+        "completed_q_base_active_rows": 0,
+        "completed_q_aux_active_rows": 0,
+        "completed_q_exposure_measurement_status": "bound_exactly",
     }
 
 

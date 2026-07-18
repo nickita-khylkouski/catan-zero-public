@@ -632,6 +632,100 @@ def test_q_only_training_keeps_shared_action_gradients(tmp_path) -> None:
     assert not torch.equal(action_weight.detach(), before)
 
 
+def test_policy_aux_completed_q_is_an_independent_selected_root_objective(
+    tmp_path,
+) -> None:
+    import torch
+
+    data = _write_and_load_shard(tmp_path, _collect_real_samples(6))
+    legal = np.asarray(data["legal_action_ids"])
+    completed_q = np.full(legal.shape, np.nan, dtype=np.float32)
+    completed_q_mask = legal >= 0
+    for row in range(legal.shape[0]):
+        count = int(np.count_nonzero(completed_q_mask[row]))
+        completed_q[row, :count] = np.linspace(
+            -0.75, 0.75, count, dtype=np.float32
+        )
+    data["completed_q_values"] = completed_q
+    data["completed_q_mask"] = completed_q_mask
+    data["target_reliability_confidence"] = np.ones(
+        len(data["action_taken"]), dtype=np.float32
+    )
+
+    batch = np.arange(len(data["action_taken"]))
+    policy_weights = np.ones(len(batch), dtype=np.float32)
+    value_weights = np.zeros(len(batch), dtype=np.float32)
+    policy = _make_entity_policy()
+    optimizer = torch.optim.SGD(policy.model.parameters(), lr=1e-2)
+
+    metrics = _train_entity_batch(
+        policy,
+        optimizer,
+        data,
+        batch,
+        policy_weights,
+        value_weights,
+        soft_target_temperature=1.0,
+        soft_target_weight=0.0,
+        soft_target_source="scores",
+        soft_target_min_legal_coverage=0.0,
+        policy_loss_weight=0.0,
+        value_loss_weight=0.0,
+        final_vp_loss_weight=0.0,
+        q_loss_weight=0.0,
+        q_skip_teacher_prefixes=(),
+        vps_to_win=10,
+        advantage_policy_weighting="none",
+        advantage_temperature=1.0,
+        advantage_weight_cap=5.0,
+        advantage_weight_floor=0.05,
+        amp="none",
+        diagnostics=False,
+        policy_aux_data=data,
+        policy_aux_batch=batch,
+        policy_aux_sample_weights=policy_weights,
+        policy_aux_loss_weight=0.25,
+        completed_q_loss_weight=0.0,
+        policy_aux_completed_q_loss_weight=1.0,
+    )
+
+    assert metrics["completed_q_loss_weight_sum"] == 0.0
+    assert metrics["completed_q_active_rows"] == 0
+    assert metrics["policy_aux_completed_q_loss_weight_sum"] > 0.0
+    assert metrics["policy_aux_completed_q_active_rows"] > 0
+    assert metrics["policy_aux_completed_q_loss"] > 0.0
+    assert metrics["loss"] == pytest.approx(
+        metrics["policy_aux_completed_q_loss"], rel=1e-5
+    )
+
+    heldout = train_bc._eval_entity_batch(  # noqa: SLF001
+        policy,
+        data,
+        batch,
+        policy_weights,
+        value_weights,
+        1.0,
+        0.0,
+        "scores",
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        (),
+        10,
+        "none",
+        1.0,
+        5.0,
+        0.05,
+        completed_q_loss_weight=0.0,
+        completed_q_measure=True,
+    )
+    assert heldout["loss"] == 0.0
+    assert heldout["completed_q_loss_weight_sum"] > 0.0
+    assert heldout["completed_q_loss"] > 0.0
+
+
 def test_train_diagnostics_do_not_implicitly_run_two_extra_gradient_traversals(
     tmp_path, monkeypatch
 ) -> None:

@@ -1527,6 +1527,16 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--policy-aux-completed-q-loss-weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Opt-in independently normalized completed-Q objective on the "
+            "policy-AUX selected-root stream. This is separate from the base "
+            "--completed-q-loss-weight; 0.0 is an exact no-op."
+        ),
+    )
+    parser.add_argument(
         "--policy-kl-anchor-weight",
         type=float,
         default=0.0,
@@ -7772,6 +7782,7 @@ def _validate_composite_learner_recipe_authorization(
         "policy_target_blend_semantics": str,
         "q_loss_weight": float,
         "completed_q_loss_weight": float,
+        "policy_aux_completed_q_loss_weight": float,
         "soft_target_source": str,
         "soft_target_min_legal_coverage": float,
         "soft_target_temperature": float,
@@ -10458,6 +10469,16 @@ def _effective_a1_learner_training_recipe(
         # active when policy weights have not already consumed reliability.
         effective["completed_q_loss_weight"] = float(
             args.completed_q_loss_weight
+        )
+        effective["target_reliability_confidence_floor"] = float(
+            args.target_reliability_confidence_floor
+        )
+        effective["target_reliability_confidence_weighting"] = bool(
+            args.target_reliability_confidence_weighting
+        )
+    if float(getattr(args, "policy_aux_completed_q_loss_weight", 0.0)) != 0.0:
+        effective["policy_aux_completed_q_loss_weight"] = float(
+            args.policy_aux_completed_q_loss_weight
         )
         effective["target_reliability_confidence_floor"] = float(
             args.target_reliability_confidence_floor
@@ -13571,6 +13592,8 @@ def _validate_a1_learner_training_recipe(
         "target_reliability_confidence_weighting",
         "target_reliability_confidence_floor",
         "policy_aux_sampling_mode",
+        "completed_q_loss_weight",
+        "policy_aux_completed_q_loss_weight",
         "moe_balance_loss_weight",
     ):
         if post_seal_field in effective:
@@ -13662,6 +13685,16 @@ def _validate_a1_learner_training_recipe(
         drift["target_reliability_confidence_floor"] = {
             "contract": 0.25,
             "effective": float(effective["target_reliability_confidence_floor"]),
+        }
+    if float(effective.get("completed_q_loss_weight", 0.0)) != 0.0:
+        drift["completed_q_loss_weight"] = {
+            "contract": 0.0,
+            "effective": float(effective["completed_q_loss_weight"]),
+        }
+    if float(effective.get("policy_aux_completed_q_loss_weight", 0.0)) != 0.0:
+        drift["policy_aux_completed_q_loss_weight"] = {
+            "contract": 0.0,
+            "effective": float(effective["policy_aux_completed_q_loss_weight"]),
         }
     if getattr(args, "policy_kl_target", None) is not None:
         # Reconstruct the exact parent marker, including the fields whose
@@ -15696,6 +15729,30 @@ def main(
         args.policy_aux_loss_weight
     ) <= 0.0:
         raise SystemExit("--policy-aux-loss-weight must be finite and > 0")
+    if (
+        not math.isfinite(float(args.policy_aux_completed_q_loss_weight))
+        or float(args.policy_aux_completed_q_loss_weight) < 0.0
+    ):
+        raise SystemExit(
+            "--policy-aux-completed-q-loss-weight must be finite and >= 0"
+        )
+    if (
+        float(args.policy_aux_completed_q_loss_weight) > 0.0
+        and int(args.policy_aux_active_batch_size) <= 0
+    ):
+        raise SystemExit(
+            "--policy-aux-completed-q-loss-weight requires an active policy-AUX "
+            "batch"
+        )
+    if (
+        float(args.policy_aux_completed_q_loss_weight) > 0.0
+        and float(args.policy_dose_lr_area) > 0.0
+    ):
+        raise SystemExit(
+            "--policy-aux-completed-q-loss-weight is not compatible with "
+            "--policy-dose-lr-area: AUX completed-Q currently follows the full "
+            "max-step treatment rather than the policy-dose cutoff"
+        )
     if int(args.policy_aux_active_batch_size) > 0:
         if int(args.grad_accum_steps) != 1:
             raise SystemExit(
@@ -15876,6 +15933,9 @@ def main(
         lambda: _completed_q_binding_admission(
             data,
             loss_weight=float(args.completed_q_loss_weight),
+            policy_aux_loss_weight=float(
+                args.policy_aux_completed_q_loss_weight
+            ),
             confidence_floor=float(args.target_reliability_confidence_floor),
             policy_weights_include_reliability=bool(
                 args.target_reliability_confidence_weighting
@@ -16008,6 +16068,9 @@ def main(
             policy_loss_weight=float(args.policy_loss_weight),
             q_loss_weight=float(args.q_loss_weight),
             completed_q_loss_weight=float(args.completed_q_loss_weight),
+            policy_aux_completed_q_loss_weight=float(
+                args.policy_aux_completed_q_loss_weight
+            ),
             value_target_lambda=float(args.value_target_lambda),
             policy_kl_anchor_weight=float(args.policy_kl_anchor_weight),
             policy_kl_target=args.policy_kl_target,
@@ -16683,6 +16746,7 @@ def main(
         if (
             float(args.q_loss_weight) == 0.0
             and float(args.completed_q_loss_weight) == 0.0
+            and float(args.policy_aux_completed_q_loss_weight) == 0.0
         ):
             _set_entity_q_branch_trainable(policy.model, False)
             unwrapped_model = getattr(policy.model, "module", policy.model)
@@ -16696,7 +16760,10 @@ def main(
                     {
                         "progress": "q_branch",
                         "trainable": False,
-                        "reason": "q_loss_weight=0 and completed_q_loss_weight=0",
+                        "reason": (
+                            "q_loss_weight=0, completed_q_loss_weight=0, and "
+                            "policy_aux_completed_q_loss_weight=0"
+                        ),
                     },
                     sort_keys=True,
                 ),
@@ -18682,6 +18749,10 @@ def main(
                 validation_action_catalog_abi
             ),
             completed_q_loss_weight=float(args.completed_q_loss_weight),
+            completed_q_measure=(
+                float(args.completed_q_loss_weight) != 0.0
+                or float(args.policy_aux_completed_q_loss_weight) != 0.0
+            ),
             completed_q_confidence_floor=float(
                 args.target_reliability_confidence_floor
             ),
@@ -19060,6 +19131,7 @@ def main(
             "final_vp_loss": 0.0,
             "q_loss": 0.0,
             "completed_q_loss": 0.0,
+            "policy_aux_completed_q_loss": 0.0,
             "policy_kl_anchor_loss": 0.0,
             "policy_kl_anchor_base_loss": 0.0,
             "policy_kl_anchor_aux_loss": 0.0,
@@ -19086,6 +19158,7 @@ def main(
             "final_vp_loss": 0.0,
             "q_loss": 0.0,
             "completed_q_loss": 0.0,
+            "policy_aux_completed_q_loss": 0.0,
             "policy_kl_anchor_loss": 0.0,
             "policy_kl_anchor_base_loss": 0.0,
             "policy_kl_anchor_aux_loss": 0.0,
@@ -19125,6 +19198,8 @@ def main(
         epoch_count = 0
         epoch_active_count = 0.0
         epoch_aux_active_count = 0.0
+        epoch_completed_q_active_count = 0.0
+        epoch_policy_aux_completed_q_active_count = 0.0
         epoch_policy_base_effective_weight = 0.0
         epoch_policy_aux_effective_weight = 0.0
         epoch_policy_objective_active_rows = 0.0
@@ -19211,6 +19286,9 @@ def main(
                 "value_trunk_grad_scale": float(args.value_trunk_grad_scale),
                 "completed_q_loss_weight": float(
                     args.completed_q_loss_weight
+                ),
+                "policy_aux_completed_q_loss_weight": float(
+                    args.policy_aux_completed_q_loss_weight
                 ),
                 "completed_q_confidence_floor": float(
                     args.target_reliability_confidence_floor
@@ -19840,6 +19918,12 @@ def main(
             epoch_aux_active_count += float(
                 batch_metrics.get("policy_aux_active_count", 0)
             )
+            epoch_completed_q_active_count += float(
+                batch_metrics.get("completed_q_active_rows", 0)
+            )
+            epoch_policy_aux_completed_q_active_count += float(
+                batch_metrics.get("policy_aux_completed_q_active_rows", 0)
+            )
             epoch_policy_base_effective_weight += float(
                 batch_metrics.get("policy_base_loss_weight_sum", 0.0)
             )
@@ -19935,6 +20019,7 @@ def main(
                 "final_vp_loss",
                 "q_loss",
                 "completed_q_loss",
+                "policy_aux_completed_q_loss",
                 "policy_kl_anchor_loss",
                 "policy_kl_anchor_base_loss",
                 "policy_kl_anchor_aux_loss",
@@ -20057,6 +20142,12 @@ def main(
                         "samples": float(epoch_count),
                         "policy_base_active_rows": float(epoch_active_count),
                         "policy_aux_active_rows": float(epoch_aux_active_count),
+                        "completed_q_active_rows": float(
+                            epoch_completed_q_active_count
+                        ),
+                        "policy_aux_completed_q_active_rows": float(
+                            epoch_policy_aux_completed_q_active_count
+                        ),
                         "policy_base_effective_weight_sum": float(
                             epoch_policy_base_effective_weight
                         ),
@@ -20128,6 +20219,16 @@ def main(
                     ),
                     "policy_aux_active_rows": int(
                         round(checkpoint_counts["policy_aux_active_rows"])
+                    ),
+                    "completed_q_active_rows": int(
+                        round(checkpoint_counts["completed_q_active_rows"])
+                    ),
+                    "policy_aux_completed_q_active_rows": int(
+                        round(
+                            checkpoint_counts[
+                                "policy_aux_completed_q_active_rows"
+                            ]
+                        )
                     ),
                     "policy_aux_unique_source_rows": int(
                         checkpoint_aux_unique_rows
@@ -20411,6 +20512,12 @@ def main(
         )
         active_count_total = _reduce_scalar_sum(float(epoch_active_count), ddp)
         aux_active_count_total = _reduce_scalar_sum(float(epoch_aux_active_count), ddp)
+        completed_q_active_count_total = _reduce_scalar_sum(
+            float(epoch_completed_q_active_count), ddp
+        )
+        policy_aux_completed_q_active_count_total = _reduce_scalar_sum(
+            float(epoch_policy_aux_completed_q_active_count), ddp
+        )
         policy_base_effective_weight_total = _reduce_scalar_sum(
             float(epoch_policy_base_effective_weight), ddp
         )
@@ -20582,6 +20689,10 @@ def main(
             epoch_extra_sums["completed_q_loss"],
             epoch_extra_denominators["completed_q_loss"],
         )
+        policy_aux_completed_q_loss_epoch = _metric_from_sum_denominator(
+            epoch_extra_sums["policy_aux_completed_q_loss"],
+            epoch_extra_denominators["policy_aux_completed_q_loss"],
+        )
         auxiliary_loss_epochs = {
             key: _metric_from_sum_denominator(
                 epoch_extra_sums[key], epoch_extra_denominators[key]
@@ -20691,6 +20802,8 @@ def main(
             + float(args.final_vp_loss_weight) * final_vp_loss_epoch
             + float(args.q_loss_weight) * q_loss_epoch
             + float(args.completed_q_loss_weight) * completed_q_loss_epoch
+            + float(args.policy_aux_completed_q_loss_weight)
+            * policy_aux_completed_q_loss_epoch
             + policy_kl_weighted_objective_epoch
             + float(args.value_uncertainty_loss_weight)
             * auxiliary_loss_epochs["value_uncertainty_loss"]
@@ -20858,6 +20971,12 @@ def main(
                 "policy_total_active_rows": int(
                     active_count_total + aux_active_count_total
                 ),
+                "completed_q_active_rows": int(
+                    completed_q_active_count_total
+                ),
+                "policy_aux_completed_q_active_rows": int(
+                    policy_aux_completed_q_active_count_total
+                ),
                 "policy_base_effective_weight_sum": (
                     policy_base_effective_weight_total
                 ),
@@ -20934,6 +21053,9 @@ def main(
                 "final_vp_loss": final_vp_loss_epoch,
                 "q_loss": q_loss_epoch,
                 "completed_q_loss": completed_q_loss_epoch,
+                "policy_aux_completed_q_loss": (
+                    policy_aux_completed_q_loss_epoch
+                ),
                 **auxiliary_loss_epochs,
                 **categorical_breakdown_epochs,
                 "primary_value_loss": (
@@ -22518,6 +22640,15 @@ def main(
                 for metric in metrics
             )
         ),
+        "completed_q_active_rows": int(
+            sum(int(metric.get("completed_q_active_rows", 0)) for metric in metrics)
+        ),
+        "policy_aux_completed_q_active_rows": int(
+            sum(
+                int(metric.get("policy_aux_completed_q_active_rows", 0))
+                for metric in metrics
+            )
+        ),
         "policy_base_effective_weight_sum": float(
             sum(
                 float(metric.get("policy_base_effective_weight_sum", 0.0))
@@ -22620,6 +22751,9 @@ def main(
         "final_vp_loss_weight": args.final_vp_loss_weight,
         "q_loss_weight": args.q_loss_weight,
         "completed_q_loss_weight": args.completed_q_loss_weight,
+        "policy_aux_completed_q_loss_weight": (
+            args.policy_aux_completed_q_loss_weight
+        ),
         "completed_q_confidence_floor": float(
             args.target_reliability_confidence_floor
         ),
@@ -23797,6 +23931,7 @@ def _train_entity_batch(
     fixed_value_effective_weight_mean: float | None = None,
     fixed_final_vp_effective_weight_mean: float | None = None,
     completed_q_loss_weight: float = 0.0,
+    policy_aux_completed_q_loss_weight: float = 0.0,
     completed_q_confidence_floor: float = 0.25,
     completed_q_policy_weights_include_reliability: bool = False,
 ) -> dict:
@@ -23975,6 +24110,14 @@ def _train_entity_batch(
         policy_aux_kl_anchor_loss = torch.tensor(
             0.0, dtype=torch.float32, device=policy.device
         )
+        policy_aux_completed_q_loss = torch.tensor(
+            0.0, dtype=torch.float32, device=policy.device
+        )
+        (
+            policy_aux_completed_q_loss_sum,
+            policy_aux_completed_q_loss_denominator,
+        ) = _zero_loss_parts(policy.device)
+        policy_aux_completed_q_active_count = 0
         (
             policy_aux_kl_anchor_loss_sum,
             policy_aux_kl_anchor_loss_denominator,
@@ -24011,7 +24154,7 @@ def _train_entity_batch(
                 policy_aux_data,
                 policy_aux_batch,
                 aux_legal_ids,
-                return_q=False,
+                return_q=float(policy_aux_completed_q_loss_weight) != 0.0,
                 return_final_vp=False,
                 symmetry=symmetry,
                 symmetry_rng=symmetry_rng,
@@ -24068,6 +24211,32 @@ def _train_entity_batch(
             policy_aux_loss_sum = aux_sum
             policy_aux_loss_denominator = aux_denominator
             policy_aux_loss = _weighted_mean_from_parts(aux_sum, aux_denominator)
+            if (
+                float(policy_aux_completed_q_loss_weight) != 0.0
+                and "q_values" in aux_outputs
+            ):
+                (
+                    policy_aux_completed_q_loss,
+                    policy_aux_completed_q_loss_sum,
+                    policy_aux_completed_q_loss_denominator,
+                ) = _completed_q_loss_parts(
+                    aux_outputs["q_values"],
+                    policy_aux_data,
+                    policy_aux_batch,
+                    aux_weights,
+                    policy.device,
+                    confidence_floor=float(completed_q_confidence_floor),
+                    policy_weights_include_reliability=bool(
+                        completed_q_policy_weights_include_reliability
+                    ),
+                )
+                policy_aux_completed_q_active_count = (
+                    _completed_q_active_row_count(
+                        policy_aux_data,
+                        policy_aux_batch,
+                        aux_weights,
+                    )
+                )
             policy_aux_active_count = int(len(policy_aux_batch))
             aux_predictions = torch.argmax(aux_outputs["logits"], dim=-1)
             policy_aux_correct_count = int(
@@ -24234,6 +24403,7 @@ def _train_entity_batch(
             completed_q_loss_sum,
             completed_q_loss_denominator,
         ) = _zero_loss_parts(policy.device)
+        completed_q_active_count = 0
         if float(completed_q_loss_weight) != 0.0 and "q_values" in outputs:
             (
                 completed_q_loss,
@@ -24249,6 +24419,11 @@ def _train_entity_batch(
                 policy_weights_include_reliability=bool(
                     completed_q_policy_weights_include_reliability
                 ),
+            )
+            completed_q_active_count = _completed_q_active_row_count(
+                data,
+                batch,
+                policy_weights,
             )
         # Policy-KL anchor (unfreeze-with-KL value-repair recipe): pull the trained
         # policy toward the seed's recorded prior_policy. Only computed when enabled,
@@ -24509,6 +24684,8 @@ def _train_entity_batch(
             + float(final_vp_loss_weight) * final_vp_loss
             + float(q_loss_weight) * q_loss
             + float(completed_q_loss_weight) * completed_q_loss
+            + float(policy_aux_completed_q_loss_weight)
+            * policy_aux_completed_q_loss
             + float(policy_kl_anchor_weight) * kl_anchor_loss
             + float(value_uncertainty_loss_weight) * value_uncertainty_loss
             + float(value_categorical_loss_weight) * value_categorical_loss
@@ -24524,6 +24701,8 @@ def _train_entity_batch(
                 float(policy_loss_weight) * policy_loss
                 + float(q_loss_weight) * q_loss
                 + float(completed_q_loss_weight) * completed_q_loss
+                + float(policy_aux_completed_q_loss_weight)
+                * policy_aux_completed_q_loss
                 + float(policy_kl_anchor_weight) * kl_anchor_loss
             )
             policy_aux_objective = None
@@ -24532,6 +24711,8 @@ def _train_entity_batch(
                     float(policy_loss_weight)
                     * float(policy_aux_loss_weight)
                     * policy_aux_loss
+                    + float(policy_aux_completed_q_loss_weight)
+                    * policy_aux_completed_q_loss
                 )
             value_objective = (
                 float(value_loss_weight) * value_loss
@@ -24575,6 +24756,8 @@ def _train_entity_batch(
                 + float(final_vp_loss_weight) * final_vp_loss
                 + float(q_loss_weight) * q_loss
                 + float(completed_q_loss_weight) * completed_q_loss
+                + float(policy_aux_completed_q_loss_weight)
+                * policy_aux_completed_q_loss
                 + float(policy_kl_anchor_weight) * kl_anchor_loss
                 + float(value_uncertainty_loss_weight) * value_uncertainty_loss
                 + float(value_categorical_loss_weight) * value_categorical_loss
@@ -24620,6 +24803,7 @@ def _train_entity_batch(
         float(policy_loss_weight) == 0.0
         and float(q_loss_weight) == 0.0
         and float(completed_q_loss_weight) == 0.0
+        and float(policy_aux_completed_q_loss_weight) == 0.0
         and float(policy_kl_anchor_weight) == 0.0
         and not bool(preserve_accumulated_policy_gradients)
     ):
@@ -24790,6 +24974,13 @@ def _train_entity_batch(
         "final_vp_loss": float(final_vp_loss.item()),
         "q_loss": float(q_loss.item()),
         "completed_q_loss": float(completed_q_loss.item()),
+        "policy_aux_completed_q_loss": float(
+            policy_aux_completed_q_loss.item()
+        ),
+        "completed_q_active_rows": int(completed_q_active_count),
+        "policy_aux_completed_q_active_rows": int(
+            policy_aux_completed_q_active_count
+        ),
         "policy_kl_anchor_loss": float(kl_anchor_loss.item()),
         "policy_kl_anchor_loss_weighted_sum": float(kl_anchor_loss_sum.item()),
         "policy_kl_anchor_loss_weight_sum": float(
@@ -24889,6 +25080,12 @@ def _train_entity_batch(
         ),
         "completed_q_loss_weight_sum": float(
             completed_q_loss_denominator.item()
+        ),
+        "policy_aux_completed_q_loss_weighted_sum": float(
+            policy_aux_completed_q_loss_sum.item()
+        ),
+        "policy_aux_completed_q_loss_weight_sum": float(
+            policy_aux_completed_q_loss_denominator.item()
         ),
         "value_categorical_loss_weighted_sum": float(
             value_categorical_loss_sum.item()
@@ -26940,6 +27137,7 @@ def evaluate_bc_batches(
     policy_behavior_action_types_by_id: tuple[str, ...] | None = None,
     policy_behavior_action_catalog_abi: Mapping[str, object] | None = None,
     completed_q_loss_weight: float = 0.0,
+    completed_q_measure: bool = False,
     completed_q_confidence_floor: float = 0.25,
     completed_q_policy_weights_include_reliability: bool = False,
 ) -> dict:
@@ -27063,6 +27261,7 @@ def evaluate_bc_batches(
                 policy_behavior_action_catalog_abi
             ),
             "completed_q_loss_weight": float(completed_q_loss_weight),
+            "completed_q_measure": bool(completed_q_measure),
             "completed_q_confidence_floor": float(
                 completed_q_confidence_floor
             ),
@@ -27621,6 +27820,7 @@ def _eval_entity_batch(
     policy_behavior_action_types_by_id: tuple[str, ...] | None = None,
     policy_behavior_action_catalog_abi: Mapping[str, object] | None = None,
     completed_q_loss_weight: float = 0.0,
+    completed_q_measure: bool = False,
     completed_q_confidence_floor: float = 0.25,
     completed_q_policy_weights_include_reliability: bool = False,
 ) -> dict:
@@ -27652,6 +27852,7 @@ def _eval_entity_batch(
                 return_q=(
                     float(q_loss_weight) != 0.0
                     or float(completed_q_loss_weight) != 0.0
+                    or bool(completed_q_measure)
                 ),
                 return_aux_subgoals=float(aux_subgoal_loss_weight) != 0.0,
             )
@@ -27858,7 +28059,10 @@ def _eval_entity_batch(
                 completed_q_loss_denominator,
             ) = _zero_loss_parts(policy.device)
             if (
-                float(completed_q_loss_weight) != 0.0
+                (
+                    float(completed_q_loss_weight) != 0.0
+                    or bool(completed_q_measure)
+                )
                 and "q_values" in outputs
             ):
                 (
@@ -29260,6 +29464,7 @@ def _validate_target_information_admission(
     soft_target_min_legal_coverage: float = 0.5,
     policy_target_completeness: Mapping[str, object] | None = None,
     completed_q_loss_weight: float = 0.0,
+    policy_aux_completed_q_loss_weight: float = 0.0,
 ) -> dict[str, object]:
     """Fail closed before public-information training consumes search targets.
 
@@ -29313,7 +29518,10 @@ def _validate_target_information_admission(
     if float(q_loss_weight) != 0.0 and "target_scores" in data:
         objectives.append("q_target")
     if (
-        float(completed_q_loss_weight) != 0.0
+        (
+            float(completed_q_loss_weight) != 0.0
+            or float(policy_aux_completed_q_loss_weight) != 0.0
+        )
         and "completed_q_values" in data
     ):
         objectives.append("completed_q_target")
@@ -33073,6 +33281,7 @@ def _completed_q_binding_admission(
     data,
     *,
     loss_weight: float,
+    policy_aux_loss_weight: float = 0.0,
     confidence_floor: float = 0.25,
     policy_weights_include_reliability: bool = False,
 ) -> dict[str, object]:
@@ -33085,13 +33294,20 @@ def _completed_q_binding_admission(
     """
 
     weight = float(loss_weight)
-    if not math.isfinite(weight) or weight < 0.0:
-        raise SystemExit("--completed-q-loss-weight must be finite and non-negative")
-    if weight == 0.0:
+    aux_weight = float(policy_aux_loss_weight)
+    if (
+        not math.isfinite(weight)
+        or weight < 0.0
+        or not math.isfinite(aux_weight)
+        or aux_weight < 0.0
+    ):
+        raise SystemExit("completed-Q loss weights must be finite and non-negative")
+    if weight == 0.0 and aux_weight == 0.0:
         return {
             "schema_version": "completed-q-objective-admission-v1",
             "enabled": False,
             "loss_weight": 0.0,
+            "policy_aux_loss_weight": 0.0,
             "semantics": "return_scale_root_actor_perspective_mse",
             "legacy_target_scores_consumed": False,
         }
@@ -33256,6 +33472,7 @@ def _completed_q_binding_admission(
         "schema_version": "completed-q-objective-admission-v1",
         "enabled": True,
         "loss_weight": weight,
+        "policy_aux_loss_weight": aux_weight,
         "semantics": "return_scale_root_actor_perspective_mse",
         "per_root_centering": False,
         "reliability_weighting": {
@@ -33335,6 +33552,34 @@ def _completed_q_loss_parts(
         per_row, effective_weights
     )
     return loss, weighted_sum, denominator
+
+
+def _completed_q_active_row_count(
+    data: dict,
+    batch: np.ndarray,
+    weights,
+) -> int:
+    """Count selected roots with an authenticated multi-action completed-Q label."""
+
+    values = np.asarray(data["completed_q_values"][batch], dtype=np.float32)
+    support = np.asarray(data["completed_q_mask"][batch], dtype=np.bool_)
+    legal = np.asarray(data["legal_action_ids"][batch], dtype=np.int64)
+    if values.shape != legal.shape or support.shape != legal.shape:
+        raise ValueError("completed-Q batch is not aligned with legal actions")
+    row_active = np.sum(
+        (legal >= 0) & support & np.isfinite(values),
+        axis=1,
+    ) >= 2
+    if hasattr(weights, "detach"):
+        positive_weights = (
+            weights.detach().to(device="cpu").numpy().astype(np.float32)
+            > 0.0
+        )
+    else:
+        positive_weights = np.asarray(weights, dtype=np.float32) > 0.0
+    if positive_weights.shape != row_active.shape:
+        raise ValueError("completed-Q row weights are not aligned with the batch")
+    return int(np.count_nonzero(row_active & positive_weights))
 
 
 def _unflagged_vp_rows(data: dict, values_key: str, flags_key: str) -> np.ndarray:
@@ -42050,6 +42295,10 @@ def _coverage_unsupported_objectives(
             getattr(args, "completed_q_loss_weight", 0.0)
         )
         != 0.0,
+        "policy_aux_completed_q_loss_weight": float(
+            getattr(args, "policy_aux_completed_q_loss_weight", 0.0)
+        )
+        != 0.0,
         "policy_kl_anchor_weight": float(args.policy_kl_anchor_weight) != 0.0,
         "policy_kl_target": args.policy_kl_target is not None,
         "value_uncertainty_loss_weight": float(
@@ -42135,6 +42384,9 @@ def _derived_training_scope_cache_fields(
         "q_loss_weight": float(args.q_loss_weight),
         "completed_q_loss_weight": float(
             getattr(args, "completed_q_loss_weight", 0.0)
+        ),
+        "policy_aux_completed_q_loss_weight": float(
+            getattr(args, "policy_aux_completed_q_loss_weight", 0.0)
         ),
         "policy_kl_anchor_weight": float(args.policy_kl_anchor_weight),
         "value_uncertainty_loss_weight": float(

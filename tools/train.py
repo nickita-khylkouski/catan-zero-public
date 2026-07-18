@@ -97,6 +97,7 @@ _CANONICAL_RUNTIME_DEFAULTS: dict[str, Any] = {
     # scratch and parent-update recipes keep it inactive until a recipe binds
     # authenticated completed-Q rows and a nonzero weight explicitly.
     "completed_q_loss_weight": 0.0,
+    "policy_aux_completed_q_loss_weight": 0.0,
     "allow_legacy_action_mask_upgrade": False,
     "acknowledge_diagnostic_outcome_conditioned_policy_distillation": False,
     "a1_learner_ablation_id": "",
