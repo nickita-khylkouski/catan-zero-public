@@ -9,7 +9,7 @@ longer assembled from dozens of command-line switches.
   with one typed job file instead of pipeline flags
 - `tools/generate.py`: 9 options
 - `tools/evaluate.py`: 10 options
-- `tools/train.py`: 8-option config-first learner adapter; the checked-in fresh-scratch
+- `tools/train.py`: 10-option config-first learner adapter; the checked-in fresh-scratch
   recipe is launchable only through `tools/a1_scratch_train.py`'s authenticated
   plan/`--go` flow
 - `tools/loop.py`: 3 options for one complete improvement turn

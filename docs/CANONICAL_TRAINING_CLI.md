@@ -23,7 +23,8 @@ The public entrypoint exposes ten options:
 
 Architecture, optimization, masking, sampling, value objectives, diagnostics,
 and model-admission settings live in exact checked-in recipes authenticated by
-`configs/production_recipes.json`. The two baseline identities are:
+`configs/production_recipes.json`. The canonical scratch and parent baselines
+are:
 
 ```text
 configs/training/a1_current_35m_b200.schema1.json         # fresh scratch
@@ -68,10 +69,10 @@ separate parent recipe and an exact parent checkpoint:
 ```bash
 torchrun --standalone --nproc-per-node=8 tools/train.py \
   --config configs/training/a1_parent_update_35m_b200.schema1.json \
-  --data /path/to/authenticated_single_corpus.json \
-  --parent-checkpoint /path/to/exact-f7-parent.pt \
-  --init-checkpoint /path/to/reviewed-v8-initializer.pt \
-  --information-contract-migration-receipt /path/to/v8-migration.receipt.json \
+  --data /path/to/authenticated_memmap_or_composite.json \
+  --parent-checkpoint /path/to/exact-incumbent-parent.pt \
+  --init-checkpoint /path/to/reviewed-information-contract-initializer.pt \
+  --information-contract-migration-receipt /path/to/migration.receipt.json \
   --checkpoint /path/to/candidate.pt \
   --report /path/to/report.json
 ```
@@ -81,12 +82,12 @@ receipt. If they differ, the receipt is mandatory and must connect those exact
 checkpoint identities.
 
 That recipe reproduces the commissioned 8×64 global batch, fresh AdamW,
-12-step exact dose, flat `6e-5` learning rate with 16 warmup steps, full value
-and shared-trunk routing, split1 value topology, and authenticated coherent
-teacher semantics. It retains a model-only review snapshot at step 8; the
-normal terminal `candidate.pt` is step 12. Candidate chaining,
+12-step exact dose, flat `6e-5` learning rate with 16 warmup steps, scaled
+value-to-shared-trunk routing, split1 value topology, and authenticated coherent
+teacher semantics. It retains model-only review snapshots at steps 8 and 10;
+the normal terminal `candidate.pt` is step 12. Candidate chaining,
 optimizer resume, and grow-from initialization are rejected. The recipe does
-not pin one turn's producer hash: the authenticated single corpus supplies its
+not pin one turn's producer hash: the authenticated corpus supplies its
 exact policy-target identity, and the trainer admits it only when all active
 policy rows resolve to one uniform operator identity.
 
