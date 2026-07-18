@@ -367,6 +367,9 @@ def _search_config_kwargs(worker_args: dict[str, Any]) -> dict[str, Any]:
         temperature=0.0,  # deterministic argmax at the root.
         correct_rust_chance_spectra=bool(worker_args["correct_rust_chance_spectra"]),
         lazy_interior_chance=bool(worker_args.get("lazy_interior_chance", False)),
+        rng_stream_separation=bool(
+            worker_args.get("rng_stream_separation", False)
+        ),
         belief_chance_spectra=bool(worker_args.get("belief_chance_spectra", False)),
         information_set_search=bool(worker_args.get("information_set_search", False)),
         coherent_public_belief_search=bool(
@@ -528,6 +531,11 @@ def main() -> None:
     )
     parser.add_argument(
         "--lazy-interior-chance", action=argparse.BooleanOptionalAction, default=False
+    )
+    parser.add_argument(
+        "--rng-stream-separation",
+        action=argparse.BooleanOptionalAction,
+        default=False,
     )
     parser.add_argument("--value-squash", choices=("tanh", "clip"), default="tanh")
     parser.add_argument("--c-visit", type=float, default=50.0)
@@ -710,6 +718,9 @@ def main() -> None:
                 "value_scale": float(args.value_scale),
                 "correct_rust_chance_spectra": bool(args.correct_rust_chance_spectra),
                 "lazy_interior_chance": bool(args.lazy_interior_chance),
+                "rng_stream_separation": bool(
+                    getattr(args, "rng_stream_separation", False)
+                ),
                 "public_observation": bool(args.public_observation),
                 "belief_chance_spectra": bool(args.belief_chance_spectra),
                 "information_set_search": bool(args.information_set_search),
@@ -876,6 +887,9 @@ def _build_summary(
         "map_kind": MAP_KIND,
         "n_full": int(args.n_full),
         "lazy_interior_chance": bool(args.lazy_interior_chance),
+        "rng_stream_separation": bool(
+            getattr(args, "rng_stream_separation", False)
+        ),
         "value_squash": str(args.value_squash),
         "c_scale": float(args.c_scale),
         "c_visit": float(args.c_visit),

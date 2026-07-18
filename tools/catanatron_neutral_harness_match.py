@@ -197,6 +197,9 @@ def _search_config(
         c_visit=float(search_kwargs["c_visit"]),
         c_scale=float(search_kwargs["c_scale"]),
         lazy_interior_chance=bool(search_kwargs["lazy_interior_chance"]),
+        rng_stream_separation=bool(
+            search_kwargs.get("rng_stream_separation", False)
+        ),
         correct_rust_chance_spectra=bool(search_kwargs["correct_rust_chance_spectra"]),
         max_root_candidates=int(search_kwargs["max_root_candidates"]),
         max_root_candidates_wide=int(search_kwargs["max_root_candidates_wide"]),
@@ -473,6 +476,9 @@ def _search_recipe(args: Any) -> dict[str, Any]:
         "c_visit": float(args.c_visit),
         "c_scale": float(args.c_scale),
         "lazy_interior_chance": bool(args.lazy_interior_chance),
+        "rng_stream_separation": bool(
+            getattr(args, "rng_stream_separation", False)
+        ),
         "correct_rust_chance_spectra": bool(args.correct_rust_chance_spectra),
         "public_observation": bool(args.public_observation),
         "information_set_search": bool(args.information_set_search),
@@ -910,6 +916,11 @@ def build_summary(
         "lazy_interior_chance": (
             bool(args.lazy_interior_chance) if args.mode == "search" else None
         ),
+        "rng_stream_separation": (
+            bool(getattr(args, "rng_stream_separation", False))
+            if args.mode == "search"
+            else None
+        ),
         "public_observation": (
             bool(args.public_observation) if args.mode == "search" else None
         ),
@@ -1102,6 +1113,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--lazy-interior-chance", action=argparse.BooleanOptionalAction, default=True
+    )
+    parser.add_argument(
+        "--rng-stream-separation",
+        action=argparse.BooleanOptionalAction,
+        default=False,
     )
     parser.add_argument(
         "--public-observation", action=argparse.BooleanOptionalAction, default=True

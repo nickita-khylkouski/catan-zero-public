@@ -15,7 +15,11 @@ from typing import Any
 
 import numpy as np
 
-from catan_zero.search.rng_streams import SEARCH_RNG_STREAM_SCHEMA
+from catan_zero.search.rng_streams import (
+    SEARCH_RNG_STREAM_NAMES,
+    SEARCH_RNG_STREAM_SCHEMA,
+    SHARED_SEARCH_RNG_STREAM_SCHEMA,
+)
 
 
 TARGET_RELIABILITY_SCHEMA = "coherent_n128_duplicate_search_reliability_v1"
@@ -230,7 +234,10 @@ def target_reliability_root_seed(
 
 
 def target_reliability_contract(
-    *, audit_fraction: float, audit_seed: int
+    *,
+    audit_fraction: float,
+    audit_seed: int,
+    rng_stream_separation: bool,
 ) -> dict[str, Any] | None:
     fraction = float(audit_fraction)
     if not math.isfinite(fraction) or not 0.0 <= fraction <= 1.0:
@@ -245,8 +252,15 @@ def target_reliability_contract(
         "audit_seed": int(audit_seed),
         "selector_schema": TARGET_RELIABILITY_SELECTOR_SCHEMA,
         "duplicate_root_seed_schema": TARGET_RELIABILITY_ROOT_SEED_SCHEMA,
-        "rng_stream_schema": SEARCH_RNG_STREAM_SCHEMA,
-        "rng_streams": ["gumbel", "chance", "belief"],
+        "rng_stream_separation": bool(rng_stream_separation),
+        "rng_stream_schema": (
+            SEARCH_RNG_STREAM_SCHEMA
+            if rng_stream_separation
+            else SHARED_SEARCH_RNG_STREAM_SCHEMA
+        ),
+        "rng_streams": (
+            list(SEARCH_RNG_STREAM_NAMES) if rng_stream_separation else []
+        ),
         "confidence_formula": TARGET_RELIABILITY_CONFIDENCE_FORMULA,
         "duplicate_selected_action_applied": False,
         "columns": list(TARGET_RELIABILITY_COLUMNS),

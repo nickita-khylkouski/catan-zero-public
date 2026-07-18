@@ -3041,6 +3041,7 @@ def run_worker_games(
     target_reliability_manifest = target_reliability_contract(
         audit_fraction=reliability_fraction,
         audit_seed=int(config.target_reliability_audit_seed),
+        rng_stream_separation=bool(search_config.rng_stream_separation),
     )
     if reliability_fraction > 0.0:
         # Duplicate the *production* target operator rather than comparing a
@@ -3051,10 +3052,10 @@ def run_worker_games(
         # exactly n128, so forcing p_full=1 merely selects that same full-root
         # branch rather than changing its search budget.
         #
-        # Native traversal intentionally does not advertise independently
-        # separated Gumbel/chance/belief streams. It still receives a distinct
-        # deterministic root seed, which is sufficient for an independent
-        # duplicate while retaining the deployed native operator exactly.
+        # The duplicate must retain the production stream contract. Native
+        # traversal now fails closed unless the wheel advertises independent
+        # control/chance streams; coherent belief construction remains on the
+        # separately seeded Python belief domain.
         reliability_search_config = dataclasses.replace(
             search_config,
             seed=int(config.target_reliability_audit_seed),
@@ -3063,7 +3064,7 @@ def run_worker_games(
             p_full=1.0,
             raw_policy_above_width=None,
             temperature=0.0,
-            rng_stream_separation=not bool(native_mcts_hot_loop),
+            rng_stream_separation=bool(search_config.rng_stream_separation),
         )
         target_reliability_mcts = create_gumbel_search(
             reliability_search_config,

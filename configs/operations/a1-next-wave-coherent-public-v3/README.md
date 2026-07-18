@@ -73,7 +73,7 @@ Generate through the sealed pre-wave control plane. For a direct lane command:
 
 ```bash
 "$PY" tools/generate.py \
-  --config configs/generation/coherent_public_n128.schema21.json \
+  --config configs/generation/coherent_public_n128.schema22.json \
   --guard configs/guards/a1_generation_coherent_public_n128_adaptive256_forced_value_v3.json \
   --checkpoint "$CHECKPOINT" --out-dir "$OUT" \
   --base-seed "$BASE_SEED" --games "$GAMES" --workers "$WORKERS" \

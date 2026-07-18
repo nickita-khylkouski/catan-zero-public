@@ -25,7 +25,7 @@ CONTRACT_PATH = (
 TEMPLATE_PATH = REPO_ROOT / "configs/experiments/a1_pre_wave_contract_v4.template.json"
 GENERATOR_CONFIG_PATH = (
     REPO_ROOT
-    / "configs/generation/coherent_public_n128.schema21.json"
+    / "configs/generation/coherent_public_n128.schema22.json"
 )
 PRODUCTION_RECIPE_CATALOG_PATH = REPO_ROOT / "configs/production_recipes.json"
 GENERATOR_GUARD_PATH = (
@@ -281,7 +281,7 @@ PRODUCTION_LEARNER_SELECTION_CONTRACT = {
     "recipe": "a1-parent-update-35m-b200",
     "config_path": "configs/training/a1_parent_update_35m_b200.schema1.json",
     "config_canonical_sha256": (
-        "552e8c9d7a4ccee8715411205d5b86a3811b3ed238e18664945546205779e4fe"
+        "e14e87a45513c8c2eb5fe1d9e5a603e217b29ef7f9fb59c1ddf7d02f9632f6de"
     ),
     "initialization": {
         "mode": "parent_fresh_optimizer",
@@ -1107,7 +1107,7 @@ def _validate_target_quality_artifacts(contract: Mapping[str, Any]) -> None:
     canonical_sha256 = _content_sha256(generator).removeprefix("sha256:")
     if (
         generator.get("pipeline") != "generate"
-        or generator.get("schema_version") != 21
+        or generator.get("schema_version") != 22
         or catalog_records[0].get("canonical_sha256") != canonical_sha256
     ):
         raise ScienceContractError(
@@ -1129,7 +1129,7 @@ def _validate_target_quality_artifacts(contract: Mapping[str, Any]) -> None:
     if runtime_drift:
         raise ScienceContractError(
             "current science generation runtime differs from authenticated "
-            f"catalog schema21 recipe: {runtime_drift}"
+            f"catalog schema22 recipe: {runtime_drift}"
         )
     search_value = contract["operator"]["search"]
     expected_generator = {
@@ -1376,6 +1376,9 @@ def fleet_evaluation_science_config() -> dict[str, Any]:
         "rescale_noise_floor_c": search_value["rescale_noise_floor_c"],
         "lazy_interior_chance": search_value["lazy_interior_chance"],
         "correct_rust_chance_spectra": search_value["correct_rust_chance_spectra"],
+        "rng_stream_separation": bool(
+            search_value.get("rng_stream_separation", False)
+        ),
         "public_observation": evaluator_value["public_observation"],
         "information_set_search": search_value["information_set_search"],
         "belief_chance_spectra": search_value["belief_chance_spectra"],

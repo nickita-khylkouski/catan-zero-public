@@ -25,7 +25,7 @@ def test_canonical_generation_default_requires_adapter_v6() -> None:
 
 
 def test_canonical_generation_guard_is_bound_to_recipe() -> None:
-    config = ROOT / "configs/generation/coherent_public_n128.schema21.json"
+    config = ROOT / "configs/generation/coherent_public_n128.schema22.json"
     expected = (
         ROOT
         / "configs/guards/"
@@ -45,11 +45,11 @@ def test_canonical_generation_guard_is_bound_to_recipe() -> None:
     (
         (
             generate._validate_config,  # noqa: SLF001
-            "configs/generation/coherent_public_n128.schema21.json",
+            "configs/generation/coherent_public_n128.schema22.json",
         ),
         (
             evaluate._validate_config,  # noqa: SLF001
-            "configs/eval/coherent_public_n128.schema21.json",
+            "configs/eval/coherent_public_n128.schema22.json",
         ),
     ),
 )
@@ -172,7 +172,7 @@ def test_canonical_launchers_ignore_ambient_stale_pythonpath(
 def test_canonical_evaluation_uses_the_production_promotion_gate() -> None:
     payload = json.loads(
         (
-            ROOT / "configs/eval/coherent_public_n128.schema21.json"
+            ROOT / "configs/eval/coherent_public_n128.schema22.json"
         ).read_text(encoding="utf-8")
     )
 

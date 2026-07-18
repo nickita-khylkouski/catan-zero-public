@@ -2,7 +2,7 @@
   "schema_version": "catan-zero-training-science-admission-v1",
   "recipes": {
     "a1-current-35m-b200": {
-      "recipe_canonical_sha256": "2c48b19a0c9ecd48bf4072ddb9f060b5553bdeb905f423e86946c41fa8628d2f",
+      "recipe_canonical_sha256": "9d4ba14b1931af04c45250d68e5ac53191729b3fdde54a2d3aec1db8f9f9b945",
       "authorized": false,
       "reason": "scratch_training_signal_contract_unresolved",
       "unresolved_requirements": [
@@ -36,7 +36,7 @@
       "commissioning_evidence": []
     },
     "a1-parent-update-35m-b200": {
-      "recipe_canonical_sha256": "552e8c9d7a4ccee8715411205d5b86a3811b3ed238e18664945546205779e4fe",
+      "recipe_canonical_sha256": "e14e87a45513c8c2eb5fe1d9e5a603e217b29ef7f9fb59c1ddf7d02f9632f6de",
       "authorized": false,
       "reason": "v8_parent_update_requires_fresh_commissioning",
       "unresolved_requirements": [
@@ -137,7 +137,7 @@
       ]
     },
     "a1-parent-update-shared-action25-35m-b200": {
-      "recipe_canonical_sha256": "8cf63220d7ba3a61161d6ef951daea870eeeb842f2053cc940dec69220d82bd7",
+      "recipe_canonical_sha256": "bed6b26eab3cf8de89fcafacf2f32656f4122dbd719abc45ffce66b3d59032d4",
       "authorized": false,
       "reason": "shared_action_trust_region_requires_fresh_commissioning",
       "unresolved_requirements": [
@@ -154,7 +154,7 @@
       "commissioning_evidence": []
     },
     "a1-parent-update-action25-shared-action25-35m-b200": {
-      "recipe_canonical_sha256": "6efc4fe93a017e62bc463f7b2347c1d5d794796877d588a26e863ce78bc7f3a7",
+      "recipe_canonical_sha256": "cc6707575434d525554ba92cfc76384e597395894a9ca8c310377fea4d65a19a",
       "authorized": false,
       "reason": "action_local_trust_region_requires_fresh_commissioning",
       "unresolved_requirements": [
@@ -172,7 +172,7 @@
       "commissioning_evidence": []
     },
     "a1-parent-update-shared-action25-value25-35m-b200": {
-      "recipe_canonical_sha256": "9d9c4a80533ba01bdf1f3759c875444ecde158a027429e2b2f3d3aa459060dd1",
+      "recipe_canonical_sha256": "e257608d9e12e2f65bd19d2c5c719a27a7522f1c724cf7e6181c2b1dd4211a3b",
       "authorized": false,
       "reason": "combined_trust_region_requires_fresh_commissioning",
       "unresolved_requirements": [
@@ -190,7 +190,7 @@
       "commissioning_evidence": []
     },
     "a1-parent-update-value25-35m-b200": {
-      "recipe_canonical_sha256": "42ed186f3e3fc12b60f9f89f3afd7905edc38947ae42565288a3b2a6e92000bc",
+      "recipe_canonical_sha256": "a4646ec1b521f99d42ee18adfcceef61f66ddae18633bddc6cf812652100526f",
       "authorized": false,
       "reason": "value_head_trust_region_requires_fresh_commissioning",
       "unresolved_requirements": [
@@ -207,7 +207,7 @@
       "commissioning_evidence": []
     },
     "a1-parent-update-active-p10-35m-b200": {
-      "recipe_canonical_sha256": "950b81c30728d6f5b98a1e30426a645937fe0ffea0dca61e22f870141b29d09a",
+      "recipe_canonical_sha256": "dc827208fe84adf713d1d723160465a8c890351d558ed81ff2b187a98c2a51c2",
       "authorized": false,
       "reason": "active_policy_parent_treatment_requires_fresh_commissioning",
       "unresolved_requirements": [
@@ -224,7 +224,7 @@
       "commissioning_evidence": []
     },
     "a1-parent-update-active-p25-35m-b200": {
-      "recipe_canonical_sha256": "2b54425355b8e60797f9961249307534beaa964529e038b3d5082a8617451a3e",
+      "recipe_canonical_sha256": "940e70128bafeb6b35a8e267058e7551affc73922282bef19ada83042cab3b50",
       "authorized": false,
       "reason": "active_policy_parent_treatment_requires_fresh_commissioning",
       "unresolved_requirements": [

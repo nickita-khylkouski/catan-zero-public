@@ -116,6 +116,7 @@ def _fixture(tmp_path: Path) -> dict[str, Path]:
         "determinization_particles": 1,
         "correct_rust_chance_spectra": True,
         "lazy_interior_chance": True,
+        "rng_stream_separation": True,
         "symmetry_averaged_eval": True,
         "public_observation": True,
         "meaningful_public_history": True,

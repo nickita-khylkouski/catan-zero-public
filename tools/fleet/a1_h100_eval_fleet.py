@@ -97,6 +97,7 @@ LEGACY_PIMC_SCIENCE_CONFIG: dict[str, Any] = {
     "rescale_noise_floor_c": 0.0,
     "lazy_interior_chance": True,
     "correct_rust_chance_spectra": True,
+    "rng_stream_separation": False,
     "public_observation": True,
     "information_set_search": True,
     "belief_chance_spectra": False,
@@ -589,6 +590,13 @@ def _science_args(
         "24",
         "--gate-config",
         "flywheel",
+    ]
+    args += [
+        (
+            "--rng-stream-separation"
+            if bool(science.get("rng_stream_separation", False))
+            else "--no-rng-stream-separation"
+        )
     ]
     if operator_mode == COHERENT_PUBLIC_OPERATOR:
         args += [
@@ -2969,6 +2977,7 @@ def _fixed_panel_expected_search_fields(
         ],
         "correct_rust_chance_spectra": True,
         "lazy_interior_chance": True,
+        "rng_stream_separation": False,
         "prior_temperature": 1.0,
         "value_scale": 1.0,
         "value_squash": "tanh",
@@ -3045,6 +3054,7 @@ def _fixed_panel_expected_search_fields(
             ],
             correct_rust_chance_spectra=True,
             lazy_interior_chance=True,
+            rng_stream_separation=False,
             candidate_value_squash="tanh",
             baseline_value_squash="tanh",
             candidate_value_readout="scalar",

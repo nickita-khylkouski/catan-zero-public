@@ -1169,6 +1169,7 @@ def _effective_search_config(
             alignment.OPERATOR_IDENTITY_SCHEMA_V2,
             alignment.OPERATOR_IDENTITY_SCHEMA_V3,
             alignment.OPERATOR_IDENTITY_SCHEMA_V4,
+            alignment.OPERATOR_IDENTITY_SCHEMA_V5,
         }
         and target.get("effective_gumbel_config") != effective
     ):
@@ -1231,7 +1232,11 @@ def _evaluator_from_plan(plan: Mapping[str, Any], *, device: str) -> Any:
                 "entity_feature_adapter_version"
             ]
         )
-        if target.get("schema_version") == alignment.OPERATOR_IDENTITY_SCHEMA_V4
+        if target.get("schema_version")
+        in {
+            alignment.OPERATOR_IDENTITY_SCHEMA_V4,
+            alignment.OPERATOR_IDENTITY_SCHEMA_V5,
+        }
         else None
     )
     if (
@@ -1240,6 +1245,7 @@ def _evaluator_from_plan(plan: Mapping[str, Any], *, device: str) -> Any:
             alignment.OPERATOR_IDENTITY_SCHEMA_V2,
             alignment.OPERATOR_IDENTITY_SCHEMA_V3,
             alignment.OPERATOR_IDENTITY_SCHEMA_V4,
+            alignment.OPERATOR_IDENTITY_SCHEMA_V5,
         }
         and target.get("effective_evaluator_config")
         != alignment._complete_effective_evaluator_config(  # noqa: SLF001
@@ -1543,8 +1549,7 @@ def _execute_partition(args: argparse.Namespace) -> dict[str, Any]:
     if (
         target.get("schema_version")
         not in {
-            alignment.OPERATOR_IDENTITY_SCHEMA_V3,
-            alignment.OPERATOR_IDENTITY_SCHEMA_V4,
+            alignment.OPERATOR_IDENTITY_SCHEMA_V5,
         }
         or target.get("target_execution") != alignment.STAGE_C_TARGET_EXECUTION
         or target.get("root_value_output_contract")
@@ -1558,6 +1563,9 @@ def _execute_partition(args: argparse.Namespace) -> dict[str, Any]:
     reliability_contract = target_reliability_contract(
         audit_fraction=float(args.target_reliability_audit_fraction),
         audit_seed=int(args.target_reliability_audit_seed),
+        rng_stream_separation=bool(
+            target["chance"]["rng_stream_separation"]
+        ),
     )
     records: list[dict[str, Any]] = []
     for game_seed, game_positions in sorted(ordinals_by_game.items()):
@@ -1847,6 +1855,9 @@ def _verify_patch_arrays(
         expected_contract = target_reliability_contract(
             audit_fraction=float(contract.get("audit_fraction", -1.0)),
             audit_seed=int(contract.get("audit_seed", -1)),
+            rng_stream_separation=bool(
+                contract.get("rng_stream_separation", False)
+            ),
         )
         if contract != expected_contract:
             raise ExecutorError("duplicate-search reliability contract drifted")
@@ -2198,7 +2209,7 @@ def _new_target_identity_from_legacy_merge(
     rebound = alignment._operator_identity(  # noqa: SLF001
         Path(str(contract["path"])),
         Path(str(checkpoint["path"])),
-        require_current_target=True,
+        require_current_target=False,
         identity_schema=alignment.OPERATOR_IDENTITY_SCHEMA_V2,
         target_execution=alignment.STAGE_C_TARGET_EXECUTION,
     )

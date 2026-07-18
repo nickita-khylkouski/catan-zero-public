@@ -98,6 +98,9 @@ def _build_search_config(worker_args: dict[str, Any]) -> GumbelChanceMCTSConfig:
         temperature=0.0,
         correct_rust_chance_spectra=bool(worker_args["correct_rust_chance_spectra"]),
         lazy_interior_chance=bool(worker_args.get("lazy_interior_chance", False)),
+        rng_stream_separation=bool(
+            worker_args.get("rng_stream_separation", False)
+        ),
         belief_chance_spectra=bool(worker_args.get("belief_chance_spectra", False)),
         information_set_search=bool(worker_args.get("information_set_search", False)),
         coherent_public_belief_search=bool(
@@ -330,6 +333,11 @@ def main() -> None:
         default=False,
         help="Run the SEARCH side with lazy interior chance evaluation (#52 lazy-vs-raw arm).",
     )
+    parser.add_argument(
+        "--rng-stream-separation",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
     parser.add_argument("--value-squash", choices=("tanh", "clip"), default="tanh",
                         help="Evaluator value squash (#60 diagnostic arm).")
     parser.add_argument(
@@ -531,6 +539,9 @@ def main() -> None:
                 "value_scale": float(args.value_scale),
                 "correct_rust_chance_spectra": bool(args.correct_rust_chance_spectra),
                 "lazy_interior_chance": bool(args.lazy_interior_chance),
+                "rng_stream_separation": bool(
+                    getattr(args, "rng_stream_separation", False)
+                ),
                 "public_observation": bool(args.public_observation),
                 "belief_chance_spectra": bool(args.belief_chance_spectra),
                 "information_set_search": bool(args.information_set_search),
@@ -670,6 +681,9 @@ def _build_summary(
         "prior_temperature": float(getattr(args, "prior_temperature", 1.0)),
         "value_scale": float(getattr(args, "value_scale", 1.0)),
         "lazy_interior_chance": bool(args.lazy_interior_chance),
+        "rng_stream_separation": bool(
+            getattr(args, "rng_stream_separation", False)
+        ),
         "value_squash": str(args.value_squash),
         "value_readout": str(getattr(args, "value_readout", "scalar")),
         "c_scale": float(args.c_scale),

@@ -99,12 +99,11 @@ _T = TypeVar("_T", bound="PipelineConfig")
 # coverage sampler's minimum effective policy-signal admission floor; a
 # fail-closed run must not share an identity with the historical no-floor run.
 # Schema 20 binds the optional nominal forced-row scalar-value mass ceiling.
-# A commissioned objective with a ceiling must never hash like the historical
-# diagnostic-only forced-row weighting regime. Schema 21 binds
-# ``policy_target_min_visits``: a target distribution written before this
-# field existed must not be able to claim the same producer schema merely
-# because today's default happens to be zero.
-CONFIG_SCHEMA_VERSION = 21
+# Schema 21 binds ``policy_target_min_visits``. Schema 22 binds explicit
+# Gumbel/chance/belief RNG-domain separation across generation and evaluation.
+# Never add fields while retaining an older schema number: omitted defaults
+# must not let old recipe bytes claim today's operator semantics.
+CONFIG_SCHEMA_VERSION = 22
 
 # Length (hex chars) of the short hash embedded in artifacts. 16 hex chars =
 # 64 bits; collision probability is negligible for the run counts here and the
@@ -552,7 +551,7 @@ class GenerateConfig(PipelineConfig):
     policy_target_min_visits: int = 0
     # The generator has always materialized the pre-search evaluator value on
     # eligible full-search roots.  Bind that invariant into typed provenance
-    # so the canonical schema21 file and the resolved GenerateConfig cannot
+    # so the canonical schema22 file and the resolved GenerateConfig cannot
     # silently claim different science identities.
     preserve_root_prior_value: bool = True
     n_full_wide: int | None = None
@@ -591,6 +590,10 @@ class GenerateConfig(PipelineConfig):
     value_readout: str = "scalar"
     correct_rust_chance_spectra: bool = True
     lazy_interior_chance: bool = False
+    # Keep root control/Gumbel draws, interior chance, and public-belief
+    # materialization in independently seeded domains. This changes target
+    # stochasticity and therefore belongs in the typed producer identity.
+    rng_stream_separation: bool = False
     exact_budget_sh: bool = False
     exact_budget_sh_min_n: int = 0
     root_wave_batching: bool = False
@@ -759,6 +762,7 @@ class EvalConfig(PipelineConfig):
     symmetry_averaged_eval_threshold: int | None = None
     correct_rust_chance_spectra: bool = True
     lazy_interior_chance: bool = False
+    rng_stream_separation: bool = False
     prior_temperature: float = 1.0
     value_scale: float = 1.0
     value_squash: str = "tanh"

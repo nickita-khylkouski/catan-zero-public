@@ -57,7 +57,11 @@ from catan_zero.rl.target_reliability import (  # noqa: E402
     TARGET_RELIABILITY_VERSION,
     target_reliability_confidence,
 )
-from catan_zero.search.rng_streams import SEARCH_RNG_STREAM_SCHEMA  # noqa: E402
+from catan_zero.search.rng_streams import (  # noqa: E402
+    SEARCH_RNG_STREAM_NAMES,
+    SEARCH_RNG_STREAM_SCHEMA,
+    SHARED_SEARCH_RNG_STREAM_SCHEMA,
+)
 from catan_zero.search.gumbel_chance_mcts import (  # noqa: E402
     GumbelChanceMCTSConfig,
 )
@@ -79,6 +83,7 @@ OPERATOR_IDENTITY_SCHEMA_V1 = "a1-operator-bound-policy-target-identity-v1"
 OPERATOR_IDENTITY_SCHEMA_V2 = "a1-operator-bound-policy-target-identity-v2"
 OPERATOR_IDENTITY_SCHEMA_V3 = "a1-operator-bound-policy-target-identity-v3"
 OPERATOR_IDENTITY_SCHEMA_V4 = "a1-operator-bound-policy-target-identity-v4"
+OPERATOR_IDENTITY_SCHEMA_V5 = "a1-operator-bound-policy-target-identity-v5"
 RD_TEACHER_TRANSITION_BINDING_SCHEMA = "a1-rd-teacher-transition-binding-v1"
 POST_WAVE_SOURCE_BINDING_SCHEMA = "a1-post-wave-source-operator-binding-v1"
 PAIRED_ROOT_VALUE_OUTPUT_SCHEMA = "a1-paired-root-value-output-contract-v1"
@@ -326,6 +331,7 @@ CHANCE_FIELDS = (
     "correct_rust_chance_spectra",
     "lazy_interior_chance",
 )
+CHANCE_FIELDS_V5 = (*CHANCE_FIELDS, "rng_stream_separation")
 SYMMETRY_FIELDS = (
     "symmetry_averaged_eval",
     "symmetry_averaged_eval_threshold",
@@ -648,9 +654,14 @@ def _rd_teacher_transition_authority(
         config_path, where="R&D teacher typed generation config"
     )
     fields = config.get("fields")
+    expected_config_schema = (
+        22
+        if base.get("operator", {}).get("rng_stream_separation") is True
+        else 13
+    )
     if (
         config.get("pipeline") != "generate"
-        or config.get("schema_version") != 13
+        or config.get("schema_version") != expected_config_schema
         or not isinstance(fields, Mapping)
     ):
         raise AlignmentError("R&D teacher typed generation config is malformed")
@@ -837,7 +848,8 @@ def _operator_identity(
             transition_authority is None
             and contract_digest != _value_sha256(contract_unsigned)
         )
-        or config.get("schema_version") != 13
+        or config.get("schema_version")
+        != (22 if identity_schema == OPERATOR_IDENTITY_SCHEMA_V5 else 13)
         or config.get("pipeline") != "generate"
         or not isinstance(fields, Mapping)
         or not isinstance(operator, Mapping)
@@ -857,7 +869,12 @@ def _operator_identity(
         )
     search = _field_bundle(fields, SEARCH_FIELDS)
     belief = _field_bundle(fields, BELIEF_FIELDS)
-    chance = _field_bundle(fields, CHANCE_FIELDS)
+    chance = _field_bundle(
+        fields,
+        CHANCE_FIELDS_V5
+        if identity_schema == OPERATOR_IDENTITY_SCHEMA_V5
+        else CHANCE_FIELDS,
+    )
     symmetry = _field_bundle(fields, SYMMETRY_FIELDS)
     semantics = _semantic_field_bundle(fields, operator, TARGET_SEMANTIC_FIELDS)
     # Stored policy columns are probabilities over the legal rows produced by
@@ -879,6 +896,8 @@ def _operator_identity(
         or belief["determinization_particles"] != 1
         or chance["correct_rust_chance_spectra"] is not True
         or chance["lazy_interior_chance"] is not True
+        or identity_schema != OPERATOR_IDENTITY_SCHEMA_V5
+        or chance["rng_stream_separation"] is not True
         or symmetry["symmetry_averaged_eval"] is not True
         or semantics["public_observation"] is not True
     ):
@@ -888,6 +907,7 @@ def _operator_identity(
         OPERATOR_IDENTITY_SCHEMA_V2,
         OPERATOR_IDENTITY_SCHEMA_V3,
         OPERATOR_IDENTITY_SCHEMA_V4,
+        OPERATOR_IDENTITY_SCHEMA_V5,
     }:
         raise AlignmentError(
             f"unsupported policy-target identity schema {identity_schema!r}"
@@ -905,11 +925,27 @@ def _operator_identity(
             **belief,
             "semantic_identity": regime,
         },
-        "chance": {
-            **chance,
-            "rng_stream_schema": SEARCH_RNG_STREAM_SCHEMA,
-            "separate_rng_domains": ["gumbel", "chance", "belief"],
-        },
+        "chance": (
+            {
+                **chance,
+                "rng_stream_schema": (
+                    SEARCH_RNG_STREAM_SCHEMA
+                    if chance["rng_stream_separation"] is True
+                    else SHARED_SEARCH_RNG_STREAM_SCHEMA
+                ),
+                "separate_rng_domains": (
+                    list(SEARCH_RNG_STREAM_NAMES)
+                    if chance["rng_stream_separation"] is True
+                    else []
+                ),
+            }
+            if identity_schema == OPERATOR_IDENTITY_SCHEMA_V5
+            else {
+                **chance,
+                "rng_stream_schema": SEARCH_RNG_STREAM_SCHEMA,
+                "separate_rng_domains": ["gumbel", "chance", "belief"],
+            }
+        ),
         "symmetry": symmetry,
         "target_semantics": {
             **semantics,
@@ -931,7 +967,10 @@ def _operator_identity(
             "operator_semantic_sha256": _value_sha256(operator),
         },
     }
-    if identity_schema == OPERATOR_IDENTITY_SCHEMA_V4:
+    if identity_schema in {
+        OPERATOR_IDENTITY_SCHEMA_V4,
+        OPERATOR_IDENTITY_SCHEMA_V5,
+    }:
         try:
             teacher_adapter = train_bc._checkpoint_entity_feature_adapter_version(  # noqa: SLF001
                 str(checkpoint)
@@ -946,7 +985,7 @@ def _operator_identity(
             != teacher_adapter
         ):
             raise AlignmentError(
-                "v4 target identity requires explicit checkpoint-matched V6 adapter"
+                "v4/v5 target identity requires explicit checkpoint-matched V6 adapter"
             )
         value["teacher_feature_contract"] = {
             "schema_version": ENTITY_FEATURE_ADAPTER_CHECKPOINT_SCHEMA,
@@ -958,6 +997,7 @@ def _operator_identity(
         OPERATOR_IDENTITY_SCHEMA_V2,
         OPERATOR_IDENTITY_SCHEMA_V3,
         OPERATOR_IDENTITY_SCHEMA_V4,
+        OPERATOR_IDENTITY_SCHEMA_V5,
     }:
         execution = (
             dict(target_execution)
@@ -980,7 +1020,11 @@ def _operator_identity(
                 value["teacher_feature_contract"][
                     "entity_feature_adapter_version"
                 ]
-                if identity_schema == OPERATOR_IDENTITY_SCHEMA_V4
+                if identity_schema
+                in {
+                    OPERATOR_IDENTITY_SCHEMA_V4,
+                    OPERATOR_IDENTITY_SCHEMA_V5,
+                }
                 else None
             ),
         )
@@ -999,6 +1043,7 @@ def _operator_identity(
     if identity_schema in {
         OPERATOR_IDENTITY_SCHEMA_V3,
         OPERATOR_IDENTITY_SCHEMA_V4,
+        OPERATOR_IDENTITY_SCHEMA_V5,
     }:
         value["root_value_output_contract"] = _paired_root_value_output_contract(
             fields,
@@ -1029,6 +1074,7 @@ def _operator_identity(
         OPERATOR_IDENTITY_SCHEMA_V2,
         OPERATOR_IDENTITY_SCHEMA_V3,
         OPERATOR_IDENTITY_SCHEMA_V4,
+        OPERATOR_IDENTITY_SCHEMA_V5,
     }:
         scientific_keys.extend(
             (
@@ -1041,9 +1087,13 @@ def _operator_identity(
     if identity_schema in {
         OPERATOR_IDENTITY_SCHEMA_V3,
         OPERATOR_IDENTITY_SCHEMA_V4,
+        OPERATOR_IDENTITY_SCHEMA_V5,
     }:
         scientific_keys.append("root_value_output_contract")
-    if identity_schema == OPERATOR_IDENTITY_SCHEMA_V4:
+    if identity_schema in {
+        OPERATOR_IDENTITY_SCHEMA_V4,
+        OPERATOR_IDENTITY_SCHEMA_V5,
+    }:
         scientific_keys.append("teacher_feature_contract")
     scientific = {key: value[key] for key in scientific_keys}
     scientific["producer_checkpoint"] = {
@@ -1052,6 +1102,7 @@ def _operator_identity(
     if identity_schema in {
         OPERATOR_IDENTITY_SCHEMA_V3,
         OPERATOR_IDENTITY_SCHEMA_V4,
+        OPERATOR_IDENTITY_SCHEMA_V5,
     }:
         scientific_output = dict(scientific["root_value_output_contract"])
         scientific_authority = dict(scientific_output["authority"])
@@ -1762,7 +1813,7 @@ def _build_plan(args: argparse.Namespace) -> dict[str, Any]:
         args.target_operator_contract,
         args.target_checkpoint,
         require_current_target=True,
-        identity_schema=OPERATOR_IDENTITY_SCHEMA_V4,
+        identity_schema=OPERATOR_IDENTITY_SCHEMA_V5,
         target_execution=STAGE_C_TARGET_EXECUTION,
     )
     if (
@@ -2195,6 +2246,7 @@ def _verify_plan(path: Path) -> dict[str, Any]:
                     OPERATOR_IDENTITY_SCHEMA_V2,
                     OPERATOR_IDENTITY_SCHEMA_V3,
                     OPERATOR_IDENTITY_SCHEMA_V4,
+                    OPERATOR_IDENTITY_SCHEMA_V5,
                 }
                 and identity_key == "target_policy_target_identity"
                 else None

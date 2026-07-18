@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import random
 import sys
 from types import SimpleNamespace
 
@@ -151,6 +152,86 @@ def test_native_rng_stream_separation_refuses_silent_operator_drift(
 
     with pytest.raises(ValueError, match="rng_stream_separation"):
         search._validate_native_semantics()
+
+def test_native_rng_stream_separation_routes_explicit_seed_domains(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(
+        sys.modules,
+        "catanatron_rs",
+        SimpleNamespace(
+            gumbel_search_capabilities=lambda: ["rng_stream_separation"]
+        ),
+    )
+    search = object.__new__(NativeGumbelChanceMCTS)
+    search.config = GumbelChanceMCTSConfig(rng_stream_separation=True)
+    search.using_native_hot_loop = True
+    search._gumbel_rng = SimpleNamespace(getrandbits=lambda _bits: 11)
+    search._chance_rng = SimpleNamespace(getrandbits=lambda _bits: 13)
+    search._belief_materialization_seed = 17
+    search._boundary_value_particle_seeds = ()
+
+    native = search._native_config()
+
+    assert native["seed"] == 11
+    assert native["control_seed"] == 11
+    assert native["chance_seed"] == 13
+    assert native["belief_seed"] == 17
+
+
+def test_native_belief_materialization_seed_ignores_advancing_belief_rng(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(
+        sys.modules,
+        "catanatron_rs",
+        SimpleNamespace(
+            gumbel_search_capabilities=lambda: ["rng_stream_separation"]
+        ),
+    )
+    search = object.__new__(NativeGumbelChanceMCTS)
+    search.config = GumbelChanceMCTSConfig(rng_stream_separation=True)
+    search.using_native_hot_loop = True
+    search._gumbel_rng = SimpleNamespace(getrandbits=lambda _bits: 11)
+    search._chance_rng = SimpleNamespace(getrandbits=lambda _bits: 13)
+    search._belief_rng = SimpleNamespace(
+        getrandbits=lambda _bits: (_ for _ in ()).throw(
+            AssertionError("native config must not consume advancing belief RNG")
+        )
+    )
+    search._belief_materialization_seed = 17
+    search._boundary_value_particle_seeds = ()
+
+    assert search._native_config()["belief_seed"] == 17
+
+
+def test_native_and_reference_bind_same_static_belief_materialization_seed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(
+        sys.modules,
+        "catanatron_rs",
+        SimpleNamespace(
+            gumbel_search_capabilities=lambda: ["rng_stream_separation"]
+        ),
+    )
+    config = GumbelChanceMCTSConfig(rng_stream_separation=True)
+    reference = object.__new__(GumbelChanceMCTS)
+    reference.config = config
+    reference.rng = random.Random()
+    reference.seed_search_rngs(101)
+
+    native = object.__new__(NativeGumbelChanceMCTS)
+    native.config = config
+    native.using_native_hot_loop = True
+    native.rng = random.Random()
+    native.seed_search_rngs(101)
+    native._boundary_value_particle_seeds = ()
+
+    assert (
+        native._native_config()["belief_seed"]
+        == reference._belief_materialization_seed
+    )
 
 
 def test_native_config_revalidates_temperature_after_runtime_mutation(

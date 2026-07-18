@@ -1,0 +1,89 @@
+{
+  "schema_version": "a1-coherent-target-rd-contract-v2",
+  "contract_id": "a1-v6-history64-coherent-n128-separated-rng-reanalysis-operator-20260717-r2",
+  "status": "ready_nonpromotable_reanalysis_operator",
+  "purpose": "Bind coherent public-belief n128 search to an exact V6/history64 checkpoint and explicit three-domain RNG separation for bounded Stage-C root reanalysis.",
+  "target_information_regime": "public_belief_single_tree_v1",
+  "producer_checkpoint": {
+    "path": "/home/ubuntu/catan-zero-production/runs/learner/a1-production-l1-one-dose-20260712-r3/candidate.pt",
+    "sha256": "sha256:6817ab054506f962a758ebf48addce5cc7eb801bf451cf2d02b62fb91f5da39c"
+  },
+  "source_population": {
+    "mode": "reanalysis_only",
+    "opponent_mix": null,
+    "opponent_pool": null,
+    "reason": "This immutable operator template is consumed only through a checkpoint-bound R&D teacher-transition binding."
+  },
+  "operator": {
+    "n_full": 128,
+    "n_fast": 16,
+    "p_full": 0.25,
+    "adaptive_wide_budget": null,
+    "coherent_public_belief_search": true,
+    "information_set_search": false,
+    "determinization_particles": 1,
+    "c_visit": 50.0,
+    "c_scale": 0.1,
+    "sigma_eval": 0.79,
+    "symmetry_averaged_eval": true,
+    "symmetry_averaged_eval_threshold": 20,
+    "forced_root_target_mode": "trajectory_only",
+    "record_automatic_transitions": true,
+    "meaningful_public_history": true,
+    "meaningful_public_history_schema": "meaningful_public_history_2p_no_trade_v2",
+    "event_history_limit": 64,
+    "teacher_entity_feature_adapter_version": "rust_entity_adapter_v6_exact_actor_resources_initial_road_two_hop",
+    "learner_entity_feature_adapter_version": "rust_entity_adapter_v6_exact_actor_resources_initial_road_two_hop",
+    "preserve_search_evidence": true,
+    "native_mcts_hot_loop": true,
+    "rng_stream_separation": true,
+    "rust_featurize": true
+  },
+  "execution": {
+    "historical_template_only": true,
+    "host": "149.118.65.110",
+    "gpu_model": "B200",
+    "gpu_count": 8,
+    "total_games": 8192,
+    "seed_start": 570000008192,
+    "seed_end": 570000016384,
+    "lanes": [
+      {
+        "lane_id": "b200_gpu0_template",
+        "host": "149.118.65.110",
+        "gpu": 0,
+        "base_seed": 570000008192,
+        "games": 8192
+      }
+    ]
+  },
+  "artifacts": {
+    "typed_generation_config": {
+      "path": "configs/experiments/teacher_transition/coherent_public_n128_v6_history64_teacher.schema22.json",
+      "sha256": "sha256:72083c81f38164843a0e5e4cb302d7ca526842fb8545aed2dda08b696edf8713"
+    },
+    "generation_guard": {
+      "path": "configs/guards/a1_generation_coherent_public_n128_v6_history64_rd_v2.json",
+      "sha256": "sha256:c7a0c0908d204b7b7c22b9704d08f4f4d6b9d85278cfd2df693f2ab3b9337923"
+    }
+  },
+  "acceptance": {
+    "require_unique_game_seeds": true,
+    "require_complete_contiguous_two_seat_action_trace": true,
+    "require_target_information_regime": "public_belief_single_tree_v1",
+    "require_policy_active_rows": true,
+    "require_search_evidence_schema": "gumbel_root_search_evidence_v2_fp32_prior",
+    "require_public_observation": true,
+    "require_meaningful_public_history": true,
+    "require_public_card_count_schema": "public_card_state_v2",
+    "require_forced_value_rows_in_every_game": true,
+    "forced_row_policy_weight_multiplier": 0.0,
+    "forced_row_value_weight_multiplier": 1.0
+  },
+  "eligibility": {
+    "production_promotion_eligible": false,
+    "self_play_generation_eligible": false,
+    "stage_c_root_reanalysis_eligible": true
+  },
+  "contract_sha256": "sha256:ba9b4cd7e1aa2e5d3457e2a6ea0f656a046e6080934c3f00c9a834b96f5dc80e"
+}
