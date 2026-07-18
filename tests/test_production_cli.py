@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import multiprocessing
 from pathlib import Path
@@ -288,9 +289,7 @@ def test_status_exposes_v7_parent_and_scratch_as_fail_closed() -> None:
     assert parent["status"] == "blocked"
     assert parent["reason"] == ("v8_parent_update_requires_fresh_commissioning")
     assert len(parent["unresolved_requirements"]) == 1
-    shared_action = train["recipes"][
-        "a1-parent-update-shared-action25-35m-b200"
-    ]
+    shared_action = train["recipes"]["a1-parent-update-shared-action25-35m-b200"]
     assert shared_action["authorized"] is False
     assert shared_action["status"] == "blocked"
     assert shared_action["reason"] == (
@@ -916,6 +915,546 @@ def test_execute_refuses_before_receipt_or_subprocess(
     assert not Path(plan["run_receipt"]).exists()
 
 
+def _parent_update_admissible_report(
+    plan: dict[str, object],
+    *,
+    checkpoint: Path,
+) -> tuple[dict[str, object], set[str]]:
+    contract = plan["contract"]
+    assert isinstance(contract, dict)
+    config_path = Path(str(contract["config"]))
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    fields = config["train_config"]["fields"]
+    engine = config["engine_settings"]
+    max_steps = int(fields["max_steps"])
+    world_size = 8
+    global_batch_size = (
+        world_size * int(fields["batch_size"]) * int(fields["grad_accum_steps"])
+    )
+    checkpoint_steps = [
+        int(token) for token in str(engine["checkpoint_steps"]).split(",")
+    ]
+    terminal_steps = [*checkpoint_steps, max_steps]
+    required_modules = sorted(
+        name.strip()
+        for name in str(engine["require_feature_learning_signal_modules"]).split(",")
+        if name.strip()
+    )
+    module_row = {
+        "mean_pre_clip_grad_norm": 0.25,
+        "max_pre_clip_grad_norm": 0.5,
+        "mean_parameter_delta_norm": 0.01,
+        "mean_parameter_update_rms": 0.001,
+        "mean_relative_parameter_delta": 0.0001,
+        "parameter_count": 64,
+    }
+    modules = {name: dict(module_row) for name in required_modules}
+    admitted_modules = {
+        name: {
+            key: value
+            for key, value in module_row.items()
+            if key
+            in {
+                "mean_pre_clip_grad_norm",
+                "max_pre_clip_grad_norm",
+                "mean_parameter_delta_norm",
+                "mean_parameter_update_rms",
+                "parameter_count",
+            }
+        }
+        for name in required_modules
+    }
+    module_observability = {
+        "schema_version": "module-optimizer-observability-v1",
+        "observed_steps": 2,
+        "cadence_batches": int(engine["train_diagnostics_every_batches"]),
+        "norm_scope": "global_replicated",
+        "modules": modules,
+    }
+    feature_admission = {
+        "schema_version": "a1-feature-learning-signal-admission-v1",
+        "authenticated": True,
+        "observed_steps": 2,
+        "cadence_batches": int(engine["train_diagnostics_every_batches"]),
+        "norm_scope": "global_replicated",
+        "required_modules": required_modules,
+        "positive_signal_fields": [
+            "mean_pre_clip_grad_norm",
+            "max_pre_clip_grad_norm",
+            "mean_parameter_delta_norm",
+            "mean_parameter_update_rms",
+        ],
+        "modules": admitted_modules,
+    }
+    objective_observations = [
+        {
+            "optimizer_step": step,
+            "available": True,
+            "policy_trunk_grad_norm": 1.0,
+            "value_trunk_grad_norm": 0.2,
+            "combined_trunk_grad_norm": 1.1,
+            "value_to_policy_grad_norm_ratio": 0.2,
+            "trunk_gradient_cosine": 0.25,
+            "opposing_coordinate_fraction": 0.1,
+        }
+        for step in (1, int(engine["objective_gradient_interference_every_batches"]))
+    ]
+    objective_admission_rows = [
+        {
+            key: value
+            for key, value in row.items()
+            if key
+            in {
+                "optimizer_step",
+                "policy_trunk_grad_norm",
+                "value_trunk_grad_norm",
+                "combined_trunk_grad_norm",
+                "value_to_policy_grad_norm_ratio",
+                "trunk_gradient_cosine",
+                "opposing_coordinate_fraction",
+            }
+        }
+        for row in objective_observations
+    ]
+
+    intermediate_records: list[dict[str, object]] = []
+    checkpoint_ref_by_step: dict[int, dict[str, str]] = {}
+    expected_outputs: set[str] = set()
+    for step in checkpoint_steps:
+        path = checkpoint.with_name(
+            f"{checkpoint.stem}_step{step:04d}{checkpoint.suffix}"
+        )
+        path.write_bytes(f"checkpoint-step-{step}".encode("ascii"))
+        digest = cli._file_sha256(path)  # noqa: SLF001
+        intermediate_records.append(
+            {
+                "schema_version": "train-bc-intermediate-checkpoint-v1",
+                "optimizer_step": step,
+                "checkpoint": str(path),
+                "checkpoint_sha256": f"sha256:{digest}",
+                "size_bytes": path.stat().st_size,
+                "same_training_trajectory": True,
+                "optimizer_sidecar": None,
+            }
+        )
+        checkpoint_ref_by_step[step] = {
+            "path": str(path),
+            "sha256": f"sha256:{digest}",
+        }
+        expected_outputs.add(f"training_checkpoint_step_{step:06d}")
+    checkpoint_ref_by_step[max_steps] = {
+        "path": str(checkpoint),
+        "sha256": f"sha256:{cli._file_sha256(checkpoint)}",  # noqa: SLF001
+    }
+
+    aux_batch_size = int(fields["policy_aux_active_batch_size"])
+    aux_coefficient = float(fields["policy_aux_loss_weight"])
+
+    def dose_row(step: int) -> dict[str, object]:
+        base_draws = step * global_batch_size
+        aux_draws = step * world_size * aux_batch_size
+        base_mass = float(base_draws)
+        aux_mass = float(aux_draws)
+        total_mass = base_mass + aux_mass
+        weighted_mass = base_mass + (
+            aux_coefficient * aux_mass if aux_draws > 0 else 0.0
+        )
+        optimizer = {
+            "observed_steps": step,
+            "clipped_steps": step // 4,
+            "clipped_fraction": (step // 4) / step,
+            "zero_objective_steps_skipped": 0,
+            "mean_pre_clip_total_grad_norm": 0.75,
+            "max_pre_clip_total_grad_norm": 1.25,
+        }
+        return {
+            "schema_version": "train-bc-checkpoint-dose-telemetry-v1",
+            "optimizer_step": step,
+            "training_row_draws": {
+                "base_training_row_draws": base_draws,
+                "policy_aux_training_row_draws": aux_draws,
+                "policy_active_training_row_draws": base_draws + aux_draws,
+                "value_active_training_row_draws": base_draws,
+                "total_training_row_draws": base_draws + aux_draws,
+            },
+            "active_rows": {
+                "policy_base": base_draws,
+                "policy_aux": aux_draws,
+                "policy_total": base_draws + aux_draws,
+                "value": base_draws,
+                "policy_kl_anchor": 0,
+            },
+            "policy_objective_dose": {
+                "active_rows": base_draws + aux_draws,
+                "equivalent_active_rows": float(base_draws + aux_draws),
+                "coefficient_weighted_effective_weight_sum": weighted_mass,
+                "equivalent_effective_weight_sum": weighted_mass,
+                "optimizer_updates": step,
+                "equivalent_optimizer_updates": float(step),
+            },
+            "policy_effective_weight_sums": {
+                "base": base_mass,
+                "aux": aux_mass,
+                "total": total_mass,
+            },
+            "policy_stream_objective": {
+                "schema_version": "train-policy-stream-objective-v1",
+                "formula": "base_mean + aux_coefficient * aux_mean",
+                "normalization": "independent_weighted_means",
+                "base_coefficient": 1.0,
+                "aux_enabled": aux_draws > 0,
+                "aux_coefficient": aux_coefficient if aux_draws > 0 else 0.0,
+                "base_denominator": base_mass,
+                "aux_denominator": aux_mass,
+            },
+            "objective_effective_weight_sums": {
+                "policy_base_loss": base_mass,
+                "policy_aux_loss": aux_mass,
+                "active_policy_loss": aux_mass,
+            },
+            "optimizer": optimizer,
+            "shared_trunk_objective_gradients": {
+                "schema_version": "objective-gradient-dose-observations-v2",
+                "cadence_batches": int(
+                    engine["objective_gradient_interference_every_batches"]
+                ),
+                "observed_steps": sum(
+                    row["optimizer_step"] <= step for row in objective_observations
+                ),
+                "observations": [
+                    row
+                    for row in objective_observations
+                    if int(row["optimizer_step"]) <= step
+                ],
+            },
+            "module_optimizer_observability": {
+                **module_observability,
+                "observed_steps": step
+                // int(engine["train_diagnostics_every_batches"]),
+            },
+        }
+
+    trajectory_rows = [dose_row(step) for step in terminal_steps]
+    terminal_dose = trajectory_rows[-1]
+    multiplier_area = sum(
+        (step + 1) / int(fields["lr_warmup_steps"]) for step in range(max_steps)
+    )
+    base_lr = float(fields["lr"])
+    semantic_multipliers = {"base": 1.0}
+    for name, field in (
+        ("value", "value_lr_mult"),
+        ("action_local", "action_module_lr_mult"),
+        ("shared_action", "shared_action_lr_mult"),
+        ("public_card", "public_card_lr_mult"),
+        ("trunk", "trunk_lr_mult"),
+    ):
+        multiplier = float(fields[field])
+        if multiplier != 1.0:
+            semantic_multipliers[name] = multiplier
+    optimizer_lr_groups = [
+        {
+            "semantic_group_name": name,
+            "optimizer_group_indices": [index * 2, index * 2 + 1],
+            "optimizer_group_count": 2,
+            "parameter_tensors": 4,
+            "parameters": 256,
+            "base_lr": base_lr * multiplier,
+            "integrated_lr_area": group_lr * multiplier_area,
+            "mean_applied_lr": group_lr * multiplier_area / max_steps,
+        }
+        for index, (name, multiplier) in enumerate(semantic_multipliers.items())
+        for group_lr in (base_lr * multiplier,)
+    ]
+    terminal_optimizer = terminal_dose["optimizer"]
+    assert isinstance(terminal_optimizer, dict)
+    report: dict[str, object] = {
+        "checkpoint": str(checkpoint),
+        "max_steps": max_steps,
+        "exact_max_steps": True,
+        "steps_completed": max_steps,
+        "total_training_steps": max_steps,
+        "world_size": world_size,
+        "batch_size": int(fields["batch_size"]),
+        "grad_accum_steps": int(fields["grad_accum_steps"]),
+        "effective_global_batch_size": global_batch_size,
+        "optimizer": fields["optimizer"],
+        "lr": float(fields["lr"]),
+        "lr_warmup_steps": int(fields["lr_warmup_steps"]),
+        "lr_schedule": fields["lr_schedule"],
+        "max_grad_norm": float(fields["max_grad_norm"]),
+        "weight_decay": float(fields["weight_decay"]),
+        "policy_loss_weight": float(fields["policy_loss_weight"]),
+        "policy_aux_active_batch_size": aux_batch_size,
+        "policy_aux_loss_weight": aux_coefficient,
+        "policy_aux_sampling_mode": fields["policy_aux_sampling_mode"],
+        "value_lr_mult": float(fields["value_lr_mult"]),
+        "action_module_lr_mult": float(fields["action_module_lr_mult"]),
+        "shared_action_lr_mult": float(fields["shared_action_lr_mult"]),
+        "public_card_lr_mult": float(fields["public_card_lr_mult"]),
+        "trunk_lr_mult": float(fields["trunk_lr_mult"]),
+        "value_trunk_grad_scale": float(fields["value_trunk_grad_scale"]),
+        "train_diagnostics_every_batches": int(
+            engine["train_diagnostics_every_batches"]
+        ),
+        "objective_gradient_interference_every_batches": int(
+            engine["objective_gradient_interference_every_batches"]
+        ),
+        "a1_canonical_parent_update_authority": {
+            "schema_version": "a1-canonical-parent-update-runtime-authority-v1",
+            "config": str(config_path.resolve()),
+            "config_file_sha256": f"sha256:{cli._file_sha256(config_path)}",  # noqa: SLF001
+            "diagnostic_only": True,
+            "promotion_eligible": False,
+        },
+        "optimizer_lr_dose": {
+            "schema_version": "optimizer-lr-dose-v2",
+            "scope": "updates_applied_in_this_process_invocation",
+            "applied_updates": max_steps,
+            "integrated_schedule_multiplier_area": multiplier_area,
+            "mean_schedule_multiplier": multiplier_area / max_steps,
+            "parameter_groups": optimizer_lr_groups,
+        },
+        "checkpoint_steps_requested": checkpoint_steps,
+        "intermediate_checkpoints": intermediate_records,
+        "checkpoint_dose_trajectory": {
+            "schema_version": "train-bc-checkpoint-dose-trajectory-v1",
+            "checkpoint_steps": terminal_steps,
+            "checkpoints": trajectory_rows,
+        },
+        "checkpoint_holdout_frontier": {
+            "schema_version": "train-bc-checkpoint-holdout-frontier-v1",
+            "measure": "report_bound_raw_validation_rows",
+            "validation_game_seed_set_sha256": "sha256:" + "1" * 64,
+            "checkpoints": [
+                {
+                    "schema_version": "train-bc-checkpoint-holdout-v1",
+                    "optimizer_step": step,
+                    "checkpoint": checkpoint_ref_by_step[step]["path"],
+                    "checkpoint_sha256": checkpoint_ref_by_step[step]["sha256"],
+                    "measure": "report_bound_raw_validation_rows",
+                    "validation_game_seed_set_sha256": "sha256:" + "1" * 64,
+                    "metrics": {"loss": 0.75, "samples": 512},
+                }
+                for step in terminal_steps
+            ],
+        },
+        "module_optimizer_observability": module_observability,
+        "feature_learning_signal_admission": feature_admission,
+        "objective_gradient_interference": {
+            "schema_version": "objective-gradient-dose-observations-v1",
+            "cadence_batches": int(
+                engine["objective_gradient_interference_every_batches"]
+            ),
+            "observed_steps": len(objective_observations),
+            "observations": objective_observations,
+        },
+        "objective_gradient_signal_admission": {
+            "schema_version": "a1-objective-gradient-signal-admission-v1",
+            "authenticated": True,
+            "cadence_batches": int(
+                engine["objective_gradient_interference_every_batches"]
+            ),
+            "observed_steps": len(objective_admission_rows),
+            "world_size": world_size,
+            "scalar_value_trunk_grad_scale": float(fields["value_trunk_grad_scale"]),
+            "observations": objective_admission_rows,
+        },
+        "base_training_row_draws": terminal_dose["training_row_draws"][
+            "base_training_row_draws"
+        ],
+        "policy_aux_training_row_draws": terminal_dose["training_row_draws"][
+            "policy_aux_training_row_draws"
+        ],
+        "total_training_row_draws": terminal_dose["training_row_draws"][
+            "total_training_row_draws"
+        ],
+        "policy_base_active_rows": terminal_dose["active_rows"]["policy_base"],
+        "policy_aux_active_rows": terminal_dose["active_rows"]["policy_aux"],
+        "policy_total_active_rows": terminal_dose["active_rows"]["policy_total"],
+        "value_active_rows": terminal_dose["active_rows"]["value"],
+        "policy_base_effective_weight_sum": terminal_dose[
+            "policy_effective_weight_sums"
+        ]["base"],
+        "policy_aux_effective_weight_sum": terminal_dose[
+            "policy_effective_weight_sums"
+        ]["aux"],
+        "policy_total_effective_weight_sum": terminal_dose[
+            "policy_effective_weight_sums"
+        ]["total"],
+        "policy_objective_effective_weight_sum": terminal_dose["policy_objective_dose"][
+            "coefficient_weighted_effective_weight_sum"
+        ],
+        "policy_objective_optimizer_updates": max_steps,
+        "metrics": [
+            {
+                "epoch": 1,
+                "loss": 1.0,
+                "policy_loss": 0.75,
+                "value_loss": 0.25,
+                "optimizer_observability": terminal_optimizer,
+            }
+        ],
+    }
+    return report, expected_outputs
+
+
+def _parent_validation_fixture(
+    tmp_path: Path,
+    *,
+    recipe: str = "a1-parent-update-35m-b200",
+) -> tuple[dict[str, object], dict[str, object], Path, dict[str, object]]:
+    plan = cli.build_plan(_write_job(tmp_path, "train", recipe=recipe))
+    run_dir = Path(str(plan["job"]["run_dir"]))
+    run_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint = run_dir / "candidate.pt"
+    checkpoint.write_bytes(b"trained-candidate")
+    report, _ = _parent_update_admissible_report(plan, checkpoint=checkpoint)
+    checkpoint_ref, _ = cli._stable_output_ref(  # noqa: SLF001
+        checkpoint, label="training checkpoint"
+    )
+    return plan, report, checkpoint, checkpoint_ref
+
+
+@pytest.mark.parametrize(
+    "recipe",
+    (
+        "a1-parent-update-35m-b200",
+        "a1-parent-update-shared-action25-35m-b200",
+        "a1-parent-update-value25-35m-b200",
+        "a1-parent-update-active-p10-35m-b200",
+        "a1-parent-update-active-p25-35m-b200",
+    ),
+)
+def test_parent_update_validator_accepts_every_catalog_recipe(
+    tmp_path: Path, recipe: str
+) -> None:
+    plan, report, checkpoint, checkpoint_ref = _parent_validation_fixture(
+        tmp_path, recipe=recipe
+    )
+
+    admitted = cli._verify_parent_update_outputs(  # noqa: SLF001
+        plan,
+        report=report,
+        checkpoint_path=checkpoint,
+        checkpoint_ref=checkpoint_ref,
+    )
+
+    assert set(admitted) == {
+        "training_checkpoint_step_000008",
+        "training_checkpoint_step_000010",
+    }
+    if recipe in {
+        "a1-parent-update-35m-b200",
+        "a1-parent-update-active-p10-35m-b200",
+    }:
+        dose = report["optimizer_lr_dose"]
+        assert isinstance(dose, dict)
+        assert [row["semantic_group_name"] for row in dose["parameter_groups"]] == [
+            "base",
+            "trunk",
+        ]
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    (
+        "short_run",
+        "lr_area",
+        "semantic_group",
+        "trajectory",
+        "nonfinite_clipping",
+        "aux_dose",
+        "feature_admission",
+        "objective_admission",
+        "holdout_binding",
+    ),
+)
+def test_parent_update_validator_rejects_authenticated_report_drift(
+    tmp_path: Path, tamper: str
+) -> None:
+    plan, original, checkpoint, checkpoint_ref = _parent_validation_fixture(
+        tmp_path, recipe="a1-parent-update-active-p10-35m-b200"
+    )
+    report = copy.deepcopy(original)
+    trajectory = report["checkpoint_dose_trajectory"]
+    assert isinstance(trajectory, dict)
+    rows = trajectory["checkpoints"]
+    assert isinstance(rows, list)
+
+    if tamper == "short_run":
+        report["steps_completed"] = 3
+    elif tamper == "lr_area":
+        dose = report["optimizer_lr_dose"]
+        assert isinstance(dose, dict)
+        dose["integrated_schedule_multiplier_area"] = 0.0
+    elif tamper == "semantic_group":
+        dose = report["optimizer_lr_dose"]
+        assert isinstance(dose, dict)
+        groups = dose["parameter_groups"]
+        assert isinstance(groups, list)
+        groups[0]["semantic_group_name"] = "anonymous"
+    elif tamper == "trajectory":
+        trajectory["checkpoint_steps"] = [10, 8, 12]
+    elif tamper == "nonfinite_clipping":
+        rows[0]["optimizer"]["clipped_fraction"] = float("nan")
+    elif tamper == "aux_dose":
+        rows[-1]["active_rows"]["policy_aux"] = 0
+    elif tamper == "feature_admission":
+        report["feature_learning_signal_admission"]["authenticated"] = False
+    elif tamper == "objective_admission":
+        report["objective_gradient_signal_admission"]["observed_steps"] = "2"
+    elif tamper == "holdout_binding":
+        report["checkpoint_holdout_frontier"]["checkpoints"][-1][
+            "checkpoint_sha256"
+        ] = "sha256:" + "0" * 64
+    else:
+        raise AssertionError(f"unknown tamper: {tamper}")
+
+    with pytest.raises(cli.ProductionCLIError):
+        cli._verify_parent_update_outputs(  # noqa: SLF001
+            plan,
+            report=report,
+            checkpoint_path=checkpoint,
+            checkpoint_ref=checkpoint_ref,
+        )
+
+
+def test_parent_update_validator_hashes_and_requires_intermediate_checkpoints(
+    tmp_path: Path,
+) -> None:
+    plan, report, checkpoint, checkpoint_ref = _parent_validation_fixture(tmp_path)
+    records = report["intermediate_checkpoints"]
+    assert isinstance(records, list)
+    intermediate = Path(str(records[0]["checkpoint"]))
+    intermediate.write_bytes(b"tampered-after-report")
+
+    with pytest.raises(cli.ProductionCLIError, match="binding drifted"):
+        cli._verify_parent_update_outputs(  # noqa: SLF001
+            plan,
+            report=report,
+            checkpoint_path=checkpoint,
+            checkpoint_ref=checkpoint_ref,
+        )
+
+
+def test_parent_update_validator_rejects_legacy_minimal_success_report(
+    tmp_path: Path,
+) -> None:
+    plan, _report, checkpoint, checkpoint_ref = _parent_validation_fixture(tmp_path)
+
+    with pytest.raises(cli.ProductionCLIError, match="recipe echo drift"):
+        cli._verify_parent_update_outputs(  # noqa: SLF001
+            plan,
+            report={
+                "checkpoint": str(checkpoint),
+                "steps_completed": 3,
+                "epochs": 1,
+            },
+            checkpoint_path=checkpoint,
+            checkpoint_ref=checkpoint_ref,
+        )
+
+
 def _write_admissible_outputs(plan: dict[str, object]) -> set[str]:
     job = plan["job"]
     inputs = plan["inputs"]
@@ -946,17 +1485,24 @@ def _write_admissible_outputs(plan: dict[str, object]) -> set[str]:
         candidate = run_dir / "candidate.pt"
         report = run_dir / "train.report.json"
         candidate.write_bytes(b"trained-candidate")
-        report.write_text(
-            json.dumps(
-                {
-                    "checkpoint": str(candidate),
-                    "steps_completed": 3,
-                    "epochs": 1,
-                }
-            ),
-            encoding="utf-8",
-        )
         expected = {"training_candidate", "training_report"}
+        if cli._is_parent_update_recipe(job["recipe"]):  # noqa: SLF001
+            report_payload, parent_outputs = _parent_update_admissible_report(
+                plan, checkpoint=candidate
+            )
+            expected.update(parent_outputs)
+            report.write_text(json.dumps(report_payload), encoding="utf-8")
+        else:
+            report.write_text(
+                json.dumps(
+                    {
+                        "checkpoint": str(candidate),
+                        "steps_completed": 3,
+                        "epochs": 1,
+                    }
+                ),
+                encoding="utf-8",
+            )
         if job["recipe"] == "a1-current-35m-b200":
             execution = {
                 "schema_version": "a1-coherent-scratch-training-execution-v2",
@@ -1057,6 +1603,7 @@ def test_zero_exit_without_required_outputs_is_failed_and_nonzero(
     (
         ("generate", None),
         ("train", "a1-parent-update-35m-b200"),
+        ("train", "a1-parent-update-active-p10-35m-b200"),
         ("train", "a1-current-35m-b200"),
         ("evaluate", None),
     ),

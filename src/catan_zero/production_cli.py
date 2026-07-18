@@ -8,6 +8,7 @@ import fcntl
 import hashlib
 from importlib import metadata
 import json
+import math
 import os
 from pathlib import Path
 import platform
@@ -17,7 +18,7 @@ import stat
 import subprocess
 import sys
 from time import time
-from typing import Any, Iterator, Sequence
+from typing import Any, Iterator, Mapping, Sequence
 
 from catan_zero.production_contracts import (
     NATIVE_REQUIRED_CAPABILITIES,
@@ -35,6 +36,8 @@ PLAN_SCHEMA = "catan-zero-production-plan-v1"
 RUN_RECEIPT_SCHEMA = "catan-zero-production-run-v1"
 _RUN_ID = re.compile(r"^[a-z0-9][a-z0-9._-]{2,95}$")
 _CUDA_DEVICE = re.compile(r"^cuda:(0|[1-9][0-9]*)$")
+_SCRATCH_TRAIN_RECIPE = "a1-current-35m-b200"
+_PARENT_UPDATE_RECIPE_PREFIX = "a1-parent-update-"
 _COMMON_KEYS = {"schema_version", "pipeline", "run_id", "run_dir"}
 _PIPELINE_KEYS = {
     "generate": {
@@ -71,6 +74,10 @@ _PIPELINE_KEYS = {
 
 class ProductionCLIError(RuntimeError):
     """A production job is malformed, unsafe, or not currently authorized."""
+
+
+def _is_parent_update_recipe(value: object) -> bool:
+    return isinstance(value, str) and value.startswith(_PARENT_UPDATE_RECIPE_PREFIX)
 
 
 def repo_root() -> Path:
@@ -809,7 +816,7 @@ def doctor(plan: dict[str, Any]) -> dict[str, Any]:
         )
     if (
         plan["job"]["pipeline"] == "train"
-        and plan["job"]["recipe"] == "a1-current-35m-b200"
+        and plan["job"]["recipe"] == _SCRATCH_TRAIN_RECIPE
         and "plan_receipt" not in plan["inputs"]
     ):
         errors.append(
@@ -1025,6 +1032,500 @@ def _require_checkpoint_ref(
         raise ProductionCLIError(f"required {label} checkpoint binding drift")
 
 
+def _finite_parent_number(
+    value: object, *, field: str, minimum: float | None = None
+) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ProductionCLIError(f"parent-update {field} must be numeric")
+    parsed = float(value)
+    if not math.isfinite(parsed) or (minimum is not None and parsed < minimum):
+        raise ProductionCLIError(f"parent-update {field} is outside its finite range")
+    return parsed
+
+
+def _parent_update_recipe(
+    plan: Mapping[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    job = plan.get("job")
+    contract = plan.get("contract")
+    if not isinstance(job, Mapping) or not isinstance(contract, Mapping):
+        raise ProductionCLIError("parent-update plan contract is malformed")
+    recipe = job.get("recipe")
+    config_raw = contract.get("config")
+    if (
+        not _is_parent_update_recipe(recipe)
+        or contract.get("recipe") != recipe
+        or not isinstance(config_raw, str)
+    ):
+        raise ProductionCLIError("parent-update plan recipe identity drifted")
+    config_path = Path(config_raw).expanduser().resolve(strict=False)
+    config_ref, payload = _stable_output_ref(
+        config_path, label="parent-update canonical config", json_object=True
+    )
+    assert payload is not None
+    train_config = payload.get("train_config")
+    fields = train_config.get("fields") if isinstance(train_config, Mapping) else None
+    engine = payload.get("engine_settings")
+    if (
+        payload.get("name") != recipe
+        or canonical_json_sha256(payload) != contract.get("config_sha256")
+        or not isinstance(fields, dict)
+        or not isinstance(engine, dict)
+        or engine.get("initialization_mode") != "parent_fresh_optimizer"
+    ):
+        raise ProductionCLIError(
+            "parent-update config differs from its authenticated recipe"
+        )
+    return fields, {
+        **engine,
+        "_config_path": str(config_path),
+        "_config_file_sha256": config_ref["sha256"],
+    }
+
+
+def _parent_checkpoint_steps(engine: Mapping[str, Any]) -> tuple[int, ...]:
+    try:
+        steps = tuple(
+            int(token.strip())
+            for token in str(engine["checkpoint_steps"]).split(",")
+            if token.strip()
+        )
+    except (KeyError, ValueError) as error:
+        raise ProductionCLIError(
+            "parent-update checkpoint schedule is malformed"
+        ) from error
+    if (
+        not steps
+        or steps != tuple(sorted(set(steps)))
+        or any(step <= 0 for step in steps)
+    ):
+        raise ProductionCLIError("parent-update checkpoint schedule is malformed")
+    return steps
+
+
+def _require_parent_echoes(
+    report: Mapping[str, Any],
+    fields: Mapping[str, Any],
+    engine: Mapping[str, Any],
+) -> tuple[int, int, int]:
+    max_steps = int(fields["max_steps"])
+    world_size = 8
+    global_batch = (
+        world_size * int(fields["batch_size"]) * int(fields["grad_accum_steps"])
+    )
+    expected = {
+        "max_steps": 12,
+        "exact_max_steps": True,
+        "steps_completed": 12,
+        "total_training_steps": 12,
+        "world_size": world_size,
+        "batch_size": int(fields["batch_size"]),
+        "grad_accum_steps": int(fields["grad_accum_steps"]),
+        "effective_global_batch_size": global_batch,
+        "optimizer": fields["optimizer"],
+        "lr": float(fields["lr"]),
+        "lr_warmup_steps": int(fields["lr_warmup_steps"]),
+        "lr_schedule": fields["lr_schedule"],
+        "max_grad_norm": float(fields["max_grad_norm"]),
+        "weight_decay": float(fields["weight_decay"]),
+        "policy_aux_active_batch_size": int(fields["policy_aux_active_batch_size"]),
+        "policy_aux_loss_weight": float(fields["policy_aux_loss_weight"]),
+        "policy_aux_sampling_mode": fields["policy_aux_sampling_mode"],
+        "value_lr_mult": float(fields["value_lr_mult"]),
+        "action_module_lr_mult": float(fields["action_module_lr_mult"]),
+        "shared_action_lr_mult": float(fields["shared_action_lr_mult"]),
+        "public_card_lr_mult": float(fields["public_card_lr_mult"]),
+        "trunk_lr_mult": float(fields["trunk_lr_mult"]),
+        "train_diagnostics_every_batches": int(
+            engine["train_diagnostics_every_batches"]
+        ),
+        "objective_gradient_interference_every_batches": int(
+            engine["objective_gradient_interference_every_batches"]
+        ),
+    }
+    if max_steps != 12 or fields.get("exact_max_steps") is not True:
+        raise ProductionCLIError("canonical parent-update recipe is not exact step-12")
+    drift = {
+        key: {"expected": value, "actual": report.get(key)}
+        for key, value in expected.items()
+        if report.get(key) != value
+    }
+    if drift:
+        raise ProductionCLIError(
+            "parent-update report recipe echo drift: "
+            + json.dumps(drift, sort_keys=True)
+        )
+    authority = report.get("a1_canonical_parent_update_authority")
+    if authority != {
+        "schema_version": "a1-canonical-parent-update-runtime-authority-v1",
+        "config": engine["_config_path"],
+        "config_file_sha256": f"sha256:{engine['_config_file_sha256']}",
+        "diagnostic_only": True,
+        "promotion_eligible": False,
+    }:
+        raise ProductionCLIError("parent-update report lost canonical config authority")
+    return max_steps, world_size, global_batch
+
+
+def _require_parent_lr_dose(
+    report: Mapping[str, Any],
+    fields: Mapping[str, Any],
+    *,
+    max_steps: int,
+) -> None:
+    dose = report.get("optimizer_lr_dose")
+    groups = dose.get("parameter_groups") if isinstance(dose, Mapping) else None
+    warmup = int(fields["lr_warmup_steps"])
+    if fields["lr_schedule"] != "flat" or warmup <= 0:
+        raise ProductionCLIError("parent-update LR schedule contract drifted")
+    area = sum(min(1.0, (step + 1) / warmup) for step in range(max_steps))
+    if (
+        not isinstance(dose, Mapping)
+        or dose.get("schema_version") != "optimizer-lr-dose-v2"
+        or dose.get("scope") != "updates_applied_in_this_process_invocation"
+        or dose.get("applied_updates") != max_steps
+        or not math.isclose(
+            _finite_parent_number(
+                dose.get("integrated_schedule_multiplier_area"),
+                field="optimizer LR multiplier area",
+                minimum=0.0,
+            ),
+            area,
+            rel_tol=1.0e-12,
+        )
+        or not math.isclose(
+            _finite_parent_number(
+                dose.get("mean_schedule_multiplier"),
+                field="optimizer LR multiplier mean",
+                minimum=0.0,
+            ),
+            area / max_steps,
+            rel_tol=1.0e-12,
+        )
+        or not isinstance(groups, list)
+        or not groups
+    ):
+        raise ProductionCLIError("parent-update optimizer LR dose drifted")
+    multipliers = {"base": 1.0}
+    for name, field in (
+        ("value", "value_lr_mult"),
+        ("action_local", "action_module_lr_mult"),
+        ("shared_action", "shared_action_lr_mult"),
+        ("public_card", "public_card_lr_mult"),
+        ("trunk", "trunk_lr_mult"),
+    ):
+        multiplier = float(fields[field])
+        if multiplier != 1.0:
+            multipliers[name] = multiplier
+    observed_names: set[str] = set()
+    observed_indices: set[int] = set()
+    for row in groups:
+        if not isinstance(row, Mapping):
+            raise ProductionCLIError("parent-update semantic LR group is malformed")
+        name = row.get("semantic_group_name")
+        if (
+            not isinstance(name, str)
+            or name not in multipliers
+            or name in observed_names
+        ):
+            raise ProductionCLIError("parent-update semantic LR group identity drifted")
+        observed_names.add(name)
+        base_lr = float(fields["lr"]) * multipliers[name]
+        indices = row.get("optimizer_group_indices")
+        count = row.get("optimizer_group_count")
+        tensors = row.get("parameter_tensors")
+        parameters = row.get("parameters")
+        if (
+            not isinstance(indices, list)
+            or not indices
+            or any(
+                isinstance(index, bool) or not isinstance(index, int)
+                for index in indices
+            )
+            or any(index < 0 or index in observed_indices for index in indices)
+            or isinstance(count, bool)
+            or not isinstance(count, int)
+            or count != len(indices)
+            or isinstance(tensors, bool)
+            or not isinstance(tensors, int)
+            or tensors <= 0
+            or isinstance(parameters, bool)
+            or not isinstance(parameters, int)
+            or parameters <= 0
+            or not math.isclose(
+                _finite_parent_number(row.get("base_lr"), field=f"{name} base LR"),
+                base_lr,
+                rel_tol=1.0e-12,
+            )
+            or not math.isclose(
+                _finite_parent_number(
+                    row.get("integrated_lr_area"),
+                    field=f"{name} integrated LR area",
+                    minimum=0.0,
+                ),
+                base_lr * area,
+                rel_tol=1.0e-12,
+            )
+            or not math.isclose(
+                _finite_parent_number(
+                    row.get("mean_applied_lr"),
+                    field=f"{name} mean LR",
+                    minimum=0.0,
+                ),
+                base_lr * area / max_steps,
+                rel_tol=1.0e-12,
+            )
+        ):
+            raise ProductionCLIError(f"parent-update semantic LR group {name} drifted")
+        observed_indices.update(indices)
+    if observed_names != set(multipliers):
+        raise ProductionCLIError(
+            "parent-update optimizer LR dose omitted a semantic group"
+        )
+
+
+def _require_parent_optimizer(row: object, *, step: int) -> None:
+    if not isinstance(row, Mapping):
+        raise ProductionCLIError("parent-update optimizer telemetry is malformed")
+    observed = row.get("observed_steps")
+    clipped = row.get("clipped_steps")
+    skipped = row.get("zero_objective_steps_skipped")
+    fraction = _finite_parent_number(
+        row.get("clipped_fraction"), field="clipped fraction", minimum=0.0
+    )
+    mean_norm = _finite_parent_number(
+        row.get("mean_pre_clip_total_grad_norm"),
+        field="mean pre-clip norm",
+        minimum=0.0,
+    )
+    max_norm = _finite_parent_number(
+        row.get("max_pre_clip_total_grad_norm"),
+        field="max pre-clip norm",
+        minimum=0.0,
+    )
+    if (
+        observed != step
+        or skipped != 0
+        or isinstance(clipped, bool)
+        or not isinstance(clipped, int)
+        or not 0 <= clipped <= step
+        or not math.isclose(fraction, clipped / step, abs_tol=1.0e-12)
+        or max_norm < mean_norm
+    ):
+        raise ProductionCLIError("parent-update optimizer/clipping counters drifted")
+
+
+def _require_parent_admissions(
+    report: Mapping[str, Any], engine: Mapping[str, Any]
+) -> None:
+    minimum = int(engine["minimum_feature_learning_signal_observations"])
+    feature = report.get("feature_learning_signal_admission")
+    objective = report.get("objective_gradient_signal_admission")
+    required_modules = sorted(
+        name.strip()
+        for name in str(engine["require_feature_learning_signal_modules"]).split(",")
+        if name.strip()
+    )
+    feature_steps = (
+        feature.get("observed_steps") if isinstance(feature, Mapping) else None
+    )
+    objective_steps = (
+        objective.get("observed_steps") if isinstance(objective, Mapping) else None
+    )
+    if (
+        not isinstance(feature, Mapping)
+        or feature.get("schema_version") != "a1-feature-learning-signal-admission-v1"
+        or feature.get("authenticated") is not True
+        or isinstance(feature_steps, bool)
+        or not isinstance(feature_steps, int)
+        or feature_steps < minimum
+        or feature.get("cadence_batches")
+        != int(engine["train_diagnostics_every_batches"])
+        or feature.get("required_modules") != required_modules
+        or not isinstance(feature.get("modules"), Mapping)
+        or set(feature["modules"]) != set(required_modules)
+        or not isinstance(objective, Mapping)
+        or objective.get("schema_version")
+        != "a1-objective-gradient-signal-admission-v1"
+        or objective.get("authenticated") is not True
+        or isinstance(objective_steps, bool)
+        or not isinstance(objective_steps, int)
+        or objective_steps < minimum
+        or objective.get("cadence_batches")
+        != int(engine["objective_gradient_interference_every_batches"])
+        or objective.get("world_size") != 8
+    ):
+        raise ProductionCLIError("parent-update feature/objective admission drifted")
+
+
+def _verify_parent_update_outputs(
+    plan: Mapping[str, Any],
+    *,
+    report: Mapping[str, Any],
+    checkpoint_path: Path,
+    checkpoint_ref: Mapping[str, Any],
+) -> dict[str, dict[str, Any]]:
+    fields, engine = _parent_update_recipe(plan)
+    max_steps, world_size, global_batch = _require_parent_echoes(report, fields, engine)
+    _require_parent_lr_dose(report, fields, max_steps=max_steps)
+    _require_parent_admissions(report, engine)
+    requested = _parent_checkpoint_steps(engine)
+    expected_steps = [*requested, max_steps]
+    raw_intermediate = report.get("intermediate_checkpoints")
+    if (
+        report.get("checkpoint_steps_requested") != list(requested)
+        or not isinstance(raw_intermediate, list)
+        or len(raw_intermediate) != len(requested)
+    ):
+        raise ProductionCLIError("parent-update intermediate inventory drifted")
+    admitted: dict[str, dict[str, Any]] = {}
+    refs: dict[int, tuple[Path, str]] = {}
+    for step, record in zip(requested, raw_intermediate, strict=True):
+        if not isinstance(record, Mapping) or not isinstance(
+            record.get("checkpoint"), str
+        ):
+            raise ProductionCLIError(
+                "parent-update intermediate checkpoint is malformed"
+            )
+        path = Path(record["checkpoint"]).expanduser().resolve(strict=False)
+        ref, _ = _stable_output_ref(path, label=f"parent-update step-{step} checkpoint")
+        digest = f"sha256:{ref['sha256']}"
+        if (
+            record.get("schema_version") != "train-bc-intermediate-checkpoint-v1"
+            or record.get("optimizer_step") != step
+            or record.get("checkpoint_sha256") != digest
+            or record.get("size_bytes") != ref["size_bytes"]
+            or record.get("same_training_trajectory") is not True
+            or record.get("optimizer_sidecar") is not None
+        ):
+            raise ProductionCLIError(f"parent-update step-{step} binding drifted")
+        admitted[f"training_checkpoint_step_{step:06d}"] = ref
+        refs[step] = (path, digest)
+    refs[max_steps] = (
+        checkpoint_path.resolve(strict=False),
+        f"sha256:{checkpoint_ref['sha256']}",
+    )
+
+    trajectory = report.get("checkpoint_dose_trajectory")
+    rows = trajectory.get("checkpoints") if isinstance(trajectory, Mapping) else None
+    if (
+        not isinstance(trajectory, Mapping)
+        or trajectory.get("schema_version") != "train-bc-checkpoint-dose-trajectory-v1"
+        or trajectory.get("checkpoint_steps") != expected_steps
+        or not isinstance(rows, list)
+        or len(rows) != len(expected_steps)
+    ):
+        raise ProductionCLIError("parent-update checkpoint dose trajectory drifted")
+    aux_batch = int(fields["policy_aux_active_batch_size"])
+    for step, row in zip(expected_steps, rows, strict=True):
+        if (
+            not isinstance(row, Mapping)
+            or row.get("schema_version") != "train-bc-checkpoint-dose-telemetry-v1"
+            or row.get("optimizer_step") != step
+        ):
+            raise ProductionCLIError("parent-update checkpoint dose row drifted")
+        _require_parent_optimizer(row.get("optimizer"), step=step)
+        draws = row.get("training_row_draws")
+        active = row.get("active_rows")
+        effective = row.get("policy_effective_weight_sums")
+        expected_base = step * global_batch
+        expected_aux = step * world_size * aux_batch
+        policy_base = active.get("policy_base") if isinstance(active, Mapping) else None
+        policy_total = (
+            active.get("policy_total") if isinstance(active, Mapping) else None
+        )
+        if (
+            not isinstance(draws, Mapping)
+            or draws.get("base_training_row_draws") != expected_base
+            or draws.get("policy_aux_training_row_draws") != expected_aux
+            or draws.get("total_training_row_draws") != expected_base + expected_aux
+            or not isinstance(active, Mapping)
+            or isinstance(policy_base, bool)
+            or not isinstance(policy_base, int)
+            or isinstance(policy_total, bool)
+            or not isinstance(policy_total, int)
+            or active.get("policy_aux") != expected_aux
+            or policy_total != policy_base + expected_aux
+            or not 0 < policy_base <= expected_base
+            or not isinstance(effective, Mapping)
+        ):
+            raise ProductionCLIError("parent-update base/AUX dose drifted")
+        base_mass = _finite_parent_number(
+            effective.get("base"), field="base policy mass", minimum=0.0
+        )
+        aux_mass = _finite_parent_number(
+            effective.get("aux"), field="AUX policy mass", minimum=0.0
+        )
+        total_mass = _finite_parent_number(
+            effective.get("total"), field="total policy mass", minimum=0.0
+        )
+        if (
+            base_mass <= 0.0
+            or not math.isclose(total_mass, base_mass + aux_mass, rel_tol=1.0e-9)
+            or (expected_aux == 0) != (aux_mass == 0.0)
+        ):
+            raise ProductionCLIError("parent-update base/AUX objective mass drifted")
+
+    terminal = rows[-1]
+    terminal_draws = terminal["training_row_draws"]
+    terminal_active = terminal["active_rows"]
+    terminal_mass = terminal["policy_effective_weight_sums"]
+    for report_key, source, source_key in (
+        ("base_training_row_draws", terminal_draws, "base_training_row_draws"),
+        (
+            "policy_aux_training_row_draws",
+            terminal_draws,
+            "policy_aux_training_row_draws",
+        ),
+        ("total_training_row_draws", terminal_draws, "total_training_row_draws"),
+        ("policy_base_active_rows", terminal_active, "policy_base"),
+        ("policy_aux_active_rows", terminal_active, "policy_aux"),
+        ("policy_total_active_rows", terminal_active, "policy_total"),
+        ("policy_base_effective_weight_sum", terminal_mass, "base"),
+        ("policy_aux_effective_weight_sum", terminal_mass, "aux"),
+        ("policy_total_effective_weight_sum", terminal_mass, "total"),
+    ):
+        if report.get(report_key) != source[source_key]:
+            raise ProductionCLIError(
+                "parent-update terminal dose/report totals drifted"
+            )
+
+    holdout = report.get("checkpoint_holdout_frontier")
+    holdout_rows = holdout.get("checkpoints") if isinstance(holdout, Mapping) else None
+    holdout_measure = "report_bound_raw_validation_rows"
+    holdout_seed_sha = (
+        holdout.get("validation_game_seed_set_sha256")
+        if isinstance(holdout, Mapping)
+        else None
+    )
+    if (
+        not isinstance(holdout, Mapping)
+        or holdout.get("schema_version") != "train-bc-checkpoint-holdout-frontier-v1"
+        or holdout.get("measure") != holdout_measure
+        or not isinstance(holdout_seed_sha, str)
+        or not holdout_seed_sha.startswith("sha256:")
+        or len(holdout_seed_sha) != 71
+        or not isinstance(holdout_rows, list)
+        or len(holdout_rows) != len(expected_steps)
+    ):
+        raise ProductionCLIError("parent-update checkpoint holdout frontier drifted")
+    for step, row in zip(expected_steps, holdout_rows, strict=True):
+        expected_path, expected_digest = refs[step]
+        if (
+            not isinstance(row, Mapping)
+            or row.get("schema_version") != "train-bc-checkpoint-holdout-v1"
+            or row.get("optimizer_step") != step
+            or Path(str(row.get("checkpoint", ""))).expanduser().resolve(strict=False)
+            != expected_path
+            or row.get("checkpoint_sha256") != expected_digest
+            or row.get("measure") != holdout_measure
+            or row.get("validation_game_seed_set_sha256") != holdout_seed_sha
+            or not isinstance(row.get("metrics"), Mapping)
+        ):
+            raise ProductionCLIError("parent-update checkpoint identity drifted")
+    return admitted
+
+
 def _admit_required_outputs(plan: dict[str, Any]) -> dict[str, dict[str, Any]]:
     """Validate and hash the minimum successful artifact set for a pipeline."""
 
@@ -1116,7 +1617,16 @@ def _admit_required_outputs(plan: dict[str, Any]) -> dict[str, dict[str, Any]]:
                 "required training report has no completed optimizer steps"
             )
         outputs.update(training_candidate=checkpoint_ref, training_report=report_ref)
-        if job["recipe"] == "a1-current-35m-b200":
+        if _is_parent_update_recipe(job["recipe"]):
+            outputs.update(
+                _verify_parent_update_outputs(
+                    plan,
+                    report=report,
+                    checkpoint_path=checkpoint_path,
+                    checkpoint_ref=checkpoint_ref,
+                )
+            )
+        if job["recipe"] == _SCRATCH_TRAIN_RECIPE:
             execution_ref, execution = _stable_output_ref(
                 run_dir / "scratch.execution.json",
                 label="scratch execution receipt",
@@ -1312,7 +1822,7 @@ def _execute_claimed(
 def prepare_training(plan: dict[str, Any]) -> int:
     if (
         plan["job"]["pipeline"] != "train"
-        or plan["job"].get("recipe") != "a1-current-35m-b200"
+        or plan["job"].get("recipe") != _SCRATCH_TRAIN_RECIPE
     ):
         raise ProductionCLIError(
             "prepare is only valid for the authenticated scratch recipe"
