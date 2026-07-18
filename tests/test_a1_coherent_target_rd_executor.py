@@ -436,6 +436,64 @@ def test_resolved_v2_config_accepts_retained_automatic_transitions(
     assert record["full_config_hash"] == full_hash
 
 
+def test_resolved_config_accepts_schema22_for_separated_rng(
+    tmp_path: Path,
+) -> None:
+    contract = {
+        "operator": {
+            "record_automatic_transitions": True,
+            "event_history_limit": 64,
+            "rng_stream_separation": True,
+        },
+        "execution": {"workers_per_gpu": 4},
+        "producer_checkpoint": {"sha256": "sha256:" + "a" * 64},
+    }
+    lane = {"lane_id": "b200_gpu0", "base_seed": 41, "games": 8}
+    fields = {
+        "base_seed": 41,
+        "games": 8,
+        "workers": 4,
+        "producer_checkpoint_sha256": contract["producer_checkpoint"]["sha256"],
+        "public_observation": True,
+        "coherent_public_belief_search": True,
+        "information_set_search": False,
+        "determinization_particles": 1,
+        "n_full": 128,
+        "n_fast": 16,
+        "p_full": 0.25,
+        "n_full_wide": None,
+        "n_full_wide_threshold": None,
+        "wide_roots_always_full": False,
+        "opponent_mix_manifest": None,
+        "opponent_pool_manifest": None,
+        "record_automatic_transitions": True,
+        "meaningful_public_history": True,
+        "event_history_limit": 64,
+        "rng_stream_separation": True,
+    }
+    config = {
+        "pipeline": "generate",
+        "schema_version": executor.CONFIG_SCHEMA_VERSION,
+        "fields": fields,
+    }
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(config), encoding="utf-8")
+    full_hash = executor._digest(config)
+    manifest = {
+        "config_hash": "sha256:" + full_hash.removeprefix("sha256:")[:16],
+        "full_config_hash": full_hash,
+    }
+
+    record = executor._resolved_config_record(
+        path,
+        lane=lane,
+        contract=contract,
+        manifest=manifest,
+    )
+
+    assert record["full_config_hash"] == full_hash
+
+
 def test_group_authority_requires_exact_session_leader_identity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

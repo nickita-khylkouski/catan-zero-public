@@ -7,6 +7,7 @@ import pytest
 
 from catan_zero.rl.entity_feature_adapter import RUST_ENTITY_ADAPTER_V6
 from catan_zero.rl.meaningful_history import MEANINGFUL_PUBLIC_HISTORY_SCHEMA_V2
+from catan_zero.rl.pipeline_configs import CONFIG_SCHEMA_VERSION
 from tools import a1_rd_teacher_transition as transition
 from tools import a1_target_eligibility_inventory as inventory
 
@@ -21,6 +22,7 @@ def _bind(
     monkeypatch: pytest.MonkeyPatch,
     *,
     typed_limit: int,
+    separated_rng: bool = False,
     checkpoint_history: tuple[bool, int, str, str, bool] = (
         True,
         64,
@@ -31,13 +33,16 @@ def _bind(
 ) -> dict[str, object]:
     checkpoint = tmp_path / "candidate.pt"
     checkpoint.write_bytes(b"checkpoint")
+    operator = {
+        "meaningful_public_history": True,
+        "event_history_limit": 64,
+    }
+    if separated_rng:
+        operator["rng_stream_separation"] = True
     base = _write_json(
         tmp_path / "contract.json",
         {
-            "operator": {
-                "meaningful_public_history": True,
-                "event_history_limit": 64,
-            },
+            "operator": operator,
             "target_information_regime": "public_belief_single_tree_v1",
         },
     )
@@ -45,19 +50,27 @@ def _bind(
         tmp_path / "typed.json",
         {
             "pipeline": "generate",
-            "schema_version": 13,
+            "schema_version": CONFIG_SCHEMA_VERSION if separated_rng else 13,
             "fields": {
                 "meaningful_public_history": True,
                 "event_history_limit": typed_limit,
                 "teacher_entity_feature_adapter_version": RUST_ENTITY_ADAPTER_V6,
                 "learner_entity_feature_adapter_version": RUST_ENTITY_ADAPTER_V6,
+                **({"rng_stream_separation": True} if separated_rng else {}),
             },
         },
     )
+    typed_sha = "sha256:" + "2" * 64
     monkeypatch.setattr(
         transition.inventory,
         "inspect_rd_contract",
-        lambda _path: {"contract_sha256": "sha256:" + "1" * 64},
+        lambda _path: {
+            "contract_sha256": "sha256:" + "1" * 64,
+            "typed_generation_config": {
+                "path": str(typed.resolve()),
+                "sha256": typed_sha,
+            },
+        },
     )
     monkeypatch.setattr(
         transition.train_bc,
@@ -69,7 +82,7 @@ def _bind(
         "_checkpoint_meaningful_public_history",
         lambda _path: checkpoint_history,
     )
-    monkeypatch.setattr(transition.alignment, "_file_sha256", lambda _path: "sha256:" + "2" * 64)
+    monkeypatch.setattr(transition.alignment, "_file_sha256", lambda _path: typed_sha)
     monkeypatch.setattr(
         transition.alignment,
         "_rd_teacher_transition_authority",
@@ -105,6 +118,18 @@ def test_bind_records_matching_v6_history_contract(
         "meaningful_public_history_schema": MEANINGFUL_PUBLIC_HISTORY_SCHEMA_V2,
         "event_history_limit": 64,
     }
+
+
+def test_bind_accepts_authenticated_schema22_separated_rng_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result = _bind(
+        tmp_path,
+        monkeypatch,
+        typed_limit=64,
+        separated_rng=True,
+    )
+    assert result["typed_generation_config"]["file_sha256"] == "sha256:" + "2" * 64
 
 
 def test_v6_history64_operator_contract_is_self_consistent() -> None:

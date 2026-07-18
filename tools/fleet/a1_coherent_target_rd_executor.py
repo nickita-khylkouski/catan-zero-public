@@ -29,10 +29,11 @@ from typing import Any, Mapping, Sequence
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-for import_root in (REPO_ROOT / "tools", REPO_ROOT):
+for import_root in (REPO_ROOT / "tools", REPO_ROOT, REPO_ROOT / "src"):
     if str(import_root) not in sys.path:
         sys.path.insert(0, str(import_root))
 
+from catan_zero.rl.pipeline_configs import CONFIG_SCHEMA_VERSION  # noqa: E402
 from tools import a1_target_eligibility_inventory as identity  # noqa: E402
 from tools.fleet import a1_native_runtime_identity as native_identity  # noqa: E402
 from tools.prelaunch_guard import parse_seed_ledger  # noqa: E402
@@ -1597,7 +1598,17 @@ def _resolved_config_record(
     manifest: Mapping[str, Any],
 ) -> dict[str, Any]:
     config, file_sha256, _metadata = _read_stable_json(path)
-    if config.get("pipeline") != "generate" or config.get("schema_version") != 13:
+    operator = contract.get("operator")
+    separated_rng = (
+        operator.get("rng_stream_separation") is True
+        if isinstance(operator, Mapping)
+        else False
+    )
+    expected_config_schema = CONFIG_SCHEMA_VERSION if separated_rng else 13
+    if (
+        config.get("pipeline") != "generate"
+        or config.get("schema_version") != expected_config_schema
+    ):
         raise ExecutorError(f"invalid resolved generation config: {path}")
     fields = config.get("fields")
     if not isinstance(fields, Mapping):
@@ -1623,6 +1634,8 @@ def _resolved_config_record(
         "meaningful_public_history": True,
         "event_history_limit": _event_history_limit(contract),
     }
+    if separated_rng:
+        expected["rng_stream_separation"] = True
     drift = {
         key: {"expected": value, "actual": fields.get(key)}
         for key, value in expected.items()

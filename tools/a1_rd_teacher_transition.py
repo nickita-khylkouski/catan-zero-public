@@ -30,6 +30,7 @@ from catan_zero.rl.entity_feature_adapter import (  # noqa: E402
 from catan_zero.rl.meaningful_history import (  # noqa: E402
     MEANINGFUL_PUBLIC_HISTORY_SCHEMA_V2,
 )
+from catan_zero.rl.pipeline_configs import CONFIG_SCHEMA_VERSION  # noqa: E402
 from tools import a1_stage_c_teacher_alignment as alignment  # noqa: E402
 from tools import a1_target_eligibility_inventory as inventory  # noqa: E402
 from tools import train_bc  # noqa: E402
@@ -124,13 +125,33 @@ def bind(
 
     fields = config.get("fields")
     operator = base.get("operator")
+    separated_rng = (
+        operator.get("rng_stream_separation") is True
+        if isinstance(operator, Mapping)
+        else False
+    )
+    expected_config_schema = CONFIG_SCHEMA_VERSION if separated_rng else 13
     if (
         config.get("pipeline") != "generate"
-        or config.get("schema_version") != 13
+        or config.get("schema_version") != expected_config_schema
         or not isinstance(fields, Mapping)
         or not isinstance(operator, Mapping)
     ):
         raise BindingError("V6 teacher config/operator is malformed")
+    inspected_config = base_inspection.get("typed_generation_config")
+    if not isinstance(inspected_config, Mapping):
+        raise BindingError("base coherent operator lacks an inspected typed config")
+    inspected_config_path = Path(str(inspected_config.get("path", "")))
+    inspected_config_sha = str(inspected_config.get("sha256", ""))
+    actual_config_sha = alignment._file_sha256(config_path)  # noqa: SLF001
+    if (
+        config_path != inspected_config_path
+        or actual_config_sha != inspected_config_sha
+    ):
+        raise BindingError(
+            "typed generation config is not the exact artifact authenticated "
+            "by the base coherent operator"
+        )
     try:
         checkpoint_adapter = train_bc._checkpoint_entity_feature_adapter_version(  # noqa: SLF001
             str(checkpoint)
@@ -194,7 +215,7 @@ def bind(
         },
         "typed_generation_config": {
             "path": str(config_path),
-            "file_sha256": alignment._file_sha256(config_path),  # noqa: SLF001
+            "file_sha256": actual_config_sha,
         },
         "target_information_regime": base["target_information_regime"],
         "allowed_use": {
