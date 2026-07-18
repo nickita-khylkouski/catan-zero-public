@@ -968,6 +968,19 @@ def test_p10_descriptor_and_compact_launcher_cross_bind_exact_runtime(
         "diagnostic_only": True,
         "promotion_eligible": False,
     }
+    assert args.trunk_lr_mult == pytest.approx(0.25)
+    assert payload["learner_recipe_overrides"]["trunk_lr_mult"] == pytest.approx(
+        args.trunk_lr_mult
+    )
+    train_bc._validate_composite_learner_recipe_authorization(  # noqa: SLF001
+        args, payload
+    )
+    unknown_override = copy.deepcopy(payload)
+    unknown_override["learner_recipe_overrides"]["unreviewed_runtime_knob"] = 1
+    with pytest.raises(SystemExit, match="without command converters"):
+        train_bc._validate_composite_learner_recipe_authorization(  # noqa: SLF001
+            args, unknown_override
+        )
     composite_meta = {
         "diagnostic_derivation_authority": payload[
             "diagnostic_derivation_authority"

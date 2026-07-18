@@ -7578,6 +7578,7 @@ def _validate_composite_learner_recipe_authorization(
         "per_game_policy_surprise_weighting": bool,
         "target_reliability_confidence_weighting": bool,
         "target_reliability_confidence_floor": float,
+        "trunk_lr_mult": float,
         "per_game_policy_weight": bool,
         "per_game_policy_weight_mode": str,
         "policy_aux_sampling_mode": str,
