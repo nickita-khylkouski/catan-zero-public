@@ -95,6 +95,7 @@ def _full_audit(tmp_path: Path, manifest: Path) -> Path:
     validation_path = tmp_path / "full.validation_seeds.json"
     validation_path.write_text(json.dumps(validation, sort_keys=True))
     files = [{
+        "source_path": "/generation-host/jobs/shard.npz",
         "relative_path": "jobs/shard.npz",
         "sha256": shard_file_sha,
         "size_bytes": shard.stat().st_size,

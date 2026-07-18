@@ -450,6 +450,9 @@ def test_production_runtime_projection_requires_reviewed_topology() -> None:
         legal_action_value_set_statistics=model["legal_action_value_set_statistics"],
         value_tower_split_layers=model["value_tower_split_layers"],
         public_card_count_features=model["public_card_count_features"],
+        public_card_exact_resource_residual=model[
+            "public_card_exact_resource_residual"
+        ],
         public_card_count_residual_bias=model["public_card_count_residual_bias"],
         public_rule_state_features=model["public_rule_state_features"],
         entity_feature_adapter_version=model["entity_feature_adapter_version"],
@@ -524,6 +527,9 @@ def test_topology_diagnostic_is_the_only_runtime_projection_exception() -> None:
         legal_action_value_set_statistics=model["legal_action_value_set_statistics"],
         value_tower_split_layers=model["value_tower_split_layers"],
         public_card_count_features=model["public_card_count_features"],
+        public_card_exact_resource_residual=model[
+            "public_card_exact_resource_residual"
+        ],
         public_card_count_residual_bias=model["public_card_count_residual_bias"],
         public_rule_state_features=model["public_rule_state_features"],
         entity_feature_adapter_version=model["entity_feature_adapter_version"],

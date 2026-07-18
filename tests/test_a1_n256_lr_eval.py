@@ -8,6 +8,17 @@ import pytest
 from tools.fleet import a1_n256_lr_eval as trial
 
 
+@pytest.fixture(autouse=True)
+def _attested_production_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Unit plans model the sealed Linux controller without requiring its ELF."""
+
+    monkeypatch.setattr(
+        trial.fleet,
+        "_native_runtime_sha256",
+        trial.fleet._sealed_native_runtime_sha256,  # noqa: SLF001
+    )
+
+
 def _manifest(tmp_path: Path) -> Path:
     value = {
         "schema_version": "a1-h100-eval-fleet-manifest-v1",

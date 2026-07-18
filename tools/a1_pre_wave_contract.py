@@ -8746,6 +8746,10 @@ def _generator_argv(
         argv.extend(
             ("--forced-root-target-mode", str(search["forced_root_target_mode"]))
         )
+    if "policy_target_min_visits" in search:
+        argv.extend(
+            ("--policy-target-min-visits", str(search["policy_target_min_visits"]))
+        )
     if "boundary_value_particles" in search:
         argv.extend(
             ("--boundary-value-particles", str(search["boundary_value_particles"]))

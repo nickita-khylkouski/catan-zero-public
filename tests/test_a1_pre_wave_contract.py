@@ -4126,6 +4126,12 @@ def test_post_wave_audit_accepts_exact_complete_category_corpus(
             ),
             encoding="utf-8",
         )
+        worker_summaries = [str(worker)]
+        for worker_index in range(1, min(int(cli["workers"]), int(job["attempts"]))):
+            worker_copy = out_dir / f"worker_{worker_index:03d}" / "manifest.json"
+            worker_copy.parent.mkdir()
+            worker_copy.write_bytes(worker.read_bytes())
+            worker_summaries.append(str(worker_copy))
         typed_config = contract.GenerateConfig.from_namespace(Namespace(**cli))
         config_hash = typed_config.config_hash()
         registry_path = out_dir / "config_registry.jsonl"
@@ -4164,7 +4170,7 @@ def test_post_wave_audit_accepts_exact_complete_category_corpus(
                             )
                         )
                     ),
-                    "worker_summaries": [str(worker)],
+                    "worker_summaries": worker_summaries,
                     "shards": [str(shard)],
                 }
             ),
