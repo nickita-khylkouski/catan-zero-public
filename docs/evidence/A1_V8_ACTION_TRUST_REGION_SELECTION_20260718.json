@@ -1,0 +1,78 @@
+{
+  "schema_version": "a1-v8-action-trust-region-selection-v1",
+  "status": "selected_for_nonpromotable_v6_reanalysis",
+  "track": "2p_no_trade",
+  "selection": {
+    "checkpoint": {
+      "path": "/home/ubuntu/experimental_nonpromotable/v7-integrated-20260717/v8-historyfixed-action25-shared-action25-v15/candidate.pt",
+      "sha256": "sha256:10ed4ae2a8de9f9c5db791facd02402d4d5ef840e05c30f183691b826f7dfc26"
+    },
+    "recipe": {
+      "action_module_lr_multiplier": 0.25,
+      "shared_action_lr_multiplier": 0.25,
+      "shared_trunk_lr_multiplier": 0.25,
+      "value_lr_multiplier": 1.0,
+      "optimizer_steps": 12,
+      "fresh_adam": true,
+      "initializer_sha256": "sha256:8b0eb4b96bf30f4feac64b43fe270890ca5dd7c63bb99e97495988b37c3e8b12"
+    },
+    "reason": [
+      "best held-out policy closure among the commissioned trust-region arms",
+      "crossed the paired regression-protection H1 boundary against V13",
+      "positive but inconclusive direct paired result against exact f7"
+    ]
+  },
+  "paired_evaluation_contract": {
+    "operator": "coherent_public_n128.schema21",
+    "config_file_sha256": "sha256:9101893516db769e931e2c551ba9803e67791604d7740f7f1579cf04eabe7fcd",
+    "evaluator_sha256": "sha256:4b42261e685d40a9827a62aff4a609e13e3dbe58c95492a9ddfc01357591fd8f",
+    "native_runtime_sha256": "sha256:e9f85102c65b98a7d0e3f89209c28e10b84159a006e0ef5589c776cc60dbefa4",
+    "pairs": 128,
+    "games": 256,
+    "seat_swapped": true
+  },
+  "v15_vs_v13": {
+    "artifact": {
+      "path": "/home/ubuntu/experimental_nonpromotable/v7-integrated-20260717/v15-action25-shared-action25-vs-v13-shared-action25-128pairs.json",
+      "file_sha256": "sha256:a09fd95d38d0b61aef1b1520b5df7941899e1f1299334574f42094f01b238a25"
+    },
+    "baseline_checkpoint_sha256": "sha256:12a1167de99ad5c54dc4247e54b3b78d6baeb51f91eb039f2ba8f374e09cb9e0",
+    "candidate_wins": 141,
+    "baseline_wins": 115,
+    "pair_counts": {
+      "ll": 12,
+      "split": 91,
+      "ww": 25
+    },
+    "mean_pair_score": 0.55078125,
+    "regression_protection_sprt": "H1",
+    "strict_superiority_sprt": "continue",
+    "errors": 0,
+    "truncations": 0
+  },
+  "v15_vs_exact_f7_v8_step0": {
+    "artifact": {
+      "path": "/home/ubuntu/experimental_nonpromotable/v7-integrated-20260717/direct-v15-vs-f7-v8-n128-128pairs.json",
+      "file_sha256": "sha256:1a7c74d2a830ba1eb6a88f48582839194b3e2d782202085d443241052e127210"
+    },
+    "baseline_checkpoint_sha256": "sha256:8b0eb4b96bf30f4feac64b43fe270890ca5dd7c63bb99e97495988b37c3e8b12",
+    "candidate_wins": 131,
+    "baseline_wins": 125,
+    "pair_counts": {
+      "ll": 28,
+      "split": 69,
+      "ww": 31
+    },
+    "mean_pair_score": 0.51171875,
+    "regression_protection_sprt": "continue",
+    "strict_superiority_sprt": "continue",
+    "errors": 0,
+    "truncations": 0
+  },
+  "authority": {
+    "production_promotion": false,
+    "production_pointer_update": false,
+    "stage_c_v6_reanalysis_teacher": true,
+    "next_required_evidence": "train on V15-produced V6/history64 coherent-n128 targets and evaluate the independently initialized aligned candidate against V15 and exact f7"
+  }
+}
