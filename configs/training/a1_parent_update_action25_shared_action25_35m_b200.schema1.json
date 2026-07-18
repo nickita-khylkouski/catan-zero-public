@@ -131,6 +131,7 @@
       "public_card_count_residual_bias": false,
       "public_card_lr_mult": 1.0,
       "q_loss_weight": 0.0,
+      "completed_q_loss_weight": 0.0,
       "q_skip_teacher_prefixes": "catanatron_ab",
       "relational_action_cross_layers": 1,
       "relational_bases": 4,

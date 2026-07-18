@@ -358,6 +358,11 @@ class TrainConfig(PipelineConfig):
     value_loss_weight: float = 0.10
     final_vp_loss_weight: float = 0.05
     q_loss_weight: float = 0.0
+    # Authenticated Stage-C completed-Q regression is distinct from the legacy
+    # teacher-score Q objective. Keep the opt-in weight in the typed recipe so
+    # canonical launchers bind the new engine field explicitly (zero remains an
+    # exact no-op) instead of failing or inheriting an unsealed parser default.
+    completed_q_loss_weight: float = 0.0
     q_skip_teacher_prefixes: str = "catanatron_ab"
     policy_kl_anchor_weight: float = 0.0
     policy_kl_anchor_direction: str = "forward"
