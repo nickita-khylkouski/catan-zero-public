@@ -919,6 +919,27 @@ def test_direct_stage_c_sampling_refuses_disabled_policy_aux() -> None:
     )
 
 
+def test_canonical_direct_authority_consumes_stage_c_sampling_measure() -> None:
+    stage_c = (
+        np.asarray([0.5, 1.5], dtype=np.float64),
+        "stage_c_production_weighted",
+    )
+
+    accepted = train_bc._authorized_direct_stage_c_policy_aux_base(  # noqa: SLF001
+        stage_c,
+        coherent_direct_policy_aux=False,
+        canonical_direct_policy_aux=True,
+    )
+
+    assert accepted is stage_c
+    with pytest.raises(SystemExit, match="no authorized direct policy-AUX consumer"):
+        train_bc._authorized_direct_stage_c_policy_aux_base(  # noqa: SLF001
+            stage_c,
+            coherent_direct_policy_aux=False,
+            canonical_direct_policy_aux=False,
+        )
+
+
 def test_policy_aux_phase_allocation_sets_exact_phase_shares() -> None:
     active = np.asarray([0.10, 0.20, 0.30, 0.40, 0.0], dtype=np.float64)
     phases = np.asarray(["PLAY", "PLAY", "ROBBER", "DISCARD", "PLAY"])

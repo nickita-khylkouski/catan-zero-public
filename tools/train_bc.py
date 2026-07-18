@@ -18306,10 +18306,10 @@ def main(
                 "policy auxiliary sampling requires authenticated composite base "
                 "weights or an authenticated direct-corpus authority"
             )
-        stage_c_base = (
-            direct_stage_c_base
-            if coherent_direct_policy_aux
-            else None
+        stage_c_base = _authorized_direct_stage_c_policy_aux_base(
+            direct_stage_c_base,
+            coherent_direct_policy_aux=coherent_direct_policy_aux,
+            canonical_direct_policy_aux=canonical_direct_policy_aux,
         )
         if stage_c_base is not None:
             policy_aux_preconditioning_weights = stage_c_base[0]
@@ -18377,10 +18377,10 @@ def main(
             validation_component_game_sampling = _composite_game_sampling_weights(
                 data, validation_indices
             )
-            stage_c_validation_base = (
-                _stage_c_policy_aux_base_measure(data, validation_indices)
-                if coherent_direct_policy_aux
-                else None
+            stage_c_validation_base = _authorized_direct_stage_c_policy_aux_base(
+                _stage_c_policy_aux_base_measure(data, validation_indices),
+                coherent_direct_policy_aux=coherent_direct_policy_aux,
+                canonical_direct_policy_aux=canonical_direct_policy_aux,
             )
             if stage_c_validation_base is not None:
                 validation_preconditioning = stage_c_validation_base[0]
@@ -45452,6 +45452,30 @@ def _require_stage_c_policy_aux_stream(
             "direct Stage-C policy sampling requires "
             "--policy-aux-active-batch-size > 0; otherwise the authenticated "
             "Stage-C sampling arm is silently ignored by the shared base sampler"
+        )
+    return stage_c_base
+
+
+def _authorized_direct_stage_c_policy_aux_base(
+    stage_c_base: tuple[np.ndarray, str] | None,
+    *,
+    coherent_direct_policy_aux: bool,
+    canonical_direct_policy_aux: bool,
+) -> tuple[np.ndarray, str] | None:
+    """Route an authenticated Stage-C measure through either direct authority.
+
+    Stage-C overlays are commonly admitted by
+    ``canonical_direct_policy_aux_authority`` rather than the older
+    ``coherent_direct_corpus`` marker.  Treating only the older marker as a
+    consumer silently replaced the authenticated arm with uniform AUX draws.
+    """
+
+    if stage_c_base is None:
+        return None
+    if not (coherent_direct_policy_aux or canonical_direct_policy_aux):
+        raise SystemExit(
+            "authenticated Stage-C policy sampling has no authorized direct "
+            "policy-AUX consumer"
         )
     return stage_c_base
 
