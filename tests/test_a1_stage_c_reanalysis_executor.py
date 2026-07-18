@@ -77,6 +77,60 @@ def _target_plan() -> dict:
     }
 
 
+def test_roundtrip_feature_contract_binds_nondefault_history_and_adapter() -> None:
+    plan = {
+        "target_policy_target_identity": {
+            "target_semantics": {
+                "meaningful_public_history": True,
+                "event_history_limit": 64,
+                "meaningful_public_history_schema": "history-v2",
+            },
+            "operator_contract_semantics": {
+                "meaningful_public_history": True,
+                "event_history_limit": 64,
+                "meaningful_public_history_schema": "history-v2",
+                "teacher_entity_feature_adapter_version": "adapter-v6",
+                "learner_entity_feature_adapter_version": "adapter-v6",
+            },
+            "teacher_feature_contract": {
+                "entity_feature_adapter_version": "adapter-v6",
+            },
+        }
+    }
+
+    assert executor._roundtrip_feature_contract(plan) == (  # noqa: SLF001
+        True,
+        64,
+        "history-v2",
+        "adapter-v6",
+    )
+
+
+def test_roundtrip_feature_contract_refuses_cross_surface_drift() -> None:
+    plan = {
+        "target_policy_target_identity": {
+            "target_semantics": {
+                "meaningful_public_history": True,
+                "event_history_limit": 64,
+                "meaningful_public_history_schema": "history-v2",
+            },
+            "operator_contract_semantics": {
+                "meaningful_public_history": True,
+                "event_history_limit": 64,
+                "meaningful_public_history_schema": "history-v1",
+                "teacher_entity_feature_adapter_version": "adapter-v6",
+                "learner_entity_feature_adapter_version": "adapter-v6",
+            },
+            "teacher_feature_contract": {
+                "entity_feature_adapter_version": "adapter-v6",
+            },
+        }
+    }
+
+    with pytest.raises(executor.ExecutorError, match="feature contracts disagree"):
+        executor._roundtrip_feature_contract(plan)  # noqa: SLF001
+
+
 def test_search_hook_requires_coherent_public_sanitization() -> None:
     calls = []
     safe = SimpleNamespace(

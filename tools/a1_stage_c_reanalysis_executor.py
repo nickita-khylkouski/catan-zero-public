@@ -445,6 +445,43 @@ def _qualification_partition_ordinals(
     return np.flatnonzero(np.isin(values, owned_games)).astype(np.int64)
 
 
+def _roundtrip_feature_contract(
+    plan: Mapping[str, Any],
+) -> tuple[bool, int, str, str]:
+    """Resolve the exact target feature semantics used for replay round trips."""
+
+    target = plan.get("target_policy_target_identity")
+    if not isinstance(target, Mapping):
+        raise ExecutorError("Stage-C plan lost its target identity")
+    semantics = target.get("target_semantics")
+    operator = target.get("operator_contract_semantics")
+    teacher = target.get("teacher_feature_contract")
+    if not all(
+        isinstance(value, Mapping) for value in (semantics, operator, teacher)
+    ):
+        raise ExecutorError("Stage-C target lost its feature contract")
+    enabled = semantics.get("meaningful_public_history")
+    history_limit = semantics.get("event_history_limit")
+    history_schema = semantics.get("meaningful_public_history_schema")
+    adapter = teacher.get("entity_feature_adapter_version")
+    if (
+        type(enabled) is not bool
+        or type(history_limit) is not int
+        or history_limit <= 0
+        or not isinstance(history_schema, str)
+        or not history_schema
+        or not isinstance(adapter, str)
+        or not adapter
+        or operator.get("meaningful_public_history") is not enabled
+        or operator.get("event_history_limit") != history_limit
+        or operator.get("meaningful_public_history_schema") != history_schema
+        or operator.get("teacher_entity_feature_adapter_version") != adapter
+        or operator.get("learner_entity_feature_adapter_version") != adapter
+    ):
+        raise ExecutorError("Stage-C target feature contracts disagree")
+    return enabled, history_limit, history_schema, adapter
+
+
 def _qualify_ordinals(
     *,
     data: Mapping[str, Any],
@@ -453,6 +490,8 @@ def _qualify_ordinals(
     action_size: int,
     meaningful_public_history: bool,
     history_limit: int,
+    meaningful_public_history_schema: str,
+    entity_feature_adapter_version: str,
     correct_chance: bool,
 ) -> tuple[dict[str, np.ndarray], list[dict[str, Any]]]:
     """Replay and public-roundtrip one complete set of game-owned roots."""
@@ -546,6 +585,12 @@ def _qualify_ordinals(
                     action_size=action_size,
                     meaningful_public_history=meaningful_public_history,
                     history_limit=history_limit,
+                    meaningful_public_history_schema=(
+                        meaningful_public_history_schema
+                    ),
+                    entity_feature_adapter_version=(
+                        entity_feature_adapter_version
+                    ),
                     reconstructed_game=reconstructed_game,
                 )
             except Exception as error:  # noqa: BLE001 - classify row, continue.
@@ -742,7 +787,12 @@ def _qualify(args: argparse.Namespace) -> dict[str, Any]:
         str(plan["source_policy_target_identity"]["producer_checkpoint"]["path"])
     )
     action_size = _checkpoint_action_size(source_checkpoint)
-    history = plan["target_policy_target_identity"]["target_semantics"]
+    (
+        meaningful_public_history,
+        history_limit,
+        history_schema,
+        entity_adapter,
+    ) = _roundtrip_feature_contract(plan)
     correct_chance = bool(
         plan["target_policy_target_identity"]["chance"]["correct_rust_chance_spectra"]
     )
@@ -751,8 +801,10 @@ def _qualify(args: argparse.Namespace) -> dict[str, Any]:
         subset=subset,
         selected_ordinals=np.arange(count, dtype=np.int64),
         action_size=action_size,
-        meaningful_public_history=bool(history["meaningful_public_history"]),
-        history_limit=int(history["event_history_limit"]),
+        meaningful_public_history=meaningful_public_history,
+        history_limit=history_limit,
+        meaningful_public_history_schema=history_schema,
+        entity_feature_adapter_version=entity_adapter,
         correct_chance=correct_chance,
     )
     status = qualification["status"]
@@ -816,14 +868,21 @@ def _qualify_partition(args: argparse.Namespace) -> dict[str, Any]:
         partition_index=int(args.partition_index),
         partitions=int(args.partitions),
     )
-    history = plan["target_policy_target_identity"]["target_semantics"]
+    (
+        meaningful_public_history,
+        history_limit,
+        history_schema,
+        entity_adapter,
+    ) = _roundtrip_feature_contract(plan)
     arrays, failures = _qualify_ordinals(
         data=data,
         subset=subset,
         selected_ordinals=selected_ordinals,
         action_size=action_size,
-        meaningful_public_history=bool(history["meaningful_public_history"]),
-        history_limit=int(history["event_history_limit"]),
+        meaningful_public_history=meaningful_public_history,
+        history_limit=history_limit,
+        meaningful_public_history_schema=history_schema,
+        entity_feature_adapter_version=entity_adapter,
         correct_chance=bool(
             plan["target_policy_target_identity"]["chance"][
                 "correct_rust_chance_spectra"
@@ -1534,7 +1593,12 @@ def _execute_partition(args: argparse.Namespace) -> dict[str, Any]:
     correct_chance = bool(
         plan["target_policy_target_identity"]["chance"]["correct_rust_chance_spectra"]
     )
-    history = plan["target_policy_target_identity"]["target_semantics"]
+    (
+        meaningful_public_history,
+        history_limit,
+        history_schema,
+        entity_adapter,
+    ) = _roundtrip_feature_contract(plan)
     evaluator = _evaluator_from_plan(plan, device=str(args.device))
     ordinals_by_game: dict[int, list[int]] = {}
     for position in positions.tolist():
@@ -1598,8 +1662,10 @@ def _execute_partition(args: argparse.Namespace) -> dict[str, Any]:
                 _one_row(data["legal_action_ids"], row),
                 correct_rust_chance_spectra=correct_chance,
                 action_size=action_size,
-                meaningful_public_history=bool(history["meaningful_public_history"]),
-                history_limit=int(history["event_history_limit"]),
+                meaningful_public_history=meaningful_public_history,
+                history_limit=history_limit,
+                meaningful_public_history_schema=history_schema,
+                entity_feature_adapter_version=entity_adapter,
                 reconstructed_game=game,
             )
             if not roundtrip.ok:
