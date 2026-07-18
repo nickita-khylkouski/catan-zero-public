@@ -2,7 +2,7 @@
   "schema_version": "catan-zero-training-science-admission-v1",
   "recipes": {
     "a1-current-35m-b200": {
-      "recipe_canonical_sha256": "7598181895c1c0bfa10ca5efc9be5b2bea10cf4580a6370ed3b6e9be847f459d",
+      "recipe_canonical_sha256": "0142bb6e88b39a2852fa0cc548a2f7433d94c974c42b98cac186c16a1ed3286a",
       "authorized": false,
       "reason": "scratch_training_signal_contract_unresolved",
       "unresolved_requirements": [
@@ -12,7 +12,7 @@
         "materialize and authenticate a fresh rust_entity_adapter_v6_exact_actor_resources_initial_road_two_hop training composite"
       ],
       "observations": {
-        "architecture_information_surface": "topology_path_present_zero_output_pending_learning_evidence",
+        "architecture_information_surface": "native_v8_physical_resource_inputs_topology_path_present_zero_output_pending_learning_evidence",
         "retained_composite_adapter_status": "adapter_v2_retained_v5_r2_quarantined_v6_required",
         "required_fresh_learner_adapter": "rust_entity_adapter_v6_exact_actor_resources_initial_road_two_hop",
         "adapter_v5_r2_quarantine": {

@@ -233,7 +233,8 @@ def test_scratch_command_is_native_bias_free_8gpu_and_fresh(tmp_path: Path) -> N
     assert command.count("--action-target-gather") == 1
     assert command[command.index("--action-cross-attention-layers") + 1] == "1"
     assert command[command.index("--action-cross-attention-bottleneck") + 1] == "80"
-    assert command.count("--v6-compatibility-preserving-inputs") == 1
+    assert "--v6-compatibility-preserving-inputs" not in command
+    assert command.count("--no-v6-compatibility-preserving-inputs") == 1
     assert command.count("--topology-residual-adapter") == 1
     assert command.count("--legal-action-value-set-statistics") == 1
     assert command.count("--public-rule-state-features") == 1
@@ -439,13 +440,13 @@ def test_scratch_topology_wrapper_accepts_512_while_legacy_binder_rejects(
     )
 
 
-def test_train_bc_fresh_create_boundary_builds_card_count_v2() -> None:
+def test_train_bc_fresh_create_boundary_builds_native_v8_card_count() -> None:
     model = current_science.learner_model_construction()
     args = SimpleNamespace(
         action_target_gather=True,
         action_cross_attention_layers=1,
         action_cross_attention_bottleneck=80,
-        v6_compatibility_preserving_inputs=True,
+        v6_compatibility_preserving_inputs=False,
         static_action_residual=True,
         legal_action_value_residual=True,
         legal_action_value_set_statistics=True,
@@ -478,17 +479,13 @@ def test_train_bc_fresh_create_boundary_builds_card_count_v2() -> None:
     assert policy.config.action_target_gather is True
     assert policy.config.action_cross_attention_layers == 1
     assert policy.config.action_cross_attention_bottleneck == 80
-    assert policy.config.v6_compatibility_preserving_inputs is True
-    assert hasattr(policy.model, "v6_exact_resource_residual")
-    assert hasattr(policy.model, "v6_initial_road_residual")
+    assert policy.config.v6_compatibility_preserving_inputs is False
+    assert not hasattr(policy.model, "v6_exact_resource_residual")
+    assert not hasattr(policy.model, "v6_initial_road_residual")
     assert (
         policy.entity_feature_adapter_version == model["entity_feature_adapter_version"]
     )
-    assert policy.config.v6_compatibility_preserving_inputs is True
-    assert policy.model.v6_exact_resource_residual.weight.requires_grad is True
-    assert policy.model.v6_initial_road_residual.weight.requires_grad is True
-    assert policy.model.v6_exact_resource_residual.weight.count_nonzero().item() == 0
-    assert policy.model.v6_initial_road_residual.weight.count_nonzero().item() == 0
+    assert policy.config.v6_compatibility_preserving_inputs is False
     assert policy.config.static_action_residual is True
     assert policy.config.legal_action_value_residual is True
     assert policy.config.legal_action_value_set_statistics is True

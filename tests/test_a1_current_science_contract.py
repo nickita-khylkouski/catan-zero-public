@@ -225,7 +225,8 @@ def test_current_learner_selects_parent_update_and_keeps_scratch_research_only()
     assert model["action_target_gather"] is True
     assert model["action_cross_attention_layers"] == 1
     assert model["action_cross_attention_bottleneck"] == 80
-    assert model["v6_compatibility_preserving_inputs"] is True
+    assert model["v6_compatibility_preserving_inputs"] is False
+    assert model["public_card_exact_resource_residual"] is False
     assert model["legal_action_value_set_statistics"] is True
     assert model["actor_public_rule_state"].startswith("dev_used_")
     assert recipe["value_trunk_grad_scale"] == 0.1
@@ -306,11 +307,27 @@ def test_current_learner_selects_parent_update_and_keeps_scratch_research_only()
         "public_rule_state_residual",
         "static_action_residual_proj",
         "topology_residual_adapter",
-        "v6_exact_resource_residual",
-        "v6_initial_road_residual",
         "value_blocks",
         "value_head",
         "value_state_norm",
+    }
+
+
+def test_pre_v8_scratch_control_is_explicit_and_never_launchable() -> None:
+    control = json.loads(
+        current_science.PRE_V8_SCRATCH_CONTROL_PATH.read_text(encoding="utf-8")
+    )
+
+    assert control["name"] == "a1-scratch-pre-v8-compat-control"
+    assert control["role"] == "historical_nonproduction_representation_control"
+    assert control["promotion_eligible"] is False
+    assert control["go_authorized"] is False
+    assert control["representation_delta_from_native_v8_scratch"] == {
+        "v6_compatibility_preserving_inputs": True,
+        "public_card_exact_resource_residual": False,
+        "semantics": (
+            "reconstruct_v2_v5_player_and_public_resource_inputs_before_inherited_encoders"
+        ),
     }
 
 

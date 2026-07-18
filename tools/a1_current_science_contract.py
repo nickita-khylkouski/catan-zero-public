@@ -38,6 +38,9 @@ CANONICAL_PARENT_UPDATE_CONFIG_PATH = (
 TRAINING_SCIENCE_ADMISSION_PATH = (
     REPO_ROOT / "configs/production/training_science_admission.json"
 )
+PRE_V8_SCRATCH_CONTROL_PATH = (
+    REPO_ROOT / "configs/experiments/a1_scratch_pre_v8_compat_control.json"
+)
 SCHEMA_VERSION = "a1-current-science-contract-v4"
 TEACHER_REPORT_SCHEMA = "teacher-operator-causal-report-v1"
 ADOPTION_RECEIPT_SCHEMA = "a1-teacher-operator-adoption-v1"
@@ -131,7 +134,7 @@ PRODUCTION_LEARNER_SIGNAL_CONTRACT = {
     "post_policy_dose_value_trunk_grad_scale": 0.0,
     # Reporting is part of production admission even though it does not alter
     # the optimizer trajectory. The full scratch dose must prove every
-    # commissioned v6 path received gradient and an actual update.
+    # commissioned native-V8 path received gradient and an actual update.
     "train_diagnostics_every_batches": 16,
     "objective_gradient_interference_every_batches": 16,
     "require_feature_learning_signal_modules": (
@@ -142,8 +145,8 @@ PRODUCTION_LEARNER_SIGNAL_CONTRACT = {
         "meaningful_history_ordered_gate,meaningful_history_sequence,"
         "meaningful_history_target_proj,"
         "public_card_count_residual,public_rule_state_residual,"
-        "static_action_residual_proj,topology_residual_adapter,v6_exact_resource_residual,"
-        "v6_initial_road_residual,value_blocks,value_head,"
+        "static_action_residual_proj,topology_residual_adapter,"
+        "value_blocks,value_head,"
         "value_state_norm,final_vp_head"
     ),
     "minimum_feature_learning_signal_observations": 2,
@@ -208,9 +211,12 @@ PRODUCTION_LEARNER_MODEL_CONSTRUCTION_CONTRACT = {
     "graph_dropout": 0.05,
     "entity_state_trunk": "transformer",
     "action_target_gather": True,
-        "action_cross_attention_layers": 1,
-        "action_cross_attention_bottleneck": 80,
-        "v6_compatibility_preserving_inputs": True,
+    "action_cross_attention_layers": 1,
+    "action_cross_attention_bottleneck": 80,
+    # Native scratch has no inherited V2--V5 encoders to preserve. Feed the
+    # physical V6 player/resource scales and corrected initial-road feature
+    # directly to their base encoders instead of reconstructing a legacy view.
+    "v6_compatibility_preserving_inputs": False,
     "topology_residual_adapter": True,
     "static_action_residual": True,
     "legal_action_value_residual": True,
@@ -218,9 +224,10 @@ PRODUCTION_LEARNER_MODEL_CONSTRUCTION_CONTRACT = {
     "value_tower_split_layers": 1,
     "public_card_count_features": True,
     "public_card_count_residual_bias": False,
-    # Scratch construction remains the pre-V8 control.  The selected parent
-    # route binds the exact-public-resource residual through its reviewed
-    # checkpoint migration below.
+    # With compatibility rewriting disabled, the base public-card projection
+    # receives the exact public deduction tensor directly. The separate V8
+    # residual is only required by checkpoint upgrades that must retain a
+    # mature legacy projection.
     "public_card_exact_resource_residual": False,
     "public_rule_state_features": True,
     "public_rule_state_feature_schema": "actor_public_rule_state_2p_v1",

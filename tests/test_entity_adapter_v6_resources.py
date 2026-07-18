@@ -301,6 +301,94 @@ def test_v7_resource_route_preserves_inherited_public_card_residual_input():
     )
 
 
+def test_native_v8_scratch_routes_physical_resources_directly():
+    """Fresh V8 has no inherited encoder, so no legacy reconstruction is valid."""
+
+    torch = pytest.importorskip("torch")
+    from catan_zero.deduction_tracker import DEDUCTION_FEATURES_KEY
+    from catan_zero.rl.entity_token_policy import EntityGraphConfig, EntityGraphNet
+
+    class Capture(torch.nn.Module):
+        def __init__(self, width: int):
+            super().__init__()
+            self.width = width
+            self.seen = None
+
+        def forward(self, value):
+            self.seen = value.detach().clone()
+            return value.new_zeros((*value.shape[:2], self.width))
+
+    payload = _payload(_counts(11, 10, 0, 0, 0))
+    physical = _player_tokens(
+        payload,
+        "BLUE",
+        entity_feature_adapter_version=RUST_ENTITY_ADAPTER_V6,
+    )[None, ...]
+    legacy = _player_tokens(
+        payload,
+        "BLUE",
+        entity_feature_adapter_version=RUST_ENTITY_ADAPTER_V5,
+    )[None, ...]
+    globals_ = np.zeros((1, 1, GLOBAL_FEATURE_SIZE), dtype=np.float32)
+    globals_[0, 0, 26:31] = (
+        np.asarray([8, 8, 19, 19, 19], dtype=np.float32) / 19.0
+    )
+    physical_features = public_card_count_features_from_entity_tokens(
+        physical,
+        globals_,
+        entity_feature_adapter_version=RUST_ENTITY_ADAPTER_V6,
+    )
+    legacy_features = public_card_count_features_from_entity_tokens(
+        legacy,
+        globals_,
+        entity_feature_adapter_version=RUST_ENTITY_ADAPTER_V5,
+    )
+    assert not np.array_equal(physical, legacy)
+    assert not np.array_equal(physical_features, legacy_features)
+
+    model = EntityGraphNet(
+        EntityGraphConfig(
+            action_size=1,
+            static_action_feature_size=1,
+            hidden_size=16,
+            state_layers=1,
+            attention_heads=4,
+            dropout=0.0,
+            action_cross_attention_layers=1,
+            v6_compatibility_preserving_inputs=False,
+            public_card_count_features=True,
+            public_card_count_residual_bias=False,
+        )
+    ).eval()
+    player_capture = Capture(model.config.hidden_size)
+    deduction_capture = Capture(model.config.hidden_size)
+    model.player_encoder = player_capture
+    model.public_card_count_residual = deduction_capture
+    batch = _minimal_torch_entity_batch(physical)
+    batch["global_tokens"] = torch.as_tensor(globals_)
+    batch[DEDUCTION_FEATURES_KEY] = torch.as_tensor(physical_features)
+
+    with torch.no_grad():
+        model._state_tokens(batch)
+
+    assert player_capture.seen is not None
+    assert deduction_capture.seen is not None
+    torch.testing.assert_close(
+        player_capture.seen,
+        torch.as_tensor(physical, dtype=torch.float32),
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        deduction_capture.seen,
+        torch.as_tensor(physical_features, dtype=torch.float32),
+        rtol=0,
+        atol=0,
+    )
+    assert not hasattr(model, "v6_exact_resource_residual")
+    assert not hasattr(model, "public_card_exact_resource_residual")
+
+
 def test_v8_exact_public_resource_residual_keeps_physical_deduction_separate():
     """V8 restores public 2p card counting without rewriting V5 residual input."""
 

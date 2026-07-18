@@ -1,0 +1,19 @@
+{
+  "schema_version": "a1-scratch-representation-control-v1",
+  "name": "a1-scratch-pre-v8-compat-control",
+  "role": "historical_nonproduction_representation_control",
+  "promotion_eligible": false,
+  "go_authorized": false,
+  "source_recipe": {
+    "name": "a1-current-35m-b200",
+    "path": "configs/training/a1_current_35m_b200.schema1.json",
+    "canonical_sha256": "7598181895c1c0bfa10ca5efc9be5b2bea10cf4580a6370ed3b6e9be847f459d",
+    "git_commit": "0f3e955a61283bf336430fb2e51149bef8aa515a"
+  },
+  "representation_delta_from_native_v8_scratch": {
+    "v6_compatibility_preserving_inputs": true,
+    "public_card_exact_resource_residual": false,
+    "semantics": "reconstruct_v2_v5_player_and_public_resource_inputs_before_inherited_encoders"
+  },
+  "use": "causal pre-V8 representation control only; never a production launch recipe"
+}

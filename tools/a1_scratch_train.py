@@ -607,7 +607,6 @@ def build_train_command(
     command.extend(
         [
             "--action-target-gather",
-            "--v6-compatibility-preserving-inputs",
             "--static-action-residual",
             "--legal-action-value-residual",
             "--legal-action-value-set-statistics",
@@ -626,6 +625,11 @@ def build_train_command(
             "cuda",
             "--graph-history-features",
         ]
+    )
+    command.append(
+        "--v6-compatibility-preserving-inputs"
+        if model["v6_compatibility_preserving_inputs"]
+        else "--no-v6-compatibility-preserving-inputs"
     )
     command.append(
         "--meaningful-public-history-target-gather"
