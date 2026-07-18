@@ -119,6 +119,7 @@ from catan_zero.rl.memmap_corpus import (
     MemmapFixedColumn as _MemmapFixedColumn,  # noqa: F401
     MemmapRaggedColumn as _MemmapRaggedColumn,
     MemmapRowOffsetsColumn as _MemmapRowOffsetsColumn,  # noqa: F401
+    column_schema_matches,
     normalize_index as _normalize_index,  # noqa: F401
 )
 from catan_zero.rl import optim_state as _checkout_optim_state
@@ -32880,38 +32881,6 @@ def _q_score_loss_parts(
 _STAGE_C_COMPLETED_Q_BINDING_SCHEMA = "a1-stage-c-completed-q-binding-v1"
 
 
-def _completed_q_column_schema_matches(
-    schema: object,
-    expected: Mapping[str, object],
-) -> bool:
-    """Compare the persisted Stage-C ABI, including NaN fill semantics."""
-
-    if not isinstance(schema, Mapping) or set(schema) != set(expected):
-        return False
-    if schema.get("kind") != expected["kind"]:
-        return False
-    try:
-        if np.dtype(schema.get("dtype")) != np.dtype(expected["dtype"]):
-            return False
-    except (TypeError, ValueError):
-        return False
-
-    actual_fill = schema.get("fill")
-    expected_fill = expected["fill"]
-    if isinstance(expected_fill, float) and math.isnan(expected_fill):
-        if isinstance(actual_fill, (bool, np.bool_)) or not isinstance(
-            actual_fill,
-            (int, float, np.integer, np.floating),
-        ):
-            return False
-        return math.isnan(float(actual_fill))
-    if isinstance(expected_fill, bool):
-        return isinstance(actual_fill, (bool, np.bool_)) and bool(
-            actual_fill
-        ) is expected_fill
-    return actual_fill == expected_fill
-
-
 def _completed_q_binding_admission(
     data,
     *,
@@ -33065,7 +33034,7 @@ def _completed_q_binding_admission(
             or int(reliability.get("version", 0)) <= 0
             or not isinstance(meta_columns, dict)
             or any(
-                not _completed_q_column_schema_matches(
+                not column_schema_matches(
                     meta_columns.get(name),
                     expected,
                 )

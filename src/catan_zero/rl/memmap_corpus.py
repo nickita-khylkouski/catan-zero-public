@@ -8,6 +8,7 @@ entry point responsible for learning semantics rather than file formats.
 from __future__ import annotations
 
 import json
+import math
 import operator
 from pathlib import Path
 from typing import BinaryIO, Mapping
@@ -71,6 +72,38 @@ COMPLETED_Q_COLUMN_SCHEMAS = {
         "fill": False,
     },
 }
+
+
+def column_schema_matches(
+    schema: object,
+    expected: Mapping[str, object],
+) -> bool:
+    """Compare a persisted memmap ABI, including dtype and NaN fill semantics."""
+
+    if not isinstance(schema, Mapping) or set(schema) != set(expected):
+        return False
+    if schema.get("kind") != expected["kind"]:
+        return False
+    try:
+        if np.dtype(schema.get("dtype")) != np.dtype(expected["dtype"]):
+            return False
+    except (TypeError, ValueError):
+        return False
+
+    actual_fill = schema.get("fill")
+    expected_fill = expected["fill"]
+    if isinstance(expected_fill, float) and math.isnan(expected_fill):
+        if isinstance(actual_fill, (bool, np.bool_)) or not isinstance(
+            actual_fill,
+            (int, float, np.integer, np.floating),
+        ):
+            return False
+        return math.isnan(float(actual_fill))
+    if isinstance(expected_fill, bool):
+        return isinstance(actual_fill, (bool, np.bool_)) and bool(
+            actual_fill
+        ) is expected_fill
+    return actual_fill == expected_fill
 
 _VALIDATION_BLOCK_ROWS = 1024 * 1024
 

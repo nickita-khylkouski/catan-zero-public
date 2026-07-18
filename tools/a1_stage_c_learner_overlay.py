@@ -46,7 +46,10 @@ from tools import a1_post_wave_stage_c_admission as post_wave_admission  # noqa:
 from tools import a1_stage_c_reanalysis_executor as stage_c  # noqa: E402
 from tools import a1_stage_c_teacher_alignment as alignment  # noqa: E402
 from tools import train_bc  # noqa: E402
-from catan_zero.rl.memmap_corpus import COMPLETED_Q_COLUMN_SCHEMAS  # noqa: E402
+from catan_zero.rl.memmap_corpus import (  # noqa: E402
+    COMPLETED_Q_COLUMN_SCHEMAS,
+    column_schema_matches,
+)
 from catan_zero.rl.target_reliability import (  # noqa: E402
     TARGET_RELIABILITY_COLUMNS,
     TARGET_RELIABILITY_SCHEMA,
@@ -2287,10 +2290,10 @@ def verify_overlay_admission(path: Path) -> dict[str, Any]:
         is not True
         or meta.get("stage_c_policy_overlay", {}).get("completed_q_binding")
         != completed_q_binding
-        or any(
-            meta.get("columns", {}).get(name) != schema
-            for name, schema in COMPLETED_Q_COLUMN_SCHEMAS.items()
-        )
+            or any(
+                not column_schema_matches(meta.get("columns", {}).get(name), schema)
+                for name, schema in COMPLETED_Q_COLUMN_SCHEMAS.items()
+            )
     ):
         raise OverlayError("Stage-C overlay admission differs from corpus bytes")
     return {

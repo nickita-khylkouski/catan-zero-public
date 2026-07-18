@@ -71,8 +71,10 @@ def test_base_admission_dispatch_keeps_schema_verifiers_separate(
     monkeypatch.setattr(
         overlay.post_wave_admission, "verify_admission", verify_post_wave
     )
+    from tools import a1_b200_active_policy_campaign as active_campaign
+
     monkeypatch.setattr(
-        overlay.active_campaign, "_load_admission", reject_legacy
+        active_campaign, "_load_admission", reject_legacy
     )
 
     _resolved, loaded, semantics = overlay._load_base_admission(path)  # noqa: SLF001
