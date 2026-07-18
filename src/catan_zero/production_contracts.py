@@ -41,24 +41,15 @@ PIPELINE_LAUNCHERS = {
     "generate": "tools/generate.py",
     "evaluate": "tools/evaluate.py",
 }
-TRAIN_LAUNCHERS = {
-    "a1-current-35m-b200": "tools/a1_scratch_train.py",
-    "a1-parent-update-35m-b200": "tools/train.py",
-    "a1-parent-update-shared-action25-35m-b200": "tools/train.py",
-    "a1-parent-update-active-p10-35m-b200": "tools/train.py",
-    "a1-parent-update-active-p25-35m-b200": "tools/train.py",
+TRAIN_LAUNCHERS_BY_INITIALIZATION_MODE = {
+    "scratch_fresh_optimizer": "tools/a1_scratch_train.py",
+    "parent_fresh_optimizer": "tools/train.py",
 }
 PIPELINE_ACCELERATOR_MODELS = {
     "generate": "NVIDIA H100",
     "evaluate": "NVIDIA H100",
 }
-TRAIN_ACCELERATOR_MODELS = {
-    "a1-current-35m-b200": "NVIDIA B200",
-    "a1-parent-update-35m-b200": "NVIDIA B200",
-    "a1-parent-update-shared-action25-35m-b200": "NVIDIA B200",
-    "a1-parent-update-active-p10-35m-b200": "NVIDIA B200",
-    "a1-parent-update-active-p25-35m-b200": "NVIDIA B200",
-}
+TRAIN_ACCELERATOR_MODEL = "NVIDIA B200"
 TRAINING_SCIENCE_ADMISSION = Path("configs/production/training_science_admission.json")
 TRAINING_SCIENCE_ADMISSION_SCHEMA = "catan-zero-training-science-admission-v1"
 PRIMARY_TRAINING_EVIDENCE_SCHEMAS = frozenset(
@@ -213,6 +204,25 @@ def _recipe_entry(pipeline: str, recipe: str | None) -> dict[str, str]:
     return matches[0]
 
 
+def _train_launcher(config_path: Path, *, recipe: str) -> str:
+    """Resolve one authenticated training recipe without a second name registry."""
+
+    payload = _read_json_object(config_path, label="training recipe")
+    engine = payload.get("engine_settings")
+    if payload.get("name") != recipe or not isinstance(engine, dict):
+        raise ProductionContractError(
+            f"production training recipe {recipe!r} has malformed runtime bindings"
+        )
+    initialization_mode = engine.get("initialization_mode")
+    launcher = TRAIN_LAUNCHERS_BY_INITIALIZATION_MODE.get(initialization_mode)
+    if launcher is None:
+        raise ProductionContractError(
+            f"production training recipe {recipe!r} has unsupported "
+            f"initialization mode {initialization_mode!r}"
+        )
+    return launcher
+
+
 def validate_pipeline_contract(
     repo: Path, pipeline: str, recipe: str | None = None
 ) -> dict[str, Any]:
@@ -239,14 +249,10 @@ def validate_pipeline_contract(
             f"cataloged {pipeline} config escapes repository: {config_path}"
         ) from error
     launcher = (
-        TRAIN_LAUNCHERS.get(entry["name"])
+        _train_launcher(config_path, recipe=entry["name"])
         if pipeline == "train"
         else PIPELINE_LAUNCHERS[pipeline]
     )
-    if launcher is None:
-        raise ProductionContractError(
-            f"production recipe {entry['name']!r} has no launcher"
-        )
     launcher_path = (repo / launcher).resolve()
     if not launcher_path.is_file():
         raise ProductionContractError(
@@ -267,7 +273,7 @@ def validate_pipeline_contract(
         "guard": None if guard_path is None else str(guard_path),
         "guard_sha256": guard_sha256,
         "required_accelerator_model": (
-            TRAIN_ACCELERATOR_MODELS[entry["name"]]
+            TRAIN_ACCELERATOR_MODEL
             if pipeline == "train"
             else PIPELINE_ACCELERATOR_MODELS[pipeline]
         ),
@@ -289,9 +295,13 @@ def pipeline_readiness(
         ):
             raise ProductionContractError("training science admission schema drift")
         recipes = science.get("recipes")
-        if not isinstance(recipes, dict) or set(recipes) != set(
-            TRAIN_ACCELERATOR_MODELS
-        ):
+        try:
+            catalog_recipes = {
+                entry["name"] for entry in production_recipes("train")
+            }
+        except ProductionRecipeError as error:
+            raise ProductionContractError(str(error)) from error
+        if not isinstance(recipes, dict) or set(recipes) != catalog_recipes:
             raise ProductionContractError("training science admission recipe drift")
         admission = recipes.get(identity["recipe"])
         expected_fields = {

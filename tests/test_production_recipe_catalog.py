@@ -45,6 +45,10 @@ APPROVED_SHARED_ACTION_PARENT_UPDATE = (
     "configs/training/a1_parent_update_shared_action25_35m_b200.schema1.json",
     "a1-parent-update-shared-action25-35m-b200",
 )
+APPROVED_VALUE_HEAD_PARENT_UPDATE = (
+    "configs/training/a1_parent_update_value25_35m_b200.schema1.json",
+    "a1-parent-update-value25-35m-b200",
+)
 
 
 @pytest.mark.parametrize("entrypoint", sorted(APPROVED))
@@ -110,6 +114,19 @@ def test_checked_in_shared_action_parent_update_recipe_is_authenticated() -> Non
     )
     fields = payload["train_config"]["fields"]
     assert fields["shared_action_lr_mult"] == pytest.approx(0.25)
+
+
+def test_checked_in_value_head_parent_update_recipe_is_authenticated() -> None:
+    relative, expected_name = APPROVED_VALUE_HEAD_PARENT_UPDATE
+    path = ROOT / relative
+    payload = json.loads(path.read_text(encoding="utf-8"))
+
+    assert (
+        require_production_recipe(entrypoint="train", path=path, payload=payload)
+        == expected_name
+    )
+    fields = payload["train_config"]["fields"]
+    assert fields["value_lr_mult"] == pytest.approx(0.25)
 
 
 def test_generation_recipe_round_trips_every_typed_science_field() -> None:

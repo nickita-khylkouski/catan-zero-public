@@ -297,6 +297,13 @@ def test_status_exposes_v7_parent_and_scratch_as_fail_closed() -> None:
         "shared_action_trust_region_requires_fresh_commissioning"
     )
     assert len(shared_action["unresolved_requirements"]) == 1
+    value_head = train["recipes"]["a1-parent-update-value25-35m-b200"]
+    assert value_head["authorized"] is False
+    assert value_head["status"] == "blocked"
+    assert value_head["reason"] == (
+        "value_head_trust_region_requires_fresh_commissioning"
+    )
+    assert len(value_head["unresolved_requirements"]) == 1
     p10 = train["recipes"]["a1-parent-update-active-p10-35m-b200"]
     assert p10["authorized"] is False
     assert p10["status"] == "blocked"
@@ -307,6 +314,27 @@ def test_status_exposes_v7_parent_and_scratch_as_fail_closed() -> None:
     assert status["pipelines"]["ppo"]["authorized"] is False
 
 
+def test_training_launcher_resolution_fails_closed_on_unknown_mode(
+    tmp_path: Path,
+) -> None:
+    recipe = tmp_path / "recipe.json"
+    recipe.write_text(
+        json.dumps(
+            {
+                "name": "experimental",
+                "engine_settings": {"initialization_mode": "unreviewed_mode"},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        contracts.ProductionContractError,
+        match="unsupported initialization mode",
+    ):
+        contracts._train_launcher(recipe, recipe="experimental")  # noqa: SLF001
+
+
 def test_all_canonical_config_and_guard_identities_are_exact() -> None:
     identities = [
         validate_pipeline_contract(ROOT, "generate"),
@@ -315,6 +343,9 @@ def test_all_canonical_config_and_guard_identities_are_exact() -> None:
         validate_pipeline_contract(ROOT, "train", "a1-parent-update-35m-b200"),
         validate_pipeline_contract(
             ROOT, "train", "a1-parent-update-shared-action25-35m-b200"
+        ),
+        validate_pipeline_contract(
+            ROOT, "train", "a1-parent-update-value25-35m-b200"
         ),
         validate_pipeline_contract(
             ROOT, "train", "a1-parent-update-active-p10-35m-b200"
@@ -332,6 +363,7 @@ def test_all_canonical_config_and_guard_identities_are_exact() -> None:
     assert identities[3]["required_accelerator_model"] == "NVIDIA B200"
     assert identities[4]["required_accelerator_model"] == "NVIDIA B200"
     assert identities[5]["required_accelerator_model"] == "NVIDIA B200"
+    assert identities[6]["required_accelerator_model"] == "NVIDIA B200"
 
 
 def test_generate_plan_has_one_canonical_command_and_bound_inputs(

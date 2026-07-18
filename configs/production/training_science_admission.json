@@ -153,6 +153,23 @@
       },
       "commissioning_evidence": []
     },
+    "a1-parent-update-value25-35m-b200": {
+      "recipe_canonical_sha256": "9ff18f2513e6369e1fcd0f6ee86b77054ac0436a50c713a58e69b2659fe3caba",
+      "authorized": false,
+      "reason": "value_head_trust_region_requires_fresh_commissioning",
+      "unresolved_requirements": [
+        "commission value-head 0.25 LR multiplier against exact f7 parent"
+      ],
+      "observations": {
+        "architecture_information_surface": "v6_b12_all_required_modules_positive_learning_signal",
+        "retained_composite_adapter_status": "fresh_adapter_v6_composite_authenticated",
+        "required_fresh_learner_adapter": "rust_entity_adapter_v6_exact_actor_resources_initial_road_two_hop",
+        "value_head_lr_multiplier": 0.25,
+        "shared_trunk_lr_multiplier": 0.25,
+        "scalar_value_objective": "binary_win_bce_logit_equivalent_deployed_tanh"
+      },
+      "commissioning_evidence": []
+    },
     "a1-parent-update-active-p10-35m-b200": {
       "recipe_canonical_sha256": "b484268b389cff7bc522849b84744cba286d915803467f266258aeba9876ab47",
       "authorized": false,
