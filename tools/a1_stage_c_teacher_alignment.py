@@ -80,6 +80,7 @@ OPERATOR_IDENTITY_SCHEMA_V2 = "a1-operator-bound-policy-target-identity-v2"
 OPERATOR_IDENTITY_SCHEMA_V3 = "a1-operator-bound-policy-target-identity-v3"
 OPERATOR_IDENTITY_SCHEMA_V4 = "a1-operator-bound-policy-target-identity-v4"
 RD_TEACHER_TRANSITION_BINDING_SCHEMA = "a1-rd-teacher-transition-binding-v1"
+POST_WAVE_SOURCE_BINDING_SCHEMA = "a1-post-wave-source-operator-binding-v1"
 PAIRED_ROOT_VALUE_OUTPUT_SCHEMA = "a1-paired-root-value-output-contract-v1"
 STAGE_C_ROW_SEED_SCHEMA = "a1-stage-c-coherent-reanalysis-root-seed-v1"
 STAGE_C_TARGET_EXECUTION = {
@@ -594,10 +595,59 @@ def _operator_identity(
         contract_path, where="coherent target operator contract"
     )
     transition_authority: dict[str, Any] | None = None
+    preloaded_config: dict[str, Any] | None = None
     if contract.get("schema_version") == RD_TEACHER_TRANSITION_BINDING_SCHEMA:
         contract, config_path, transition_authority = (
             _rd_teacher_transition_authority(contract_path, contract, checkpoint)
         )
+    elif contract.get("schema_version") == POST_WAVE_SOURCE_BINDING_SCHEMA:
+        unsigned = dict(contract)
+        stated = unsigned.pop("binding_sha256", None)
+        typed = contract.get("typed_generation_config")
+        producer = contract.get("producer_checkpoint")
+        evidence = contract.get("evidence")
+        if (
+            stated != _value_sha256(unsigned)
+            or contract.get("diagnostic_only") is not True
+            or contract.get("promotion_eligible") is not False
+            or not isinstance(typed, Mapping)
+            or not isinstance(producer, Mapping)
+            or not isinstance(evidence, Mapping)
+        ):
+            raise AlignmentError("post-wave source operator binding is not fail-closed")
+        source_ref = typed.get("source_manifest")
+        if not isinstance(source_ref, Mapping):
+            raise AlignmentError("post-wave source operator lost its manifest")
+        config_path = _regular_file(
+            Path(str(source_ref.get("path", ""))),
+            where="post-wave representative generation manifest",
+        )
+        if _file_sha256(config_path) != source_ref.get("file_sha256"):
+            raise AlignmentError("post-wave generation manifest bytes drifted")
+        preloaded_config = {
+            "schema_version": typed.get("schema_version"),
+            "pipeline": typed.get("pipeline"),
+            "fields": typed.get("fields"),
+        }
+        contract = {
+            "schema_version": POST_WAVE_SOURCE_BINDING_SCHEMA,
+            "contract_sha256": str(stated),
+            "target_information_regime": contract.get(
+                "target_information_regime"
+            ),
+            "producer_checkpoint": dict(producer),
+            "operator": dict(contract.get("operator", {})),
+            "acceptance": dict(contract.get("acceptance", {})),
+        }
+        transition_authority = {
+            "kind": "historical_post_wave_source_operator",
+            "source_binding": {
+                "path": str(contract_path),
+                "file_sha256": _file_sha256(contract_path),
+                "binding_sha256": stated,
+            },
+            "post_wave_evidence": dict(evidence),
+        }
     else:
         if require_current_target:
             try:
@@ -614,7 +664,12 @@ def _operator_identity(
         )
         if _file_sha256(config_path) != config_ref.get("sha256"):
             raise AlignmentError("typed generation config bytes drifted")
-    _config_path, config = _load_json(config_path, where="typed generation config")
+    if preloaded_config is None:
+        _config_path, config = _load_json(
+            config_path, where="typed generation config"
+        )
+    else:
+        config = preloaded_config
     fields = config.get("fields")
     operator = contract.get("operator")
     producer = contract.get("producer_checkpoint")
@@ -1497,6 +1552,7 @@ def _build_plan(args: argparse.Namespace) -> dict[str, Any]:
     # the campaign at module load time forms an alignment -> ... -> executor ->
     # alignment cycle and makes the selector CLI depend on import order.
     from tools import a1_b200_active_policy_campaign as active_campaign
+    from tools import a1_post_wave_stage_c_admission as post_wave_admission
 
     if int(args.subset_rows) != PRODUCTION_ROOT_COUNT:
         raise AlignmentError(
@@ -1505,10 +1561,26 @@ def _build_plan(args: argparse.Namespace) -> dict[str, Any]:
         )
 
     try:
-        admission_path, admission = active_campaign._load_admission(  # noqa: SLF001
-            args.coherent_corpus_admission
+        _candidate_path, candidate = _load_json(
+            args.coherent_corpus_admission,
+            where="coherent corpus admission",
         )
-    except active_campaign.CampaignError as error:
+        if candidate.get("schema_version") == (
+            "a1-post-wave-stage-c-corpus-admission-v1"
+        ):
+            admission_path, admission = post_wave_admission.verify_admission(
+                _candidate_path
+            )
+        else:
+            admission_path, admission = active_campaign._load_admission(  # noqa: SLF001
+                _candidate_path
+            )
+    except (
+        active_campaign.CampaignError,
+        post_wave_admission.AdmissionError,
+        OSError,
+        ValueError,
+    ) as error:
         raise AlignmentError(f"coherent corpus admission refused: {error}") from error
     corpus_record = admission["corpus"]
     corpus_root = Path(str(corpus_record["data_path"])).resolve(strict=True)
