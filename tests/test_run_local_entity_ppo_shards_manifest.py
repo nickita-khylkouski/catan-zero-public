@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import errno
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -751,3 +752,187 @@ def test_staged_policy_snapshot_resumes_after_crash_before_launch_binding(
     assert launch["policy_version"] == first.version
     assert published.version == first.version
     assert Path(launch["checkpoint"]).read_bytes() == b"version one"
+
+
+def _completed_launch_fixture(tmp_path: Path):
+    checkpoint = tmp_path / "initializer.pt"
+    checkpoint.write_bytes(b"initializer")
+    args, _manifest = actor.resolve_config(
+        [
+            "--run-base",
+            str(tmp_path),
+            "--run-name",
+            "lifecycle",
+            "--checkpoint",
+            str(checkpoint),
+            "--launch-id",
+            "bounded-launch",
+            "--games",
+            "5",
+            "--workers",
+            "2",
+            "--games-per-shard",
+            "2",
+        ]
+    )
+    root = dist.run_root(args.run_base, args.run_name)
+    dist.ensure_run_dirs(root)
+    weights = dist.policy_dir(root) / "weights_v2.pt"
+    weights.write_bytes(b"policy")
+    launch = actor._prepare_launch(  # noqa: SLF001
+        args,
+        dist.PublishedVersion(version=2, step=3, updated_at=4.0, path=str(weights)),
+    )
+    payloads, _devices, _games = actor._build_worker_payloads(  # noqa: SLF001
+        args, actor._published_from_launch(launch), launch  # noqa: SLF001
+    )
+    return args, root, launch, payloads
+
+
+def test_completed_launch_cleanup_is_bounded_and_idempotent(tmp_path: Path) -> None:
+    _args, root, launch, payloads = _completed_launch_fixture(tmp_path)
+    shard_paths = []
+    for payload in payloads:
+        shard_count = (payload["games"] + payload["games_per_shard"] - 1) // payload[
+            "games_per_shard"
+        ]
+        for shard_index in range(shard_count):
+            shard = dist.trajectories_dir(root, payload["worker_id"]) / (
+                f"shard_{shard_index:06d}.pkl"
+            )
+            dist.mark_trajectory_complete(root, shard)
+            shard_paths.append(shard)
+
+    first = actor._finalize_launch_if_complete(root, launch)  # noqa: SLF001
+    second = actor._finalize_launch_if_complete(root, launch)  # noqa: SLF001
+
+    assert first == second
+    assert first is not None
+    assert not Path(launch["checkpoint"]).exists()
+    assert not (
+        root / "actor_launches" / launch["launch_id"] / "policy_snapshot.json"
+    ).exists()
+    assert all(not dist.trajectory_completion_path(root, path).exists() for path in shard_paths)
+    assert actor._load_launch_completion(root, launch) == first  # noqa: SLF001
+
+
+def test_completed_resume_needs_no_policy_bytes_or_model_load(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    args, root, launch, payloads = _completed_launch_fixture(tmp_path)
+    for payload in payloads:
+        shard_count = (payload["games"] + payload["games_per_shard"] - 1) // payload[
+            "games_per_shard"
+        ]
+        for shard_index in range(shard_count):
+            dist.mark_trajectory_complete(
+                root,
+                dist.trajectories_dir(root, payload["worker_id"])
+                / f"shard_{shard_index:06d}.pkl",
+            )
+    actor._finalize_launch_if_complete(root, launch)  # noqa: SLF001
+    monkeypatch.setattr(
+        actor,
+        "load_ppo_policy",
+        lambda *_args, **_kwargs: pytest.fail("completed launch must not load a model"),
+    )
+    monkeypatch.setattr(
+        dist,
+        "read_version",
+        lambda _root: pytest.fail("completed launch must not consult current weights"),
+    )
+
+    resumed, published = actor._resolve_launch_and_weights(args, root)  # noqa: SLF001
+
+    assert resumed == launch
+    assert published is None
+    assert actor._build_worker_payloads(args, published, resumed)[0] == []  # noqa: SLF001
+
+
+def test_cleanup_resumes_after_crash_immediately_after_aggregate_binding(
+    tmp_path: Path,
+) -> None:
+    _args, root, launch, payloads = _completed_launch_fixture(tmp_path)
+    shard_paths = []
+    for payload in payloads:
+        shard_count = (payload["games"] + payload["games_per_shard"] - 1) // payload[
+            "games_per_shard"
+        ]
+        for shard_index in range(shard_count):
+            shard = dist.trajectories_dir(root, payload["worker_id"]) / (
+                f"shard_{shard_index:06d}.pkl"
+            )
+            dist.mark_trajectory_complete(root, shard)
+            shard_paths.append(shard)
+    actor._atomic_bind_json(  # noqa: SLF001
+        dist.launch_completion_path(root, launch["launch_id"]),
+        dist.launch_completion_payload(launch),
+    )
+    assert Path(launch["checkpoint"]).exists()
+    assert any(dist.trajectory_completion_path(root, path).exists() for path in shard_paths)
+
+    completion = actor._finalize_launch_if_complete(root, launch)  # noqa: SLF001
+
+    assert completion == dist.launch_completion_payload(launch)
+    assert not Path(launch["checkpoint"]).exists()
+    assert all(not dist.trajectory_completion_path(root, path).exists() for path in shard_paths)
+
+
+def test_launch_completion_refuses_missing_or_forged_schedule(tmp_path: Path) -> None:
+    args, root, launch, _payloads = _completed_launch_fixture(tmp_path)
+
+    assert actor._finalize_launch_if_complete(root, launch) is None  # noqa: SLF001
+    assert Path(launch["checkpoint"]).exists()
+    completion = root / "actor_launches" / launch["launch_id"] / "launch_complete.json"
+    completion.write_text('{"schema":"forged"}', encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="launch completion"):
+        actor._resolve_launch_and_weights(args, root)  # noqa: SLF001
+
+
+def test_learner_does_not_recreate_shard_receipt_after_aggregate_cleanup(
+    tmp_path: Path,
+) -> None:
+    _args, root, launch, payloads = _completed_launch_fixture(tmp_path)
+    shard_paths = []
+    for payload in payloads:
+        shard_count = (payload["games"] + payload["games_per_shard"] - 1) // payload[
+            "games_per_shard"
+        ]
+        for shard_index in range(shard_count):
+            shard = dist.trajectories_dir(root, payload["worker_id"]) / (
+                f"shard_{shard_index:06d}.pkl"
+            )
+            dist.mark_trajectory_complete(root, shard)
+            shard_paths.append(shard)
+    actor._finalize_launch_if_complete(root, launch)  # noqa: SLF001
+    shard_paths[0].parent.mkdir(parents=True, exist_ok=True)
+    shard_paths[0].write_bytes(b"already queued")
+
+    dist.mark_consumed(root, shard_paths[0])
+
+    assert not shard_paths[0].exists()
+    assert not dist.trajectory_completion_path(root, shard_paths[0]).exists()
+
+
+def test_snapshot_copy_fallback_handles_link_permission_errors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source.pt"
+    destination = tmp_path / "launch" / "policy.pt"
+    source.write_bytes(b"policy bytes")
+    real_link = actor.os.link
+
+    def permission_denied_once(src, dst):
+        if Path(dst) == destination:
+            raise OSError(errno.EPERM, "hard links unavailable")
+        return real_link(src, dst)
+
+    monkeypatch.setattr(actor.os, "link", permission_denied_once)
+
+    digest = actor._snapshot_policy(source, destination)  # noqa: SLF001
+
+    assert destination.read_bytes() == source.read_bytes()
+    assert digest == dist.checkpoint_sha256(destination)

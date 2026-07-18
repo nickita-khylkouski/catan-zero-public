@@ -260,13 +260,19 @@ def _snapshot_policy(source: Path, destination: Path) -> str:
         try:
             os.link(source, destination)
         except OSError as error:
-            if error.errno != errno.EXDEV:
+            link_fallback_errors = {
+                errno.EXDEV,
+                errno.EPERM,
+                getattr(errno, "EOPNOTSUPP", errno.EPERM),
+                getattr(errno, "ENOTSUP", errno.EPERM),
+            }
+            if error.errno not in link_fallback_errors:
                 raise
             temporary = destination.with_name(
                 f".{destination.name}.{os.getpid()}.{time.time_ns()}.tmp"
             )
             shutil.copyfile(source, temporary)
-            os.link(temporary, destination)
+            os.replace(temporary, destination)
         snapshot_sha256 = dist.checkpoint_sha256(destination)
         source_after = dist.checkpoint_sha256(source)
         if snapshot_sha256 != source_before or snapshot_sha256 != source_after:
@@ -449,6 +455,51 @@ def _published_from_launch(launch: dict[str, Any]) -> dist.PublishedVersion:
     )
 
 
+def _load_launch_completion(
+    root: Path, launch: dict[str, Any]
+) -> dict[str, Any] | None:
+    completion = dist.load_launch_completion(root, str(launch["launch_id"]))
+    if completion is None:
+        return None
+    expected = dist.launch_completion_payload(launch)
+    if completion != expected:
+        raise RuntimeError(
+            "launch completion receipt does not match the requested launch contract"
+        )
+    return completion
+
+
+def _finalize_launch_if_complete(
+    root: Path, launch: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Aggregate a fully produced schedule and release per-launch storage."""
+
+    launch_dir = _launches_dir(root) / str(launch["launch_id"])
+    with _file_lock(launch_dir / ".creation.lock"):
+        completion = _load_launch_completion(root, launch)
+        expected_shards = dist.expected_launch_shards(launch)
+        if completion is None:
+            for relative in expected_shards:
+                shard = dist.trajectories_dir(root) / relative
+                if not dist.trajectory_is_complete(root, shard):
+                    return None
+            completion = _atomic_bind_json(
+                dist.launch_completion_path(root, str(launch["launch_id"])),
+                dist.launch_completion_payload(launch),
+            )
+            completion = _load_launch_completion(root, launch)
+        if completion is None:  # defensive: atomic binding must be immediately visible
+            raise RuntimeError("failed to authenticate bound launch completion receipt")
+        Path(launch["checkpoint"]).unlink(missing_ok=True)
+        (launch_dir / "policy_snapshot.json").unlink(missing_ok=True)
+        for relative in expected_shards:
+            dist.trajectory_completion_path(
+                root, dist.trajectories_dir(root) / relative
+            ).unlink(missing_ok=True)
+        shutil.rmtree(launch_dir / "shard_claims", ignore_errors=True)
+        return completion
+
+
 def _resolve_launch_and_weights(
     args: argparse.Namespace, root: Path
 ) -> tuple[dict[str, Any], Any]:
@@ -460,6 +511,9 @@ def _resolve_launch_and_weights(
         if contract_path.exists():
             try:
                 existing = json.loads(contract_path.read_text(encoding="utf-8"))
+                completion = _load_launch_completion(root, existing)
+                if completion is not None:
+                    return existing, None
                 checkpoint = Path(existing["checkpoint"])
                 expected_checkpoint_sha256 = str(existing["checkpoint_sha256"])
                 policy_version = int(existing["policy_version"])
@@ -519,6 +573,8 @@ def _build_worker_payloads(
     devices = [item.strip() for item in args.devices.split(",") if item.strip()]
     if not devices:
         devices = ["cpu"]
+    if published is None:
+        return [], devices, 0
     workers = max(1, int(args.workers))
     games = max(0, int(args.games))
     base = games // workers
@@ -578,8 +634,8 @@ def main(argv: list[str] | None = None) -> None:
             {
                 "event": "local_ppo_shards_start",
                 "run_root": str(root),
-                "policy_version": int(published.version),
-                "checkpoint": str(published.path),
+                "policy_version": int(launch["policy_version"]),
+                "checkpoint": None if published is None else str(published.path),
                 "launch_id": str(launch["launch_id"]),
                 "games": games,
                 "workers": len(payloads),
@@ -605,6 +661,7 @@ def main(argv: list[str] | None = None) -> None:
                     ),
                     flush=True,
                 )
+    launch_completion = _finalize_launch_if_complete(root, launch)
     total_games = sum(int(report["games"]) for report in reports)
     total_samples = sum(int(report["samples"]) for report in reports)
     total_shards = sum(int(report["shards"]) for report in reports)
@@ -616,6 +673,7 @@ def main(argv: list[str] | None = None) -> None:
                 "games": total_games,
                 "samples": total_samples,
                 "shards": total_shards,
+                "launch_complete": launch_completion is not None,
                 "elapsed_sec": time.perf_counter() - started,
             },
             sort_keys=True,

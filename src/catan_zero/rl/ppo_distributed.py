@@ -501,6 +501,105 @@ def trajectory_completion_path(
     return completed_dir(root) / f"{str(relative).replace(os.sep, '__')}.json"
 
 
+def expected_launch_shards(launch: dict[str, Any]) -> list[str]:
+    """Return the exact worker/shard schedule authenticated by a launch contract."""
+
+    games = int(launch["games"])
+    workers = max(1, int(launch["workers"]))
+    games_per_shard = max(1, int(launch["games_per_shard"]))
+    launch_id = str(launch["launch_id"])
+    base, remainder = divmod(max(0, games), workers)
+    expected: list[str] = []
+    for worker in range(workers):
+        worker_games = base + (1 if worker < remainder else 0)
+        worker_id = f"local_{launch_id}_{worker:03d}"
+        shard_count = (worker_games + games_per_shard - 1) // games_per_shard
+        expected.extend(
+            f"{worker_id}/shard_{shard_index:06d}.pkl"
+            for shard_index in range(shard_count)
+        )
+    return expected
+
+
+def launch_completion_path(root: str | os.PathLike, launch_id: str) -> Path:
+    return Path(root) / "actor_launches" / str(launch_id) / "launch_complete.json"
+
+
+def launch_completion_payload(launch: dict[str, Any]) -> dict[str, Any]:
+    contract_digest = hashlib.sha256(
+        json.dumps(launch, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    completed_shards = expected_launch_shards(launch)
+    schedule_digest = hashlib.sha256(
+        json.dumps(completed_shards, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return {
+        "schema": "local_entity_ppo_launch_complete_v1",
+        "launch_id": str(launch["launch_id"]),
+        "launch_contract_sha256": contract_digest,
+        "completed_shard_count": len(completed_shards),
+        "completed_schedule_sha256": schedule_digest,
+        "games": int(launch["games"]),
+        "policy_version": int(launch["policy_version"]),
+    }
+
+
+def load_launch_completion(
+    root: str | os.PathLike, launch_id: str
+) -> dict[str, Any] | None:
+    """Authenticate and return one aggregate launch completion receipt."""
+
+    completion = launch_completion_path(root, launch_id)
+    if not completion.exists():
+        return None
+    contract_path = completion.parent / "launch.json"
+    try:
+        launch = json.loads(contract_path.read_text(encoding="utf-8"))
+        actual = json.loads(completion.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"invalid launch completion receipt at {completion}") from error
+    expected = launch_completion_payload(launch)
+    if actual != expected:
+        raise RuntimeError(
+            "launch completion receipt mismatch: "
+            f"expected={expected!r} actual={actual!r}"
+        )
+    return actual
+
+
+def _aggregate_completion_for_shard(
+    root: str | os.PathLike, shard_path: str | os.PathLike
+) -> Path | None:
+    path = Path(shard_path).resolve()
+    try:
+        relative = path.relative_to(trajectories_dir(root).resolve())
+    except ValueError as error:
+        raise ValueError(f"trajectory shard is outside run root: {path}") from error
+    if len(relative.parts) != 2:
+        return None
+    worker_id = relative.parts[0]
+    if not worker_id.startswith("local_") or len(worker_id) < len("local_x_000"):
+        return None
+    launch_id, separator, worker_suffix = worker_id[len("local_") :].rpartition("_")
+    if separator != "_" or len(worker_suffix) != 3 or not worker_suffix.isdigit():
+        return None
+    completion = load_launch_completion(root, launch_id)
+    if completion is None:
+        return None
+    shard_key = f"{worker_id}/{relative.name}"
+    try:
+        launch = json.loads(
+            (launch_completion_path(root, launch_id).parent / "launch.json").read_text(
+                encoding="utf-8"
+            )
+        )
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"invalid launch contract for completed launch {launch_id}") from error
+    if shard_key not in expected_launch_shards(launch):
+        return None
+    return launch_completion_path(root, launch_id)
+
+
 def mark_trajectory_complete(
     root: str | os.PathLike, shard_path: str | os.PathLike
 ) -> Path:
@@ -512,6 +611,9 @@ def mark_trajectory_complete(
     consumed-marker retention window.
     """
 
+    aggregate = _aggregate_completion_for_shard(root, shard_path)
+    if aggregate is not None:
+        return aggregate
     path = Path(shard_path).resolve()
     try:
         relative = path.relative_to(trajectories_dir(root).resolve())
@@ -555,6 +657,8 @@ def mark_trajectory_complete(
 def trajectory_is_complete(
     root: str | os.PathLike, shard_path: str | os.PathLike
 ) -> bool:
+    if _aggregate_completion_for_shard(root, shard_path) is not None:
+        return True
     receipt = trajectory_completion_path(root, shard_path)
     if not receipt.is_file():
         return False
