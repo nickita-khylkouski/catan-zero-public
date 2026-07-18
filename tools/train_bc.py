@@ -9162,6 +9162,88 @@ def _validate_a1_validation_manifest_corpus_binding(
         )
 
 
+def _validate_stage_c_overlay_learner_parent(
+    data_path: str | Path,
+    corpus_meta: object,
+) -> dict[str, str] | None:
+    """Separate trajectory provenance from the reanalysed policy authority.
+
+    A Stage-C overlay keeps the original observations, terminal outcomes, and
+    value rows, so its historical trajectory producer must remain intact.
+    Its active policy rows, however, were replaced by one exact coherent-search
+    checkpoint.  Treating the old trajectory producer as the learner
+    initializer makes a correct direct distillation from the reanalyzer
+    impossible and caused the canonical config-first launch to fail only after
+    corpus staging.
+
+    Replay the overlay admission and bind the learner parent to the checkpoint
+    that actually produced the active policy targets.  Ordinary A1 corpora
+    retain their historical producer-equality rule.
+    """
+
+    if not isinstance(corpus_meta, dict):
+        return None
+    meta_overlay = corpus_meta.get("stage_c_policy_overlay")
+    if meta_overlay is None:
+        return None
+    if not isinstance(meta_overlay, dict):
+        raise SystemExit("Stage-C corpus overlay metadata is malformed")
+    root = Path(data_path).expanduser().resolve(strict=True)
+    admission_path = root / "overlay.admission.json"
+    try:
+        from tools import a1_stage_c_learner_overlay as stage_c_overlay
+
+        evidence = stage_c_overlay.verify_overlay_admission(admission_path)
+    except (OSError, ValueError, stage_c_overlay.OverlayError) as error:
+        raise SystemExit(
+            f"Stage-C learner-parent admission refused: {error}"
+        ) from error
+    admission = evidence.get("admission")
+    receipt = evidence.get("receipt")
+    if not isinstance(admission, dict) or not isinstance(receipt, dict):
+        raise SystemExit("Stage-C overlay verifier returned malformed evidence")
+    admitted_corpus = admission.get("corpus")
+    admitted_overlay = admission.get("stage_c_policy_overlay")
+    target = (
+        admitted_overlay.get("target_reanalyzer_checkpoint")
+        if isinstance(admitted_overlay, dict)
+        else None
+    )
+    trajectory_producer = (
+        admitted_corpus.get("producer_checkpoint_sha256")
+        if isinstance(admitted_corpus, dict)
+        else None
+    )
+    if (
+        not isinstance(admitted_corpus, dict)
+        or admitted_corpus.get("data_path") != str(root)
+        or not isinstance(admitted_overlay, dict)
+        or admitted_overlay.get("schema_version")
+        != meta_overlay.get("schema_version")
+        or admitted_overlay.get("target_policy_target_identity_sha256")
+        != meta_overlay.get("target_policy_target_identity_sha256")
+        or admitted_overlay.get("selected_policy_rows")
+        != meta_overlay.get("selected_policy_rows")
+        or admitted_overlay.get("target_reanalyzer_checkpoint")
+        != meta_overlay.get("target_reanalyzer_checkpoint")
+        or not isinstance(target, dict)
+        or set(target) != {"path", "sha256"}
+        or not _is_sha256(target.get("sha256"))
+        or receipt.get("target_reanalyzer_checkpoint") != target
+        or not _is_sha256(trajectory_producer)
+    ):
+        raise SystemExit(
+            "Stage-C policy teacher, corpus metadata, and trajectory provenance "
+            "do not form one authenticated learner authority"
+        )
+    return {
+        "learner_parent_checkpoint_sha256": str(target["sha256"]),
+        "learner_initializer_sha256": str(target["sha256"]),
+        "policy_target_producer_checkpoint_sha256": str(target["sha256"]),
+        "trajectory_producer_checkpoint_sha256": str(trajectory_producer),
+    }
+
+
 def _read_sha256_bound_json(
     path_value: object, expected_file_sha256: object, *, label: str
 ) -> tuple[Path, dict[str, object], str]:
@@ -16265,6 +16347,19 @@ def main(
                 validation_seed_contract,
                 np.asarray(data["game_seed"], dtype=np.int64),
             )
+            stage_c_parent = _validate_stage_c_overlay_learner_parent(
+                args.data, getattr(data, "meta", None)
+            )
+            if stage_c_parent is not None:
+                if (
+                    stage_c_parent["trajectory_producer_checkpoint_sha256"]
+                    != a1_training_binding["producer_checkpoint_sha256"]
+                ):
+                    raise SystemExit(
+                        "Stage-C overlay trajectory producer differs from the "
+                        "authenticated base corpus"
+                    )
+                a1_training_binding.update(stage_c_parent)
         _validate_a1_learner_objective(args, a1_training_binding)
         a1_training_binding["effective_learner_training_recipe"] = (
             _validate_a1_learner_training_recipe(args, ddp, a1_training_binding)

@@ -59,8 +59,8 @@ from catan_zero.rl.target_reliability import (  # noqa: E402
 
 
 EXPORT_SCHEMA = "a1-stage-c-learner-overlay-export-v4"
-MATERIALIZATION_SCHEMA = "a1-stage-c-policy-overlay-materialization-v4"
-ADMISSION_OVERLAY_SCHEMA = "a1-stage-c-policy-overlay-admission-binding-v4"
+MATERIALIZATION_SCHEMA = "a1-stage-c-policy-overlay-materialization-v5"
+ADMISSION_OVERLAY_SCHEMA = "a1-stage-c-policy-overlay-admission-binding-v5"
 COMPLETED_Q_BINDING_SCHEMA = "a1-stage-c-completed-q-binding-v1"
 SAMPLING_SCHEMA = "a1-stage-c-policy-sampling-distribution-v2"
 ROOT_BREADTH_SCHEMA = alignment.ROOT_BREADTH_SCHEMA
@@ -2245,6 +2245,13 @@ def _materialize(args: argparse.Namespace) -> dict[str, Any]:
             "target_policy_target_identity_sha256": export[
                 "target_policy_target_identity_sha256"
             ],
+            # State/outcome provenance remains bound to the base corpus
+            # producer.  Policy targets are a new evidence stream produced by
+            # this exact reanalyzer, which is also the only coherent parent for
+            # a direct Stage-C distillation update.
+            "target_reanalyzer_checkpoint": copy.deepcopy(
+                export["target_reanalyzer_checkpoint"]
+            ),
             "selected_policy_rows": int(projection["selected_rows"]),
             "nonselected_policy_weight": 0.0,
             "selected_policy_weight": 1.0,
@@ -2375,6 +2382,9 @@ def _materialize(args: argparse.Namespace) -> dict[str, Any]:
             "target_policy_target_identity_sha256": export[
                 "target_policy_target_identity_sha256"
             ],
+            "target_reanalyzer_checkpoint": copy.deepcopy(
+                export["target_reanalyzer_checkpoint"]
+            ),
             "selected_policy_rows": int(projection["selected_rows"]),
             "selected_training_policy_rows": int(
                 projection["selected_training_policy_rows"]
@@ -2470,6 +2480,11 @@ def verify_overlay_admission(path: Path) -> dict[str, Any]:
     completed_q_binding = (
         overlay.get("completed_q_binding") if isinstance(overlay, dict) else None
     )
+    target_reanalyzer = (
+        overlay.get("target_reanalyzer_checkpoint")
+        if isinstance(overlay, dict)
+        else None
+    )
     corpus = admission.get("corpus")
     policy_contract = admission.get("policy_distillation_contract")
     if (
@@ -2489,6 +2504,11 @@ def verify_overlay_admission(path: Path) -> dict[str, Any]:
         or overlay.get("paired_root_value_patch_consumed") is not True
         or overlay.get("completed_q_patch_consumed") is not True
         or not isinstance(completed_q_binding, dict)
+        or not isinstance(target_reanalyzer, dict)
+        or set(target_reanalyzer) != {"path", "sha256"}
+        or not isinstance(target_reanalyzer.get("path"), str)
+        or not target_reanalyzer["path"]
+        or not train_bc._is_sha256(target_reanalyzer.get("sha256"))  # noqa: SLF001
         or completed_q_binding.get("schema_version") != COMPLETED_Q_BINDING_SCHEMA
         or completed_q_binding.get("semantics", {}).get(
             "default_learner_objective"
@@ -2565,6 +2585,7 @@ def verify_overlay_admission(path: Path) -> dict[str, Any]:
         or receipt_stated != receipt_ref.get("receipt_sha256")
         or receipt.get("target_policy_target_identity_sha256")
         != overlay.get("target_policy_target_identity_sha256")
+        or receipt.get("target_reanalyzer_checkpoint") != target_reanalyzer
         or receipt.get("root_breadth") != root_breadth
         or receipt.get("paired_root_value_patch_consumed") is not True
         or receipt.get("completed_q_patch_consumed") is not True
@@ -2594,10 +2615,14 @@ def verify_overlay_admission(path: Path) -> dict[str, Any]:
         is not True
         or meta.get("stage_c_policy_overlay", {}).get("completed_q_binding")
         != completed_q_binding
-            or any(
-                not column_schema_matches(meta.get("columns", {}).get(name), schema)
-                for name, schema in COMPLETED_Q_COLUMN_SCHEMAS.items()
-            )
+        or meta.get("stage_c_policy_overlay", {}).get(
+            "target_reanalyzer_checkpoint"
+        )
+        != target_reanalyzer
+        or any(
+            not column_schema_matches(meta.get("columns", {}).get(name), schema)
+            for name, schema in COMPLETED_Q_COLUMN_SCHEMAS.items()
+        )
     ):
         raise OverlayError("Stage-C overlay admission differs from corpus bytes")
     overlay_trace = overlay.get("source_game_trace_qualification")

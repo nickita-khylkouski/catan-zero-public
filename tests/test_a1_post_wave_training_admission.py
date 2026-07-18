@@ -109,6 +109,10 @@ def test_one_dose_accepts_post_wave_overlay_and_derives_counts(
     target_contract = "sha256:" + "3" * 64
     validation_manifest_sha = "sha256:" + "4" * 64
     target_identity = "sha256:" + "5" * 64
+    target_reanalyzer = {
+        "path": str(tmp_path / "target-reanalyzer.pt"),
+        "sha256": "sha256:" + "9" * 64,
+    }
     admission = {
         "schema_version": executor.stage_c_final.overlay.post_wave_admission.ADMISSION_SCHEMA,
         "status": "admitted_for_diagnostic_policy_distillation",
@@ -145,6 +149,7 @@ def test_one_dose_accepts_post_wave_overlay_and_derives_counts(
         "stage_c_policy_overlay": {
             "selected_policy_rows": 2,
             "target_policy_target_identity_sha256": target_identity,
+            "target_reanalyzer_checkpoint": target_reanalyzer,
         },
     }
     admission["admission_sha256"] = executor._value_sha256(admission)  # noqa: SLF001
@@ -171,7 +176,10 @@ def test_one_dose_accepts_post_wave_overlay_and_derives_counts(
     overlay_evidence = {
         "path": str(admission_path),
         "admission": admission,
-        "receipt": {"projection": {"selected_rows": 2}},
+        "receipt": {
+            "projection": {"selected_rows": 2},
+            "target_reanalyzer_checkpoint": target_reanalyzer,
+        },
     }
     monkeypatch.setattr(
         executor.stage_c_final.overlay,

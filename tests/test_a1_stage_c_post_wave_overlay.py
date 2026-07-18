@@ -166,6 +166,10 @@ def test_overlay_verifier_accepts_bound_post_wave_derived_admission(
     base_semantics = overlay._source_policy_semantics(source)  # noqa: SLF001
     semantics = _augmented_source_semantics(source)
     target = "sha256:" + "e" * 64
+    target_reanalyzer = {
+        "path": "/sealed/v15-target-reanalyzer.pt",
+        "sha256": "sha256:" + "d" * 64,
+    }
     completed_q = {
         "schema_version": overlay.COMPLETED_Q_BINDING_SCHEMA,
         "semantics": {"default_learner_objective": "none_evidence_only"},
@@ -196,6 +200,7 @@ def test_overlay_verifier_accepts_bound_post_wave_derived_admission(
             "paired_root_value_patch_consumed": True,
             "completed_q_patch_consumed": True,
             "completed_q_binding": completed_q,
+            "target_reanalyzer_checkpoint": target_reanalyzer,
             "source_game_trace_qualification": trace_qualification,
             "trace_population": trace_population,
         },
@@ -206,6 +211,7 @@ def test_overlay_verifier_accepts_bound_post_wave_derived_admission(
     receipt = {
         "schema_version": overlay.MATERIALIZATION_SCHEMA,
         "target_policy_target_identity_sha256": target,
+        "target_reanalyzer_checkpoint": target_reanalyzer,
         "root_breadth": root_breadth,
         "paired_root_value_patch_consumed": True,
         "completed_q_patch_consumed": True,
@@ -270,6 +276,7 @@ def test_overlay_verifier_accepts_bound_post_wave_derived_admission(
                 "arm": "STRATEGIC_BALANCED",
             },
             "target_policy_target_identity_sha256": target,
+            "target_reanalyzer_checkpoint": target_reanalyzer,
             "root_breadth": root_breadth,
             "materialization_receipt": {
                 "path": str(receipt_path),
