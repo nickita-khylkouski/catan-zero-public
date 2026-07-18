@@ -58,6 +58,48 @@ def test_featurize_state_uses_canonical_public_learner_surface(monkeypatch):
     assert result["legal_policy_ids"] == (5, 6)
 
 
+def test_featurize_state_matches_producer_order_for_road_building_and_monopoly(
+    monkeypatch,
+):
+    class OutOfOrderDevCardGame(_FakeGame):
+        def playable_action_indices(self, colors, _prompt):
+            assert colors == ["RED", "BLUE"]
+            # The engine enumerates Monopoly before Road Building at PLAY_TURN,
+            # while the producer sorts the Rust action ids before persisting.
+            return [700, 600]
+
+        def playable_actions_json(self):
+            return json.dumps(
+                [
+                    ["RED", "PLAY_MONOPOLY", "WOOD"],
+                    ["RED", "PLAY_ROAD_BUILDING", None],
+                ]
+            )
+
+        def json_snapshot(self):
+            return json.dumps({"current_prompt": "PLAY_TURN"})
+
+    def canonical(_game, legal_rust, **kwargs):
+        assert legal_rust == (600, 700)
+        assert kwargs["action_by_id"] == {
+            700: ["RED", "PLAY_MONOPOLY", "WOOD"],
+            600: ["RED", "PLAY_ROAD_BUILDING", None],
+        }
+        return (
+            (310, 309),
+            {"hex_tokens": np.zeros((2, 3), dtype=np.float32)},
+            np.zeros((2, 4), dtype=np.float32),
+            {"current_prompt": "PLAY_TURN"},
+            kwargs["action_by_id"],
+        )
+
+    monkeypatch.setattr(rs, "_build_public_learner_features", canonical)
+
+    result = rs.featurize_state(OutOfOrderDevCardGame(), action_size=567)
+
+    assert result["legal_policy_ids"] == (310, 309)
+
+
 def _sequence() -> rs.GameActionSequence:
     return rs.GameActionSequence(
         game_seed=123,

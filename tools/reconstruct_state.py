@@ -507,8 +507,14 @@ def featurize_state(
     """
     if action_size is None:
         action_size = action_size_for_colors(tuple(colors))
+    # The self-play producer persists rows in sorted Rust-action-id order:
+    # `_build_decision_row` derives `legal_rust` from
+    # `sorted(result.improved_policy.keys())`.  The engine's playable-action
+    # enumeration is not in that order for every action combination (notably
+    # Monopoly + Road Building), so replay must apply the same canonical order
+    # before building action-indexed features.
     legal_rust = tuple(
-        int(a) for a in game.playable_action_indices(list(colors), None)
+        sorted(int(a) for a in game.playable_action_indices(list(colors), None))
     )
     acting_color = str(game.current_color())
     snapshot = json.loads(game.json_snapshot())
