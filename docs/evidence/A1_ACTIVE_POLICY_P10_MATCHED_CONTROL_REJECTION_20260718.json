@@ -1,0 +1,79 @@
+{
+  "schema_version": "a1-active-policy-p10-matched-control-rejection-v1",
+  "status": "rejected_non_promotable_parent_treatment",
+  "date_utc": "2026-07-18",
+  "recipes": {
+    "control": {
+      "name": "a1-parent-update-35m-b200",
+      "recipe_canonical_sha256": "552e8c9d7a4ccee8715411205d5b86a3811b3ed238e18664945546205779e4fe",
+      "current_catalog_recipe_canonical_sha256": "e14e87a45513c8c2eb5fe1d9e5a603e217b29ef7f9fb59c1ddf7d02f9632f6de",
+      "source_commit": "a934e210e481874b7e1e7bddd899fdbe2b487da9"
+    },
+    "treatment": {
+      "name": "a1-parent-update-active-p10-35m-b200",
+      "recipe_canonical_sha256": "950b81c30728d6f5b98a1e30426a645937fe0ffea0dca61e22f870141b29d09a",
+      "current_catalog_recipe_canonical_sha256": "dc827208fe84adf713d1d723160465a8c890351d558ed81ff2b187a98c2a51c2",
+      "source_commit": "92fcdda87172cb4ccfc45d6fa79997eec2ff565a",
+      "policy_aux_active_batch_size": 64,
+      "policy_aux_loss_weight": 0.1
+    }
+  },
+  "catalog_identity_migration": {
+    "from_typed_config_schema_version": 21,
+    "to_typed_config_schema_version": 22,
+    "science_fields_unchanged": true,
+    "matched_control_conclusion_applies_to_current_catalog_identity": true
+  },
+  "artifacts": {
+    "control_report_sha256": "sha256:110619d58624656ddd4fbad0529042628e6854e245b956b43aefc98a1ff1a501",
+    "treatment_report_sha256": "sha256:48dc635625fe743382419efdb881ebddb4d63def6d84ce75d0253a53ef479ecd",
+    "comparison_sha256": "sha256:7b4198ffb7a50f4635d3ca82cc0bf14de8e3d25ff53469c8416759161ae7d2d7"
+  },
+  "matched_control_isolation": {
+    "step0_model_tensors_equal": true,
+    "step0_tensor_count": 204,
+    "step0_tensor_only_sha256": "sha256:bd67c97d935cf50f2bbf217551c77685f23f5e1fd111a4da1d0e8851c99b7259",
+    "base_planned_order_equal": true,
+    "base_planned_order_sha256": "sha256:2f828783fc2730ecdc28f76f4f832154c17bb891e8d697925c3e825fdc958d74",
+    "validation_game_seed_set_equal": true,
+    "validation_game_seed_set_sha256": "sha256:78c81dc4d6da92c4dc5259cbaa48e42342ea2c0bcc2683ecb020530cee319aec",
+    "same_lr_dose": true,
+    "sampled_base_rows_per_arm": 6144,
+    "policy_active_base_rows_per_arm": 1399,
+    "policy_active_base_weight_sum_per_arm": 6172.229368448257,
+    "value_active_base_rows_per_arm": 4898,
+    "control_aux_rows": 0,
+    "treatment_aux_rows": 6144
+  },
+  "step12_treatment_minus_control": {
+    "active_policy_teacher_gap_closure": -0.013985194883283425,
+    "loss": 0.009231016117389856,
+    "policy_target_kl": 0.008852560896261408,
+    "sampled_action_top1_accuracy": -0.023214596841746482,
+    "move_robber_kl": 0.0301345306865064,
+    "move_robber_target_mass": -0.053257796976297705,
+    "move_robber_teacher_top1_accuracy": -0.09723566741959772,
+    "play_turn_kl": -0.001535863055496578
+  },
+  "objective_matched_treatment_minus_control": {
+    "current_producer": {
+      "active_policy_teacher_gap_closure": -0.014516913239920104,
+      "loss": 0.009609803228422198
+    },
+    "recent_history": {
+      "active_policy_teacher_gap_closure": -0.014376552116336372,
+      "loss": 0.009102459393440121
+    },
+    "hard_negative": {
+      "active_policy_teacher_gap_closure": -0.013592817148676772,
+      "loss": 0.00941600363007189
+    }
+  },
+  "decision": {
+    "authorize_for_retraining": false,
+    "promotion_authority": false,
+    "diagnostic_replay_allowed": true,
+    "replacement_requires_new_recipe_identity": true,
+    "reason": "The matched P10 treatment degraded policy loss, teacher-gap closure, overall KL, sampled-action accuracy, and especially MOVE_ROBBER behavior on the locked holdout. The exact P10 identity remains reproducible for diagnostics but is rejected for retraining or promotion."
+  }
+}

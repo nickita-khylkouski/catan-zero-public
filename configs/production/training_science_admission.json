@@ -209,9 +209,9 @@
     "a1-parent-update-active-p10-35m-b200": {
       "recipe_canonical_sha256": "dc827208fe84adf713d1d723160465a8c890351d558ed81ff2b187a98c2a51c2",
       "authorized": false,
-      "reason": "active_policy_parent_treatment_requires_fresh_commissioning",
+      "reason": "active_policy_p10_rejected_by_matched_control",
       "unresolved_requirements": [
-        "commission active-policy p10 dose against exact f7 parent"
+        "retain this exact P10 treatment as diagnostic-only; any replacement requires a distinct recipe identity and fresh independent commissioning"
       ],
       "observations": {
         "architecture_information_surface": "v6_b12_all_required_modules_positive_learning_signal",
@@ -219,9 +219,16 @@
         "required_fresh_learner_adapter": "rust_entity_adapter_v6_exact_actor_resources_initial_road_two_hop",
         "active_policy_treatment": "policy_aux_active_batch_size_64_policy_aux_loss_weight_0.10",
         "shared_trunk_lr_multiplier": 0.25,
-        "scalar_value_objective": "binary_win_bce_logit_equivalent_deployed_tanh"
+        "scalar_value_objective": "binary_win_bce_logit_equivalent_deployed_tanh",
+        "matched_control_step12_teacher_gap_delta": -0.013985194883283425,
+        "matched_control_step12_loss_delta": 0.009231016117389856,
+        "matched_control_step12_policy_kl_delta": 0.008852560896261408,
+        "matched_control_step12_move_robber_kl_delta": 0.0301345306865064,
+        "matched_control_selection_admitted": false
       },
-      "commissioning_evidence": []
+      "commissioning_evidence": [
+        "docs/evidence/A1_ACTIVE_POLICY_P10_MATCHED_CONTROL_REJECTION_20260718.json"
+      ]
     },
     "a1-parent-update-active-p25-35m-b200": {
       "recipe_canonical_sha256": "940e70128bafeb6b35a8e267058e7551affc73922282bef19ada83042cab3b50",

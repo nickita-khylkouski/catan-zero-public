@@ -1772,6 +1772,127 @@ def test_exact_max_steps_continues_past_configured_epoch_limit(
     assert len(report["metrics"]) == 2
 
 
+def test_optimizer_resume_preserves_exact_frontier_and_cumulative_report(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    import json
+
+    from catan_zero.rl.self_play import make_env_config
+    from tools import train_bc
+
+    data = _write_and_load_shard(tmp_path, _collect_real_samples(6))
+    winner = str(np.asarray(data["player"]).astype(str)[0])
+    data["winner"] = np.asarray([winner] * 6, dtype=object)
+    if "terminated" in data:
+        data["terminated"] = np.ones(6, dtype=np.bool_)
+    if "truncated" in data:
+        data["truncated"] = np.zeros(6, dtype=np.bool_)
+    monkeypatch.setattr(
+        train_bc, "load_teacher_data", lambda _path, **_kwargs: data
+    )
+    monkeypatch.setattr(
+        train_bc,
+        "_env_config_for_teacher_data",
+        lambda _args, _data, _ddp: make_env_config(vps_to_win=3),
+    )
+    shared_args = [
+        "--data",
+        str(tmp_path / "shard"),
+        "--data-format",
+        "npz",
+        "--arch",
+        "entity_graph",
+        "--device",
+        "cpu",
+        "--hidden-size",
+        "16",
+        "--epochs",
+        "2",
+        "--max-steps",
+        "4",
+        "--exact-max-steps",
+        "--checkpoint-steps",
+        "1,3",
+        "--train-diagnostics-every-batches",
+        "1",
+        "--batch-size",
+        "4",
+        "--policy-dose-lr-area",
+        "0.0001",
+        "--policy-dose-reference-global-batch-size",
+        "4",
+        "--validation-fraction",
+        "0",
+        "--save-each-epoch",
+        "--skip-guards",
+    ]
+    uninterrupted_checkpoint = tmp_path / "uninterrupted.pt"
+    uninterrupted_report = tmp_path / "uninterrupted.report.json"
+    train_bc.main(
+        [
+            *shared_args,
+            "--checkpoint",
+            str(uninterrupted_checkpoint),
+            "--report",
+            str(uninterrupted_report),
+            "--host-lock-file",
+            str(tmp_path / "uninterrupted.lock"),
+        ]
+    )
+    capsys.readouterr()
+
+    epoch_one = train_bc._epoch_checkpoint_path(
+        str(uninterrupted_checkpoint), 1
+    )
+    resumed_checkpoint = tmp_path / "resumed.pt"
+    resumed_report = tmp_path / "resumed.report.json"
+    train_bc.main(
+        [
+            *shared_args,
+            "--checkpoint",
+            str(resumed_checkpoint),
+            "--report",
+            str(resumed_report),
+            "--host-lock-file",
+            str(tmp_path / "resumed.lock"),
+            "--init-checkpoint",
+            str(epoch_one),
+            "--resume-optimizer",
+        ]
+    )
+    capsys.readouterr()
+
+    uninterrupted = json.loads(
+        uninterrupted_report.read_text(encoding="utf-8")
+    )
+    resumed = json.loads(resumed_report.read_text(encoding="utf-8"))
+    assert train_bc._checkpoint_model_tensor_state_sha256(
+        resumed_checkpoint
+    ) == train_bc._checkpoint_model_tensor_state_sha256(
+        uninterrupted_checkpoint
+    )
+    assert resumed["steps_completed"] == uninterrupted["steps_completed"] == 4
+    assert (
+        resumed["post_policy_dose_value_routing"][
+            "policy_dose_cutoff_optimizer_step"
+        ]
+        == uninterrupted["post_policy_dose_value_routing"][
+            "policy_dose_cutoff_optimizer_step"
+        ]
+        == 1
+    )
+    assert len(resumed["metrics"]) == len(uninterrupted["metrics"]) == 2
+    assert resumed["training_row_draws"] == uninterrupted["training_row_draws"]
+    assert resumed["checkpoint_dose_trajectory"]["checkpoint_steps"] == [1, 3, 4]
+    assert resumed["checkpoint_holdout_frontier"]["checkpoints"]
+    assert [
+        row["optimizer_step"]
+        for row in resumed["intermediate_checkpoints"]
+    ] == [1, 3]
+    assert train_bc._step_checkpoint_path(resumed_checkpoint, 1).is_file()
+    assert train_bc._step_checkpoint_path(resumed_checkpoint, 3).is_file()
+
+
 def test_unforced_phase_ddp_reducer_merges_unequal_rank_counts(monkeypatch) -> None:
     import torch.distributed as dist
     from tools import train_bc

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 from collections import Counter, deque
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -22,6 +23,7 @@ import sys
 import tempfile
 import time
 from typing import Any, BinaryIO, Mapping, Sequence
+import zlib
 
 # A script path does not bind Python imports to the same checkout.  In particular,
 # ``python /new/checkout/tools/train_bc.py`` can otherwise import ``catan_zero``
@@ -123,6 +125,7 @@ from catan_zero.rl.memmap_corpus import (
     normalize_index as _normalize_index,  # noqa: F401
 )
 from catan_zero.rl import optim_state as _checkout_optim_state
+from catan_zero.rl import config_serialization as _checkout_config_serialization  # noqa: F401
 from catan_zero.rl.flywheel.composite_contract import (
     FRESH_SOURCE_GAME_RATIOS,
     HISTORICAL_REPLAY_CATEGORY,
@@ -18670,21 +18673,149 @@ def main(
     optimizer_lr_applied_updates = 0
     optimizer_schedule_multiplier_sum = 0.0
     optimizer_lr_area_by_group = [0.0 for _ in optimizer.param_groups]
+    dose_microbatch_number = 0
+    policy_aux_source_reuse_resume_state: dict[str, object] | None = None
+    policy_aux_epoch_cycles_state: list[dict[str, object]] = []
+
+    def _current_checkpoint_resume_telemetry_state() -> dict[str, object]:
+        return {
+            "schema_version": CHECKPOINT_RESUME_TELEMETRY_SCHEMA,
+            "metrics": metrics,
+            "optimizer_observed_steps": optimizer_observed_steps,
+            "optimizer_clipped_steps": optimizer_clipped_steps,
+            "optimizer_zero_objective_steps": optimizer_zero_objective_steps,
+            "optimizer_pre_clip_grad_norm_sum": (
+                optimizer_pre_clip_grad_norm_sum
+            ),
+            "optimizer_pre_clip_grad_norm_max": (
+                optimizer_pre_clip_grad_norm_max
+            ),
+            "objective_gradient_baseline_observed": (
+                objective_gradient_baseline_observed
+            ),
+            "dose_microbatch_number": dose_microbatch_number,
+            "policy_dose_cutoff_optimizer_step": (
+                policy_dose_cutoff_optimizer_step
+            ),
+            "policy_aux_source_reuse_state": (
+                policy_aux_source_reuse_resume_state
+            ),
+            "policy_aux_epoch_cycles": policy_aux_epoch_cycles_state,
+        }
     total_training_steps = int(args.max_steps) if int(args.max_steps) > 0 else 0
-    intermediate_checkpoints: list[dict[str, object]] = []
-    checkpoint_dose_snapshots: list[dict[str, object]] = []
-    checkpoint_holdout_snapshots: list[dict[str, object]] = []
     effective_initialization_reference: dict[str, object] | None = None
-    saved_checkpoint_steps = (
+    resumed_checkpoint_frontier = (
         _verify_resumed_checkpoint_frontier(
             args.checkpoint,
             checkpoint_steps=checkpoint_steps,
             restored_global_step=global_step,
             resume_recipe_identity=resume_recipe_identity,
+            resume_progress=resume_progress,
+            resume_checkpoint=args.init_checkpoint,
+            validation_game_seed_set_sha256=(
+                validation_seed_set_sha256 or None
+            ),
+            ddp=ddp,
         )
         if resume_progress is not None
-        else set()
+        else None
     )
+    if resumed_checkpoint_frontier is None:
+        intermediate_checkpoints: list[dict[str, object]] = []
+        checkpoint_dose_snapshots: list[dict[str, object]] = []
+        checkpoint_holdout_snapshots: list[dict[str, object]] = []
+        saved_checkpoint_steps: set[int] = set()
+        checkpoint_frontier_trajectory_root = (
+            _checkpoint_frontier_trajectory_root(
+                resume_recipe_identity=resume_recipe_identity,
+                initial_model_state_sha256=_a1_model_tensor_state_sha256(
+                    policy.model
+                ),
+            )
+        )
+    else:
+        intermediate_checkpoints = list(
+            resumed_checkpoint_frontier["intermediate_checkpoints"]
+        )
+        checkpoint_dose_snapshots = list(
+            resumed_checkpoint_frontier["checkpoint_dose_snapshots"]
+        )
+        checkpoint_holdout_snapshots = list(
+            resumed_checkpoint_frontier["checkpoint_holdout_snapshots"]
+        )
+        saved_checkpoint_steps = set(
+            resumed_checkpoint_frontier["saved_checkpoint_steps"]
+        )
+        checkpoint_frontier_trajectory_root = dict(
+            resumed_checkpoint_frontier["trajectory_root"]
+        )
+        resumed_initialization_reference = resumed_checkpoint_frontier[
+            "effective_initialization_reference"
+        ]
+        effective_initialization_reference = (
+            None
+            if resumed_initialization_reference is None
+            else dict(resumed_initialization_reference)
+        )
+        resume_telemetry_state = resumed_checkpoint_frontier[
+            "resume_telemetry_state"
+        ]
+        if not isinstance(resume_telemetry_state, dict):
+            raise SystemExit("resumed checkpoint telemetry state is malformed")
+        metrics = list(resume_telemetry_state["metrics"])
+        optimizer_observed_steps = int(
+            resume_telemetry_state["optimizer_observed_steps"]
+        )
+        optimizer_clipped_steps = int(
+            resume_telemetry_state["optimizer_clipped_steps"]
+        )
+        optimizer_zero_objective_steps = int(
+            resume_telemetry_state["optimizer_zero_objective_steps"]
+        )
+        optimizer_pre_clip_grad_norm_sum = float(
+            resume_telemetry_state["optimizer_pre_clip_grad_norm_sum"]
+        )
+        optimizer_pre_clip_grad_norm_max = float(
+            resume_telemetry_state["optimizer_pre_clip_grad_norm_max"]
+        )
+        objective_gradient_baseline_observed = bool(
+            resume_telemetry_state["objective_gradient_baseline_observed"]
+        )
+        dose_microbatch_number = int(
+            resume_telemetry_state["dose_microbatch_number"]
+        )
+        restored_policy_dose_cutoff = resume_telemetry_state[
+            "policy_dose_cutoff_optimizer_step"
+        ]
+        policy_dose_cutoff_optimizer_step = (
+            None
+            if restored_policy_dose_cutoff is None
+            else int(restored_policy_dose_cutoff)
+        )
+        restored_reuse_state = resume_telemetry_state[
+            "policy_aux_source_reuse_state"
+        ]
+        policy_aux_source_reuse_resume_state = (
+            None
+            if restored_reuse_state is None
+            else dict(restored_reuse_state)
+        )
+        policy_aux_epoch_cycles_state = _validate_policy_aux_epoch_cycles(
+            resume_telemetry_state["policy_aux_epoch_cycles"],
+            expected_global_draw_end=(
+                policy_aux_global_draw_offset
+                if weighted_policy_aux_stream
+                else (
+                    0
+                    if restored_reuse_state is None
+                    else int(restored_reuse_state.get("global_draws", -1))
+                )
+            ),
+        )
+    if int(ddp["rank"]) == 0 and policy_aux_sampling_report:
+        policy_aux_sampling_report["epoch_cycles"] = (
+            policy_aux_epoch_cycles_state
+        )
 
     def _evaluate_validation_indices(eval_indices: np.ndarray) -> dict:
         return evaluate_bc_batches(
@@ -18812,8 +18943,32 @@ def main(
     # stream.  Short Stage-C doses sample with replacement; draw count alone
     # cannot distinguish broad target coverage from repeatedly replaying a
     # small handful of roots.
-    policy_aux_source_row_counts: Counter[int] = Counter()
-    policy_aux_seen_game_identities: set[tuple[int, int]] = set()
+    try:
+        (
+            policy_aux_source_row_counts,
+            policy_aux_seen_game_identities,
+        ) = _restore_policy_aux_source_reuse_resume_state(
+            policy_aux_source_reuse_resume_state,
+            ddp=ddp,
+            data_sharded=bool(args.ddp_shard_data),
+            expected_global_draws=(
+                policy_aux_global_draw_offset
+                if weighted_policy_aux_stream
+                else (
+                    0
+                    if policy_aux_source_reuse_resume_state is None
+                    else int(
+                        policy_aux_source_reuse_resume_state.get(
+                            "global_draws", -1
+                        )
+                    )
+                )
+            ),
+        )
+    except ValueError as error:
+        raise SystemExit(
+            f"resumed policy AUX source-reuse telemetry is malformed: {error}"
+        ) from error
     # C1 gradient accumulation. accum==1 (default) preserves the pre-C1 path
     # exactly: every micro-batch zero-grads, backwards the undivided loss, clips,
     # and steps, and global_step (== optimizer steps) advances once per batch.
@@ -18823,7 +18978,6 @@ def main(
     # small authenticated corpus is trained with replacement.  Using that
     # resetting counter made exact-capped runs pass preflight yet collect zero
     # module observations, so the terminal checkpoint was impossible to save.
-    dose_microbatch_number = 0
     central_realized_sample_evidence: dict[str, object] | None = None
     aux_stage_realized_sample_evidence: dict[str, object] | None = None
     for epoch in range(start_epoch, effective_epoch_limit):
@@ -19025,6 +19179,7 @@ def main(
             )
         aux_order = None
         weighted_cycle_mode = False
+        epoch_policy_aux_cycle: dict[str, object] | None = None
         if policy_aux_sampling_weights is not None:
             # This stream is stateless with respect to the persisted base RNG.
             # Legacy mode keeps its exact historical per-epoch seed. Cycle mode
@@ -19059,19 +19214,16 @@ def main(
                 mode=str(args.policy_aux_sampling_mode),
                 global_draw_offset=global_aux_draw_offset,
             )
-            if int(ddp["rank"]) == 0:
-                policy_aux_sampling_report.setdefault("epoch_cycles", []).append(
-                    {
-                        "epoch": int(epoch) + 1,
-                        **_policy_aux_sampling_cycle_report(
-                            policy_aux_sampling_weights,
-                            local_draws=local_aux_draws,
-                            ddp=ddp,
-                            mode=str(args.policy_aux_sampling_mode),
-                            global_draw_offset=global_aux_draw_offset,
-                        ),
-                    }
-                )
+            epoch_policy_aux_cycle = {
+                "epoch": int(epoch) + 1,
+                **_policy_aux_sampling_cycle_report(
+                    policy_aux_sampling_weights,
+                    local_draws=local_aux_draws,
+                    ddp=ddp,
+                    mode=str(args.policy_aux_sampling_mode),
+                    global_draw_offset=global_aux_draw_offset,
+                ),
+            }
         epoch_policy_component_dose: dict[str, float] = {}
         epoch_policy_component_phase_dose: dict[str, float] = {}
         epoch_value_component_dose: dict[str, float] = {}
@@ -20314,7 +20466,11 @@ def main(
                 # nobody can accidentally turn step 64/96 into a chained second
                 # production dose.  The terminal checkpoint remains the sole
                 # resumable checkpoint set.
-                snapshot_path = _step_checkpoint_path(args.checkpoint, global_step)
+                snapshot_path = (
+                    _step_checkpoint_path(args.checkpoint, global_step)
+                    .expanduser()
+                    .resolve()
+                )
                 snapshot_scalar_weight = cumulative_scalar_training_weight + (
                     _reduce_scalar_sum(
                         float(epoch_extra_denominators["value_loss"]), ddp
@@ -20354,6 +20510,11 @@ def main(
                     _intermediate_checkpoint_trajectory_binding(
                         optimizer_step=global_step,
                         resume_recipe_identity=resume_recipe_identity,
+                        trajectory_root_sha256=(
+                            checkpoint_frontier_trajectory_root[
+                                "trajectory_root_sha256"
+                            ]
+                        ),
                     )
                 )
                 snapshot_policy_signal = _policy_training_signal_attestation(
@@ -20423,6 +20584,27 @@ def main(
                         }
                     )
                     checkpoint_dose_snapshots.append(snapshot_dose_telemetry)
+                _save_checkpoint_frontier_journal(
+                    args.checkpoint,
+                    checkpoint_steps=checkpoint_steps,
+                    intermediate_checkpoints=intermediate_checkpoints,
+                    checkpoint_dose_snapshots=checkpoint_dose_snapshots,
+                    checkpoint_holdout_snapshots=checkpoint_holdout_snapshots,
+                    effective_initialization_reference=(
+                        effective_initialization_reference
+                    ),
+                    trajectory_root=checkpoint_frontier_trajectory_root,
+                    resume_recipe_identity=resume_recipe_identity,
+                    validation_game_seed_set_sha256=(
+                        validation_seed_set_sha256 or None
+                    ),
+                    resume_telemetry_state=(
+                        _current_checkpoint_resume_telemetry_state()
+                    ),
+                    owner_checkpoint=snapshot_path,
+                    owner_optimizer_step=global_step,
+                    ddp=ddp,
+                )
                 saved_checkpoint_steps.add(global_step)
             if args.progress_every_batches and batch_number % int(args.progress_every_batches) == 0:
                 _rank0_print(
@@ -20947,6 +21129,25 @@ def main(
             if int(args.policy_aux_active_batch_size) > 0
             else None
         )
+        policy_aux_source_reuse_resume_state = (
+            _policy_aux_source_reuse_resume_state(
+                policy_aux_source_row_counts,
+                game_identities=policy_aux_seen_game_identities,
+                ddp=ddp,
+                data_sharded=bool(args.ddp_shard_data),
+            )
+            if int(args.policy_aux_active_batch_size) > 0
+            else None
+        )
+        if epoch_policy_aux_cycle is not None:
+            policy_aux_epoch_cycles_state.append(epoch_policy_aux_cycle)
+        if weighted_policy_aux_stream and policy_aux_source_reuse_resume_state is not None and (
+            int(policy_aux_source_reuse_resume_state["global_draws"])
+            != int(policy_aux_global_draw_offset)
+        ):
+            raise RuntimeError(
+                "policy AUX reuse telemetry draw count drifted from sampler offset"
+            )
         metrics.append(
             {
                 "epoch": epoch + 1,
@@ -21703,6 +21904,27 @@ def main(
             optimizer_saved = _save_optimizer_sidecar(
                 str(epoch_path), policy, optimizer, ddp
             )
+            checkpoint_frontier_saved = _save_checkpoint_frontier_journal(
+                epoch_path,
+                checkpoint_steps=checkpoint_steps,
+                intermediate_checkpoints=intermediate_checkpoints,
+                checkpoint_dose_snapshots=checkpoint_dose_snapshots,
+                checkpoint_holdout_snapshots=checkpoint_holdout_snapshots,
+                effective_initialization_reference=(
+                    effective_initialization_reference
+                ),
+                trajectory_root=checkpoint_frontier_trajectory_root,
+                resume_recipe_identity=resume_recipe_identity,
+                validation_game_seed_set_sha256=(
+                    validation_seed_set_sha256 or None
+                ),
+                resume_telemetry_state=(
+                    _current_checkpoint_resume_telemetry_state()
+                ),
+                owner_checkpoint=epoch_path,
+                owner_optimizer_step=global_step,
+                ddp=ddp,
+            )
             _save_training_progress_sidecar(
                 str(epoch_path),
                 optimizer_saved=optimizer_saved,
@@ -21723,6 +21945,7 @@ def main(
                     if policy_kl_controller is None
                     else policy_kl_controller.state_dict()
                 ),
+                checkpoint_frontier_saved=checkpoint_frontier_saved,
                 ddp=ddp,
             )
         if args.max_steps > 0 and global_step >= args.max_steps:
@@ -21755,7 +21978,7 @@ def main(
             getattr(checkpoint_model, "value_categorical_bins", 0) or 0
         ),
         optimizer_steps=global_step,
-        completed_epochs=start_epoch + len(metrics),
+        completed_epochs=len(metrics),
         scalar_training_weight_sum=cumulative_scalar_training_weight,
         categorical_training_weight_sum=(
             cumulative_categorical_training_weight
@@ -21887,12 +22110,31 @@ def main(
     optimizer_saved = _save_optimizer_sidecar(
         args.checkpoint, policy, optimizer, ddp
     )
+    checkpoint_frontier_saved = _save_checkpoint_frontier_journal(
+        args.checkpoint,
+        checkpoint_steps=checkpoint_steps,
+        intermediate_checkpoints=intermediate_checkpoints,
+        checkpoint_dose_snapshots=checkpoint_dose_snapshots,
+        checkpoint_holdout_snapshots=checkpoint_holdout_snapshots,
+        effective_initialization_reference=effective_initialization_reference,
+        trajectory_root=checkpoint_frontier_trajectory_root,
+        resume_recipe_identity=resume_recipe_identity,
+        validation_game_seed_set_sha256=(
+            validation_seed_set_sha256 or None
+        ),
+        resume_telemetry_state=(
+            _current_checkpoint_resume_telemetry_state()
+        ),
+        owner_checkpoint=args.checkpoint,
+        owner_optimizer_step=global_step,
+        ddp=ddp,
+    )
     _save_training_progress_sidecar(
         args.checkpoint,
         optimizer_saved=optimizer_saved,
         checkpoint_role="terminal_admitted",
         optimizer_step=global_step,
-        completed_epochs=start_epoch + len(metrics),
+        completed_epochs=len(metrics),
         recipe_identity=resume_recipe_identity,
         rng=rng,
         symmetry_rng=symmetry_rng,
@@ -21905,6 +22147,7 @@ def main(
             if policy_kl_controller is None
             else policy_kl_controller.state_dict()
         ),
+        checkpoint_frontier_saved=checkpoint_frontier_saved,
         ddp=ddp,
     )
     if int(ddp["rank"]) == 0 and checkpoint_steps:
@@ -22196,51 +22439,18 @@ def main(
                 np.asarray(policy_aux_sampling_weights, dtype=np.float64) > 0.0
             )
         )
-        if not isinstance(realized_reuse, dict):
-            raise RuntimeError(
-                "weighted policy AUX cycles completed without reuse evidence"
-            )
-        realized_draws = int(realized_reuse["draws"])
-        realized_slice = _policy_aux_stream_slice_contract(
-            global_draw_offset=policy_aux_initial_global_draw_offset,
-            global_draws=realized_draws,
+        realized_contract = _policy_aux_cumulative_realized_reuse_contract(
+            realized_reuse,
             eligible_rows=eligible_rows,
+            data_sharded=bool(args.ddp_shard_data),
+            resumed_invocation_global_draw_start=(
+                policy_aux_initial_global_draw_offset
+            ),
         )
-        slice_start = int(realized_slice["global_draw_start"])
-        slice_end = int(realized_slice["global_draw_end"])
-        reuse_cap = int(realized_slice["maximum_source_row_reuse"])
-        if int(realized_reuse["max_source_row_reuse"]) > reuse_cap:
-            raise RuntimeError("weighted policy AUX sampler exceeded its reuse cap")
-        complete_cycle_observed = bool(
-            realized_slice["contains_complete_cycle"]
-        )
-        if (
-            not bool(args.ddp_shard_data)
-            and complete_cycle_observed
-            and int(realized_reuse["unique_source_rows"]) != eligible_rows
-        ):
-            raise RuntimeError(
-                "weighted policy AUX sampler failed complete eligible-row coverage"
-            )
         if int(ddp["rank"]) == 0:
-            policy_aux_sampling_report["realized_reuse_contract"] = {
-                "schema_version": "policy-aux-cycle-realized-reuse-v1",
-                "draws": realized_draws,
-                "global_draw_start": slice_start,
-                "global_draw_end": slice_end,
-                "eligible_positive_mass_rows": eligible_rows,
-                "unique_source_rows": int(
-                    realized_reuse["unique_source_rows"]
-                ),
-                "observed_max_source_row_reuse": int(
-                    realized_reuse["max_source_row_reuse"]
-                ),
-                "maximum_source_row_reuse_by_construction": reuse_cap,
-                "complete_eligible_coverage_required": bool(
-                    not args.ddp_shard_data and complete_cycle_observed
-                ),
-                "contract_satisfied": True,
-            }
+            policy_aux_sampling_report["realized_reuse_contract"] = (
+                realized_contract
+            )
     report = {
         "checkout_runtime_binding": checkout_runtime_binding,
         "training_resume_recipe_identity": resume_recipe_identity,
@@ -41077,8 +41287,29 @@ def _step_checkpoint_path(checkpoint: str | Path, step: int) -> Path:
 
 INTERMEDIATE_CHECKPOINT_SCHEMA = "train-bc-intermediate-checkpoint-v1"
 INTERMEDIATE_CHECKPOINT_TRAJECTORY_SCHEMA = (
-    "train-bc-intermediate-checkpoint-trajectory-v1"
+    "train-bc-intermediate-checkpoint-trajectory-v2"
 )
+CHECKPOINT_FRONTIER_JOURNAL_SCHEMA = "train-bc-checkpoint-frontier-journal-v1"
+CHECKPOINT_FRONTIER_ENTRY_SCHEMA = "train-bc-checkpoint-frontier-entry-v1"
+CHECKPOINT_FRONTIER_ROOT_SCHEMA = "train-bc-checkpoint-frontier-root-v1"
+CHECKPOINT_RESUME_TELEMETRY_SCHEMA = "train-bc-resume-telemetry-state-v2"
+
+
+def _empty_checkpoint_resume_telemetry_state() -> dict[str, object]:
+    return {
+        "schema_version": CHECKPOINT_RESUME_TELEMETRY_SCHEMA,
+        "metrics": [],
+        "optimizer_observed_steps": 0,
+        "optimizer_clipped_steps": 0,
+        "optimizer_zero_objective_steps": 0,
+        "optimizer_pre_clip_grad_norm_sum": 0.0,
+        "optimizer_pre_clip_grad_norm_max": 0.0,
+        "objective_gradient_baseline_observed": False,
+        "dose_microbatch_number": 0,
+        "policy_dose_cutoff_optimizer_step": None,
+        "policy_aux_source_reuse_state": None,
+        "policy_aux_epoch_cycles": [],
+    }
 
 
 def _prepare_checkpoint_frontier_start(
@@ -41122,7 +41353,10 @@ def _prepare_checkpoint_frontier_start(
 
 
 def _intermediate_checkpoint_trajectory_binding(
-    *, optimizer_step: int, resume_recipe_identity: Mapping[str, object]
+    *,
+    optimizer_step: int,
+    resume_recipe_identity: Mapping[str, object],
+    trajectory_root_sha256: str,
 ) -> dict[str, object]:
     """Bind one model-only snapshot to its exact resumable optimizer trajectory."""
 
@@ -41132,7 +41366,408 @@ def _intermediate_checkpoint_trajectory_binding(
         "training_resume_recipe_identity_sha256": _canonical_json_sha256(
             dict(resume_recipe_identity)
         ),
+        "trajectory_root_sha256": str(trajectory_root_sha256),
     }
+
+
+def _checkpoint_frontier_trajectory_root(
+    *,
+    resume_recipe_identity: Mapping[str, object],
+    initial_model_state_sha256: str,
+) -> dict[str, str]:
+    root = {
+        "schema_version": CHECKPOINT_FRONTIER_ROOT_SCHEMA,
+        "training_resume_recipe_identity_sha256": _canonical_json_sha256(
+            dict(resume_recipe_identity)
+        ),
+        "initial_model_state_sha256": str(initial_model_state_sha256),
+    }
+    return {
+        **root,
+        "trajectory_root_sha256": _canonical_json_sha256(root),
+    }
+
+
+def _checkpoint_frontier_journal_payload(
+    *,
+    checkpoint_steps: Sequence[int],
+    intermediate_checkpoints: Sequence[Mapping[str, object]],
+    checkpoint_dose_snapshots: Sequence[Mapping[str, object]],
+    checkpoint_holdout_snapshots: Sequence[Mapping[str, object]],
+    effective_initialization_reference: Mapping[str, object] | None,
+    trajectory_root: Mapping[str, str],
+    resume_recipe_identity: Mapping[str, object],
+    validation_game_seed_set_sha256: str | None,
+    resume_telemetry_state: Mapping[str, object],
+    owner_checkpoint: str | Path,
+    owner_optimizer_step: int,
+) -> dict[str, object]:
+    """Build an authenticated, checkpoint-specific resume frontier."""
+
+    inventory = [dict(record) for record in intermediate_checkpoints]
+    doses = [dict(record) for record in checkpoint_dose_snapshots]
+    holdouts = [dict(record) for record in checkpoint_holdout_snapshots]
+    if not (len(inventory) == len(doses) == len(holdouts)):
+        raise RuntimeError("checkpoint frontier evidence lengths differ")
+    telemetry_fields = {
+        "schema_version",
+        "metrics",
+        "optimizer_observed_steps",
+        "optimizer_clipped_steps",
+        "optimizer_zero_objective_steps",
+        "optimizer_pre_clip_grad_norm_sum",
+        "optimizer_pre_clip_grad_norm_max",
+        "objective_gradient_baseline_observed",
+        "dose_microbatch_number",
+        "policy_dose_cutoff_optimizer_step",
+        "policy_aux_source_reuse_state",
+        "policy_aux_epoch_cycles",
+    }
+    telemetry = dict(resume_telemetry_state)
+    if (
+        set(telemetry) != telemetry_fields
+        or telemetry.get("schema_version")
+        != CHECKPOINT_RESUME_TELEMETRY_SCHEMA
+        or not isinstance(telemetry.get("metrics"), list)
+        or type(telemetry.get("objective_gradient_baseline_observed")) is not bool
+    ):
+        raise RuntimeError("checkpoint frontier resume telemetry is malformed")
+    for field in (
+        "optimizer_observed_steps",
+        "optimizer_clipped_steps",
+        "optimizer_zero_objective_steps",
+        "dose_microbatch_number",
+    ):
+        if type(telemetry.get(field)) is not int or int(telemetry[field]) < 0:
+            raise RuntimeError("checkpoint frontier resume telemetry is malformed")
+    cutoff_step = telemetry.get("policy_dose_cutoff_optimizer_step")
+    if cutoff_step is not None and (
+        type(cutoff_step) is not int
+        or int(cutoff_step) <= 0
+        or int(cutoff_step) > int(owner_optimizer_step)
+    ):
+        raise RuntimeError("checkpoint frontier resume telemetry is malformed")
+    reuse_state = telemetry.get("policy_aux_source_reuse_state")
+    if reuse_state is not None:
+        try:
+            _restore_policy_aux_source_reuse_resume_state(
+                reuse_state,
+                ddp={
+                    "enabled": int(reuse_state.get("world_size", 0)) > 1,
+                    "world_size": int(reuse_state.get("world_size", 0)),
+                    "rank": 0,
+                },
+                data_sharded=bool(reuse_state.get("data_sharded_identity", False)),
+                expected_global_draws=int(reuse_state.get("global_draws", -1)),
+            )
+        except (AttributeError, TypeError, ValueError) as error:
+            raise RuntimeError(
+                "checkpoint frontier policy AUX reuse telemetry is malformed"
+            ) from error
+    try:
+        _validate_policy_aux_epoch_cycles(
+            telemetry.get("policy_aux_epoch_cycles"),
+            expected_global_draw_end=(
+                0
+                if reuse_state is None
+                else int(reuse_state.get("global_draws", -1))
+            ),
+        )
+    except (AttributeError, TypeError, ValueError) as error:
+        raise RuntimeError(
+            "checkpoint frontier policy AUX epoch-cycle telemetry is malformed"
+        ) from error
+    for field in (
+        "optimizer_pre_clip_grad_norm_sum",
+        "optimizer_pre_clip_grad_norm_max",
+    ):
+        value = telemetry.get(field)
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            or float(value) < 0.0
+        ):
+            raise RuntimeError("checkpoint frontier resume telemetry is malformed")
+    expected_recipe_sha256 = _canonical_json_sha256(dict(resume_recipe_identity))
+    root_without_digest = {
+        key: trajectory_root.get(key)
+        for key in (
+            "schema_version",
+            "training_resume_recipe_identity_sha256",
+            "initial_model_state_sha256",
+        )
+    }
+    if (
+        root_without_digest.get("schema_version") != CHECKPOINT_FRONTIER_ROOT_SCHEMA
+        or root_without_digest.get("training_resume_recipe_identity_sha256")
+        != expected_recipe_sha256
+        or trajectory_root.get("trajectory_root_sha256")
+        != _canonical_json_sha256(root_without_digest)
+    ):
+        raise RuntimeError("checkpoint frontier trajectory root is malformed")
+    requested = [int(step) for step in checkpoint_steps]
+    observed_steps = [int(record.get("optimizer_step", -1)) for record in inventory]
+    if observed_steps != requested[: len(observed_steps)]:
+        raise RuntimeError("checkpoint frontier is not a requested-step prefix")
+    owner_input = Path(owner_checkpoint).expanduser()
+    if not owner_input.is_file() or owner_input.is_symlink():
+        raise RuntimeError("checkpoint frontier owner is not a regular model checkpoint")
+    owner = owner_input.resolve(strict=True)
+    evidence_directory = owner.parent
+    owner_model_sha256 = _checkpoint_model_tensor_state_sha256(owner)
+    initialization_entry: dict[str, object] | None = None
+    if effective_initialization_reference is not None:
+        initialization = dict(effective_initialization_reference)
+        initialization_locator = Path(str(initialization.get("checkpoint", "")))
+        if initialization_locator.is_absolute():
+            initialization_input = initialization_locator.expanduser()
+        else:
+            if (
+                len(initialization_locator.parts) != 1
+                or initialization_locator.name in {"", ".", ".."}
+            ):
+                raise RuntimeError(
+                    "checkpoint frontier initialization locator is not checkpoint-local"
+                )
+            initialization_input = evidence_directory / initialization_locator
+        if (
+            not initialization_input.is_file()
+            or initialization_input.is_symlink()
+        ):
+            raise RuntimeError(
+                "checkpoint frontier initialization reference is not a regular file"
+            )
+        initialization_path = initialization_input.resolve(strict=True)
+        initialization_sha256 = _sha256_existing_file(initialization_path)
+        if (
+            initialization_path.parent != evidence_directory
+            or initialization.get("schema_version")
+            != EFFECTIVE_INITIALIZATION_REFERENCE_SCHEMA
+            or initialization.get("optimizer_step") != 0
+            or initialization.get("checkpoint_sha256") != initialization_sha256
+            or initialization.get("size_bytes")
+            != initialization_path.stat().st_size
+            or initialization.get("same_training_trajectory") is not True
+            or not isinstance(initialization.get("holdout_metrics"), dict)
+        ):
+            raise RuntimeError(
+                "checkpoint frontier initialization evidence is malformed"
+            )
+        initialization_entry = {
+            "evidence": {
+                **initialization,
+                "checkpoint": initialization_path.name,
+            },
+            "model_state_sha256": _checkpoint_model_tensor_state_sha256(
+                initialization_path
+            ),
+        }
+        if (
+            initialization_entry["model_state_sha256"]
+            != trajectory_root.get("initial_model_state_sha256")
+        ):
+            raise RuntimeError(
+                "checkpoint frontier initialization model differs from its "
+                "trajectory root"
+            )
+    entries: list[dict[str, object]] = []
+    previous_chain = str(trajectory_root["trajectory_root_sha256"])
+    for step, checkpoint_record, dose, holdout in zip(
+        observed_steps, inventory, doses, holdouts, strict=True
+    ):
+        snapshot_locator = Path(str(checkpoint_record.get("checkpoint", "")))
+        if snapshot_locator.is_absolute():
+            snapshot_input = snapshot_locator.expanduser()
+        else:
+            if (
+                len(snapshot_locator.parts) != 1
+                or snapshot_locator.name in {"", ".", ".."}
+            ):
+                raise RuntimeError(
+                    f"checkpoint frontier step-{step} locator is not checkpoint-local"
+                )
+            snapshot_input = evidence_directory / snapshot_locator
+        if not snapshot_input.is_file() or snapshot_input.is_symlink():
+            raise RuntimeError(
+                f"checkpoint frontier step-{step} snapshot is not a regular file"
+            )
+        snapshot = snapshot_input.resolve(strict=True)
+        if snapshot.parent != evidence_directory:
+            raise RuntimeError(
+                f"checkpoint frontier step-{step} snapshot is not owner-local"
+            )
+        snapshot_sha256 = _sha256_existing_file(snapshot)
+        snapshot_model_sha256 = _checkpoint_model_tensor_state_sha256(snapshot)
+        normalized_checkpoint_record = {
+            **checkpoint_record,
+            "checkpoint": snapshot.name,
+        }
+        normalized_holdout = {
+            **holdout,
+            "checkpoint": snapshot.name,
+        }
+        if (
+            checkpoint_record.get("schema_version") != INTERMEDIATE_CHECKPOINT_SCHEMA
+            or checkpoint_record.get("checkpoint_sha256") != snapshot_sha256
+            or checkpoint_record.get("size_bytes") != snapshot.stat().st_size
+            or checkpoint_record.get("same_training_trajectory") is not True
+            or checkpoint_record.get("optimizer_sidecar") is not None
+            or dose.get("schema_version") != CHECKPOINT_DOSE_TELEMETRY_SCHEMA
+            or dose.get("optimizer_step") != step
+            or holdout.get("schema_version") != CHECKPOINT_HOLDOUT_SCHEMA
+            or holdout.get("optimizer_step") != step
+            or holdout.get("checkpoint") != checkpoint_record.get("checkpoint")
+            or holdout.get("checkpoint_sha256") != snapshot_sha256
+            or holdout.get("measure") != "report_bound_raw_validation_rows"
+            or holdout.get("validation_game_seed_set_sha256")
+            != (validation_game_seed_set_sha256 or None)
+            or not isinstance(holdout.get("metrics"), dict)
+        ):
+            raise RuntimeError(f"checkpoint frontier step-{step} evidence is malformed")
+        entry_body: dict[str, object] = {
+            "schema_version": CHECKPOINT_FRONTIER_ENTRY_SCHEMA,
+            "optimizer_step": step,
+            "snapshot_model_sha256": snapshot_model_sha256,
+            "intermediate_checkpoint": normalized_checkpoint_record,
+            "dose_telemetry": dose,
+            "holdout": normalized_holdout,
+        }
+        chain_sha256 = _canonical_json_sha256(
+            {"previous_chain_sha256": previous_chain, "entry": entry_body}
+        )
+        entries.append(
+            {
+                **entry_body,
+                "previous_chain_sha256": previous_chain,
+                "chain_sha256": chain_sha256,
+            }
+        )
+        previous_chain = chain_sha256
+    owner_record = {
+        "path": owner.name,
+        "optimizer_step": int(owner_optimizer_step),
+        "checkpoint_sha256": _sha256_existing_file(owner),
+        "model_state_sha256": owner_model_sha256,
+    }
+    final_chain = _canonical_json_sha256(
+        {
+            "previous_chain_sha256": previous_chain,
+            "owner_checkpoint": owner_record,
+            "resume_telemetry_state": telemetry,
+            "effective_initialization_reference": initialization_entry,
+        }
+    )
+    return {
+        "schema_version": CHECKPOINT_FRONTIER_JOURNAL_SCHEMA,
+        "trajectory_root": dict(trajectory_root),
+        "training_resume_recipe_identity_sha256": expected_recipe_sha256,
+        "checkpoint_steps_requested": requested,
+        "validation_identity": {
+            "measure": "report_bound_raw_validation_rows",
+            "validation_game_seed_set_sha256": (
+                validation_game_seed_set_sha256 or None
+            ),
+        },
+        "owner_checkpoint": owner_record,
+        "resume_telemetry_state": telemetry,
+        "effective_initialization_reference": initialization_entry,
+        "entries": entries,
+        "frontier_chain_sha256": final_chain,
+    }
+
+
+def _save_checkpoint_frontier_journal(
+    checkpoint: str | Path,
+    *,
+    checkpoint_steps: Sequence[int],
+    intermediate_checkpoints: Sequence[Mapping[str, object]],
+    checkpoint_dose_snapshots: Sequence[Mapping[str, object]],
+    checkpoint_holdout_snapshots: Sequence[Mapping[str, object]],
+    effective_initialization_reference: Mapping[str, object] | None,
+    trajectory_root: Mapping[str, str],
+    resume_recipe_identity: Mapping[str, object],
+    validation_game_seed_set_sha256: str | None,
+    resume_telemetry_state: Mapping[str, object],
+    owner_checkpoint: str | Path,
+    owner_optimizer_step: int,
+    ddp: Mapping[str, int | bool],
+) -> Path | None:
+    """Atomically persist rank-zero evidence and synchronize save refusal."""
+
+    rank = int(ddp["rank"])
+    enabled = bool(ddp.get("enabled", False))
+    output: Path | None = None
+    save_error: str | None = None
+    if rank == 0:
+        try:
+            from catan_zero.rl.optim_state import checkpoint_frontier_sidecar_path
+
+            payload = _checkpoint_frontier_journal_payload(
+                checkpoint_steps=checkpoint_steps,
+                intermediate_checkpoints=intermediate_checkpoints,
+                checkpoint_dose_snapshots=checkpoint_dose_snapshots,
+                checkpoint_holdout_snapshots=checkpoint_holdout_snapshots,
+                effective_initialization_reference=(
+                    effective_initialization_reference
+                ),
+                trajectory_root=trajectory_root,
+                resume_recipe_identity=resume_recipe_identity,
+                validation_game_seed_set_sha256=(
+                    validation_game_seed_set_sha256
+                ),
+                resume_telemetry_state=resume_telemetry_state,
+                owner_checkpoint=owner_checkpoint,
+                owner_optimizer_step=owner_optimizer_step,
+            )
+            output = checkpoint_frontier_sidecar_path(checkpoint)
+            output.parent.mkdir(parents=True, exist_ok=True)
+            tmp = output.with_name(f".{output.name}.tmp.{os.getpid()}")
+            try:
+                with tmp.open("w", encoding="utf-8") as handle:
+                    json.dump(payload, handle, sort_keys=True, indent=2)
+                    handle.write("\n")
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(tmp, output)
+            finally:
+                if tmp.exists():
+                    tmp.unlink()
+        except Exception as error:
+            save_error = f"{type(error).__name__}: {error}"
+            output = None
+    if enabled:
+        import torch.distributed as dist
+
+        status: list[object] = [
+            (
+                {
+                    "error": save_error,
+                    "path": None if output is None else str(output),
+                }
+                if rank == 0
+                else None
+            )
+        ]
+        dist.broadcast_object_list(status, src=0)
+        received = status[0]
+        if (
+            not isinstance(received, dict)
+            or set(received) != {"error", "path"}
+            or received["error"] is not None
+            and not isinstance(received["error"], str)
+            or received["path"] is not None
+            and not isinstance(received["path"], str)
+        ):
+            raise RuntimeError(
+                "checkpoint frontier journal save synchronization is malformed"
+            )
+        save_error = received["error"]
+    if save_error is not None:
+        raise RuntimeError(
+            f"could not persist checkpoint frontier journal: {save_error}"
+        )
+    return output
 
 
 def _verify_resumed_checkpoint_frontier(
@@ -41141,7 +41776,11 @@ def _verify_resumed_checkpoint_frontier(
     checkpoint_steps: Sequence[int],
     restored_global_step: int,
     resume_recipe_identity: Mapping[str, object],
-) -> set[int]:
+    resume_progress: Mapping[str, object],
+    resume_checkpoint: str | Path,
+    validation_game_seed_set_sha256: str | None,
+    ddp: Mapping[str, int | bool] | None = None,
+) -> dict[str, object]:
     """Authenticate passed snapshots and reserve future paths on exact resume.
 
     A path alone is not evidence that the snapshot belongs to this optimizer
@@ -41153,26 +41792,233 @@ def _verify_resumed_checkpoint_frontier(
     import torch
 
     restored = int(restored_global_step)
+    passed_steps = [
+        int(step) for step in checkpoint_steps if int(step) <= restored
+    ]
     expected_identity_sha256 = _canonical_json_sha256(
         dict(resume_recipe_identity)
     )
     verified: set[int] = set()
     from catan_zero.rl.optim_state import (
+        checkpoint_frontier_sidecar_path,
         optimizer_sidecar_path,
         training_progress_sidecar_path,
     )
 
+    frontier_ref = resume_progress.get("checkpoint_frontier")
+    if frontier_ref is None:
+        if restored > 0:
+            raise SystemExit(
+                "optimizer resume has consumed training but its progress marker "
+                "does not bind an authenticated checkpoint frontier journal and "
+                "cumulative telemetry state"
+            )
+        trajectory_root = _checkpoint_frontier_trajectory_root(
+            resume_recipe_identity=resume_recipe_identity,
+            initial_model_state_sha256=_checkpoint_model_tensor_state_sha256(
+                resume_checkpoint
+            ),
+        )
+        journal_inventory: list[dict[str, object]] = []
+        journal_doses: list[dict[str, object]] = []
+        journal_holdouts: list[dict[str, object]] = []
+        resume_telemetry_state = _empty_checkpoint_resume_telemetry_state()
+        journal_initialization_entry: dict[str, object] | None = None
+    else:
+        frontier_path = checkpoint_frontier_sidecar_path(resume_checkpoint)
+        if not isinstance(frontier_ref, Mapping) or set(frontier_ref) != {
+            "path",
+            "sha256",
+        }:
+            raise SystemExit(
+                "optimizer resume checkpoint frontier progress binding mismatch"
+            )
+        if (
+            frontier_ref.get("path") != frontier_path.name
+            or not frontier_path.is_file()
+            or frontier_path.is_symlink()
+            or frontier_ref.get("sha256") != _sha256_existing_file(frontier_path)
+        ):
+            raise SystemExit(
+                "optimizer resume checkpoint frontier progress binding mismatch"
+            )
+        try:
+            raw_journal = json.loads(frontier_path.read_text(encoding="utf-8"))
+            if not isinstance(raw_journal, dict):
+                raise ValueError("journal is not a JSON object")
+            raw_entries = raw_journal.get("entries")
+            trajectory_root = raw_journal.get("trajectory_root")
+            resume_telemetry_state = raw_journal.get("resume_telemetry_state")
+            raw_initialization_entry = raw_journal.get(
+                "effective_initialization_reference"
+            )
+            if not isinstance(raw_entries, list) or not isinstance(
+                trajectory_root, dict
+            ) or not isinstance(resume_telemetry_state, dict):
+                raise ValueError("journal root/entries/telemetry are malformed")
+            if raw_initialization_entry is not None and not isinstance(
+                raw_initialization_entry, dict
+            ):
+                raise ValueError("journal initialization evidence is malformed")
+            journal_initialization_entry = (
+                None
+                if raw_initialization_entry is None
+                else dict(raw_initialization_entry)
+            )
+            journal_inventory = []
+            journal_doses = []
+            journal_holdouts = []
+            for entry in raw_entries:
+                if not isinstance(entry, dict):
+                    raise ValueError("journal entry is malformed")
+                checkpoint_record = entry.get("intermediate_checkpoint")
+                dose = entry.get("dose_telemetry")
+                holdout = entry.get("holdout")
+                if not all(
+                    isinstance(value, dict)
+                    for value in (checkpoint_record, dose, holdout)
+                ):
+                    raise ValueError("journal entry evidence is malformed")
+                journal_inventory.append(dict(checkpoint_record))
+                journal_doses.append(dict(dose))
+                journal_holdouts.append(dict(holdout))
+            regenerated = _checkpoint_frontier_journal_payload(
+                checkpoint_steps=checkpoint_steps,
+                intermediate_checkpoints=journal_inventory,
+                checkpoint_dose_snapshots=journal_doses,
+                checkpoint_holdout_snapshots=journal_holdouts,
+                effective_initialization_reference=(
+                    None
+                    if journal_initialization_entry is None
+                    else journal_initialization_entry.get("evidence")
+                ),
+                trajectory_root=trajectory_root,
+                resume_recipe_identity=resume_recipe_identity,
+                validation_game_seed_set_sha256=(
+                    validation_game_seed_set_sha256
+                ),
+                resume_telemetry_state=resume_telemetry_state,
+                owner_checkpoint=resume_checkpoint,
+                owner_optimizer_step=restored,
+            )
+        except (OSError, UnicodeError, json.JSONDecodeError, ValueError, RuntimeError) as error:
+            raise SystemExit(
+                f"cannot authenticate optimizer resume checkpoint frontier: {error}"
+            ) from error
+        if raw_journal != regenerated:
+            raise SystemExit(
+                "optimizer resume checkpoint frontier content/chain mismatch"
+            )
+        journal_steps = [
+            int(record["optimizer_step"]) for record in journal_inventory
+        ]
+        if journal_steps != passed_steps:
+            raise SystemExit(
+                "optimizer resume checkpoint frontier does not contain every "
+                f"passed step: expected={passed_steps} observed={journal_steps}"
+            )
+        evidence_directory = frontier_path.parent.resolve(strict=True)
+        rehydrated_inventory: list[dict[str, object]] = []
+        rehydrated_holdouts: list[dict[str, object]] = []
+        for checkpoint_record, holdout in zip(
+            journal_inventory, journal_holdouts, strict=True
+        ):
+            locator = Path(str(checkpoint_record["checkpoint"]))
+            if (
+                locator.is_absolute()
+                or len(locator.parts) != 1
+                or locator.name in {"", ".", ".."}
+            ):
+                raise SystemExit(
+                    "optimizer resume checkpoint frontier contains a non-local "
+                    "snapshot locator"
+                )
+            snapshot = evidence_directory / locator
+            if not snapshot.is_file() or snapshot.is_symlink():
+                raise SystemExit(
+                    "optimizer resume checkpoint frontier snapshot locator is "
+                    f"missing or unsafe: {locator}"
+                )
+            resolved_snapshot = snapshot.resolve(strict=True)
+            if resolved_snapshot.parent != evidence_directory:
+                raise SystemExit(
+                    "optimizer resume checkpoint frontier snapshot escapes its "
+                    "checkpoint directory"
+                )
+            actual_path = str(resolved_snapshot)
+            rehydrated_inventory.append(
+                {**checkpoint_record, "checkpoint": actual_path}
+            )
+            rehydrated_holdouts.append(
+                {**holdout, "checkpoint": actual_path}
+            )
+        journal_inventory = rehydrated_inventory
+        journal_holdouts = rehydrated_holdouts
+        if journal_initialization_entry is not None:
+            initialization_evidence = journal_initialization_entry.get(
+                "evidence"
+            )
+            if not isinstance(initialization_evidence, dict):
+                raise SystemExit(
+                    "optimizer resume checkpoint frontier initialization "
+                    "evidence is malformed"
+                )
+            initialization_locator = Path(
+                str(initialization_evidence.get("checkpoint", ""))
+            )
+            if (
+                initialization_locator.is_absolute()
+                or len(initialization_locator.parts) != 1
+                or initialization_locator.name in {"", ".", ".."}
+            ):
+                raise SystemExit(
+                    "optimizer resume checkpoint frontier contains a non-local "
+                    "initialization locator"
+                )
+            initialization_source = evidence_directory / initialization_locator
+            if (
+                not initialization_source.is_file()
+                or initialization_source.is_symlink()
+                or optimizer_sidecar_path(initialization_source).exists()
+                or optimizer_sidecar_path(initialization_source).is_symlink()
+                or training_progress_sidecar_path(initialization_source).exists()
+                or training_progress_sidecar_path(initialization_source).is_symlink()
+            ):
+                raise SystemExit(
+                    "optimizer resume initialization reference is missing, "
+                    "unsafe, or not model-only"
+                )
+            resolved_initialization = initialization_source.resolve(strict=True)
+            if resolved_initialization.parent != evidence_directory:
+                raise SystemExit(
+                    "optimizer resume initialization reference escapes its "
+                    "checkpoint directory"
+                )
+            journal_initialization_entry = {
+                **journal_initialization_entry,
+                "evidence": {
+                    **initialization_evidence,
+                    "checkpoint": str(resolved_initialization),
+                },
+            }
+
+    journal_by_step = {
+        int(record["optimizer_step"]): record for record in journal_inventory
+    }
+    # Complete every fallible source/future-path admission before reseeding any
+    # passed snapshot into a new output namespace. A rejected resume must not
+    # leave copied files that poison a corrected retry.
     for raw_step in checkpoint_steps:
         step = int(raw_step)
-        snapshot_path = _step_checkpoint_path(checkpoint, step)
-        optimizer_path = optimizer_sidecar_path(snapshot_path)
-        progress_path = training_progress_sidecar_path(snapshot_path)
-        occupied_paths = tuple(
-            path
-            for path in (snapshot_path, optimizer_path, progress_path)
-            if path.exists() or path.is_symlink()
-        )
         if step > restored:
+            snapshot_path = _step_checkpoint_path(checkpoint, step)
+            optimizer_path = optimizer_sidecar_path(snapshot_path)
+            progress_path = training_progress_sidecar_path(snapshot_path)
+            occupied_paths = tuple(
+                path
+                for path in (snapshot_path, optimizer_path, progress_path)
+                if path.exists() or path.is_symlink()
+            )
             if occupied_paths:
                 raise SystemExit(
                     "future intermediate checkpoint path already exists during "
@@ -41180,6 +42026,15 @@ def _verify_resumed_checkpoint_frontier(
                     f"{[str(path) for path in occupied_paths]}"
                 )
             continue
+        checkpoint_record = journal_by_step.get(step)
+        if checkpoint_record is None:
+            raise SystemExit(
+                "optimizer resume checkpoint frontier is missing authenticated "
+                f"evidence for passed step {step}"
+            )
+        snapshot_path = Path(str(checkpoint_record["checkpoint"]))
+        optimizer_path = optimizer_sidecar_path(snapshot_path)
+        progress_path = training_progress_sidecar_path(snapshot_path)
         if not snapshot_path.is_file() or snapshot_path.is_symlink():
             raise SystemExit(
                 "optimizer resume is missing an immutable past intermediate "
@@ -41240,6 +42095,9 @@ def _verify_resumed_checkpoint_frontier(
                 "training_resume_recipe_identity_sha256": (
                     expected_identity_sha256
                 ),
+                "trajectory_root_sha256": trajectory_root[
+                    "trajectory_root_sha256"
+                ],
             }
         ):
             raise SystemExit(
@@ -41247,7 +42105,144 @@ def _verify_resumed_checkpoint_frontier(
                 f"step={step} path={snapshot_path}"
             )
         verified.add(step)
-    return verified
+
+    reseed_jobs: list[tuple[str, Path, Path, str]] = []
+    if journal_initialization_entry is not None:
+        initialization_evidence = journal_initialization_entry["evidence"]
+        assert isinstance(initialization_evidence, dict)
+        reseed_jobs.append(
+            (
+                "initialization",
+                Path(str(initialization_evidence["checkpoint"])),
+                _step_checkpoint_path(checkpoint, 0).expanduser().resolve(),
+                str(initialization_evidence["checkpoint_sha256"]),
+            )
+        )
+    for checkpoint_record in journal_inventory:
+        step = int(checkpoint_record["optimizer_step"])
+        reseed_jobs.append(
+            (
+                f"step-{step}",
+                Path(str(checkpoint_record["checkpoint"])),
+                _step_checkpoint_path(checkpoint, step).expanduser().resolve(),
+                str(checkpoint_record["checkpoint_sha256"]),
+            )
+        )
+    for label, source, target, expected_sha256 in reseed_jobs:
+        if target == source:
+            continue
+        target_sidecars = (
+            optimizer_sidecar_path(target),
+            training_progress_sidecar_path(target),
+        )
+        if any(
+            path.exists() or path.is_symlink() for path in target_sidecars
+        ):
+            raise SystemExit(
+                f"cannot reseed optimizer resume checkpoint frontier: "
+                f"{label} target has a sidecar"
+            )
+        if target.exists() or target.is_symlink():
+            if (
+                not target.is_file()
+                or target.is_symlink()
+                or _sha256_existing_file(target) != expected_sha256
+            ):
+                raise SystemExit(
+                    f"cannot reseed optimizer resume checkpoint frontier: "
+                    f"{label} target is occupied: {target}"
+                )
+
+    rank = int((ddp or {}).get("rank", 0))
+    ddp_enabled = bool((ddp or {}).get("enabled", False))
+    reseed_error: str | None = None
+    if rank == 0:
+        try:
+            for label, source, target, expected_sha256 in reseed_jobs:
+                if target != source:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    if target.exists() or target.is_symlink():
+                        if (
+                            not target.is_file()
+                            or target.is_symlink()
+                            or _sha256_existing_file(target) != expected_sha256
+                        ):
+                            raise RuntimeError(
+                                f"{label} reseed target is occupied: {target}"
+                            )
+                    else:
+                        tmp = target.with_name(
+                            f".{target.name}.reseed.tmp.{os.getpid()}"
+                        )
+                        try:
+                            with source.open("rb") as source_handle, tmp.open(
+                                "xb"
+                            ) as target_handle:
+                                for block in iter(
+                                    lambda: source_handle.read(1024 * 1024), b""
+                                ):
+                                    target_handle.write(block)
+                                target_handle.flush()
+                                os.fsync(target_handle.fileno())
+                            os.replace(tmp, target)
+                        finally:
+                            if tmp.exists():
+                                tmp.unlink()
+                        if (
+                            _sha256_existing_file(target) != expected_sha256
+                        ):
+                            raise RuntimeError(
+                                f"{label} reseeded snapshot digest mismatch"
+                            )
+        except (OSError, RuntimeError) as error:
+            reseed_error = str(error)
+    if ddp_enabled:
+        import torch.distributed as dist
+
+        reseed_status: list[object] = [reseed_error]
+        dist.broadcast_object_list(reseed_status, src=0)
+        reseed_error = (
+            None if reseed_status[0] is None else str(reseed_status[0])
+        )
+    if reseed_error is not None:
+        raise SystemExit(
+            f"cannot reseed optimizer resume checkpoint frontier: {reseed_error}"
+        )
+    reseeded_inventory: list[dict[str, object]] = []
+    reseeded_holdouts: list[dict[str, object]] = []
+    for checkpoint_record, holdout in zip(
+        journal_inventory, journal_holdouts, strict=True
+    ):
+        step = int(checkpoint_record["optimizer_step"])
+        target = _step_checkpoint_path(checkpoint, step).expanduser().resolve()
+        reseeded_inventory.append(
+            {**checkpoint_record, "checkpoint": str(target)}
+        )
+        reseeded_holdouts.append({**holdout, "checkpoint": str(target)})
+    journal_inventory = reseeded_inventory
+    journal_holdouts = reseeded_holdouts
+    effective_initialization_reference: dict[str, object] | None = None
+    if journal_initialization_entry is not None:
+        initialization_evidence = journal_initialization_entry["evidence"]
+        assert isinstance(initialization_evidence, dict)
+        effective_initialization_reference = {
+            **initialization_evidence,
+            "checkpoint": str(
+                _step_checkpoint_path(checkpoint, 0).expanduser().resolve()
+            ),
+        }
+
+    return {
+        "saved_checkpoint_steps": verified,
+        "intermediate_checkpoints": journal_inventory,
+        "checkpoint_dose_snapshots": journal_doses,
+        "checkpoint_holdout_snapshots": journal_holdouts,
+        "trajectory_root": trajectory_root,
+        "resume_telemetry_state": resume_telemetry_state,
+        "effective_initialization_reference": (
+            effective_initialization_reference
+        ),
+    }
 
 
 def _parse_checkpoint_steps(raw: str, *, max_steps: int) -> tuple[int, ...]:
@@ -44254,6 +45249,282 @@ def _policy_aux_source_reuse_summary(
     }
 
 
+POLICY_AUX_SOURCE_REUSE_RESUME_SCHEMA = (
+    "policy-aux-source-reuse-resume-state-v1"
+)
+POLICY_AUX_SOURCE_REUSE_RANK_CODEC = "zlib-base64-canonical-json-v1"
+
+
+def _encode_policy_aux_source_reuse_rank_state(
+    row_counts: Mapping[int, int],
+    *,
+    game_identities: set[tuple[int, int]],
+    rank: int,
+) -> dict[str, object]:
+    """Encode exact rank-local reuse state without a per-row JSON object.
+
+    Weighted-with-replacement diagnostics can touch hundreds of thousands of
+    source rows. Persisting ``{row: count}`` directly in the progress journal
+    makes the authenticated JSON enormous. A canonical sorted representation
+    remains exact, while compression keeps the journal proportional to the
+    information in the counter rather than Python/JSON key overhead.
+    """
+
+    normalized_counts: list[list[int]] = []
+    for raw_row, raw_count in sorted(
+        ((int(row), int(count)) for row, count in row_counts.items()),
+        key=lambda item: item[0],
+    ):
+        if raw_row < 0 or raw_count <= 0:
+            raise ValueError("policy AUX reuse state has an invalid row/count")
+        normalized_counts.append([raw_row, raw_count])
+    normalized_games = [
+        [int(component), int(seed)]
+        for component, seed in sorted(
+            (int(component), int(seed))
+            for component, seed in game_identities
+        )
+    ]
+    payload = {
+        "row_counts": normalized_counts,
+        "game_identities": normalized_games,
+    }
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    ).encode("ascii")
+    return {
+        "rank": int(rank),
+        "codec": POLICY_AUX_SOURCE_REUSE_RANK_CODEC,
+        "uncompressed_sha256": hashlib.sha256(encoded).hexdigest(),
+        "payload": base64.b64encode(zlib.compress(encoded, level=9)).decode("ascii"),
+    }
+
+
+def _decode_policy_aux_source_reuse_rank_state(
+    record: Mapping[str, object],
+) -> tuple[int, Counter[int], set[tuple[int, int]]]:
+    """Validate and decode one compact rank-local reuse record."""
+
+    if set(record) != {
+        "rank",
+        "codec",
+        "uncompressed_sha256",
+        "payload",
+    }:
+        raise ValueError("policy AUX reuse rank state fields drifted")
+    rank = record.get("rank")
+    digest = record.get("uncompressed_sha256")
+    payload = record.get("payload")
+    if (
+        isinstance(rank, bool)
+        or not isinstance(rank, int)
+        or rank < 0
+        or record.get("codec") != POLICY_AUX_SOURCE_REUSE_RANK_CODEC
+        or not isinstance(digest, str)
+        or len(digest) != 64
+        or any(character not in "0123456789abcdef" for character in digest)
+        or not isinstance(payload, str)
+        or not payload
+    ):
+        raise ValueError("policy AUX reuse rank state is malformed")
+    try:
+        decoded = zlib.decompress(base64.b64decode(payload, validate=True))
+        value = json.loads(decoded.decode("ascii"))
+    except (
+        ValueError,
+        UnicodeError,
+        json.JSONDecodeError,
+        zlib.error,
+    ) as error:
+        raise ValueError("policy AUX reuse rank state cannot be decoded") from error
+    if hashlib.sha256(decoded).hexdigest() != digest:
+        raise ValueError("policy AUX reuse rank state digest mismatch")
+    if not isinstance(value, dict) or set(value) != {
+        "row_counts",
+        "game_identities",
+    }:
+        raise ValueError("policy AUX reuse rank payload fields drifted")
+    raw_counts = value["row_counts"]
+    raw_games = value["game_identities"]
+    if not isinstance(raw_counts, list) or not isinstance(raw_games, list):
+        raise ValueError("policy AUX reuse rank payload is malformed")
+    counts: Counter[int] = Counter()
+    previous_row = -1
+    for item in raw_counts:
+        if (
+            not isinstance(item, list)
+            or len(item) != 2
+            or any(isinstance(part, bool) or not isinstance(part, int) for part in item)
+        ):
+            raise ValueError("policy AUX reuse row/count payload is malformed")
+        row, count = item
+        if row <= previous_row or row < 0 or count <= 0:
+            raise ValueError("policy AUX reuse row/count payload is not canonical")
+        counts[row] = count
+        previous_row = row
+    games: set[tuple[int, int]] = set()
+    previous_game: tuple[int, int] | None = None
+    for item in raw_games:
+        if (
+            not isinstance(item, list)
+            or len(item) != 2
+            or any(isinstance(part, bool) or not isinstance(part, int) for part in item)
+        ):
+            raise ValueError("policy AUX reuse game payload is malformed")
+        game = (item[0], item[1])
+        if previous_game is not None and game <= previous_game:
+            raise ValueError("policy AUX reuse game payload is not canonical")
+        games.add(game)
+        previous_game = game
+    return int(rank), counts, games
+
+
+def _policy_aux_source_reuse_resume_state(
+    row_counts: Mapping[int, int],
+    *,
+    game_identities: set[tuple[int, int]],
+    ddp: Mapping[str, int | bool],
+    data_sharded: bool,
+) -> dict[str, object]:
+    """Gather an exact, compact state that can continue reuse telemetry."""
+
+    local = _encode_policy_aux_source_reuse_rank_state(
+        row_counts,
+        game_identities=game_identities,
+        rank=int(ddp.get("rank", 0)),
+    )
+    gathered: list[object] = [local]
+    if bool(ddp.get("enabled", False)):
+        import torch.distributed as dist
+
+        gathered = [None for _ in range(int(ddp["world_size"]))]
+        dist.all_gather_object(gathered, local)
+    world_size = int(ddp["world_size"]) if ddp.get("enabled", False) else 1
+    rank_states: list[dict[str, object]] = []
+    global_draws = 0
+    observed_ranks: list[int] = []
+    for raw_record in gathered:
+        if not isinstance(raw_record, Mapping):
+            raise RuntimeError("policy AUX reuse state gather returned malformed data")
+        rank, counts, _games = _decode_policy_aux_source_reuse_rank_state(raw_record)
+        observed_ranks.append(rank)
+        global_draws += sum(counts.values())
+        rank_states.append(dict(raw_record))
+    rank_states.sort(key=lambda record: int(record["rank"]))
+    if observed_ranks != list(range(world_size)):
+        raise RuntimeError("policy AUX reuse state gather rank inventory drifted")
+    return {
+        "schema_version": POLICY_AUX_SOURCE_REUSE_RESUME_SCHEMA,
+        "world_size": world_size,
+        "data_sharded_identity": bool(data_sharded),
+        "global_draws": int(global_draws),
+        "rank_states": rank_states,
+    }
+
+
+def _restore_policy_aux_source_reuse_resume_state(
+    state: object,
+    *,
+    ddp: Mapping[str, int | bool],
+    data_sharded: bool,
+    expected_global_draws: int,
+) -> tuple[Counter[int], set[tuple[int, int]]]:
+    """Restore the current rank's exact counter/game set from authenticated state."""
+
+    if state is None:
+        if int(expected_global_draws) != 0:
+            raise ValueError("policy AUX reuse state is missing after prior draws")
+        return Counter(), set()
+    if not isinstance(state, Mapping) or set(state) != {
+        "schema_version",
+        "world_size",
+        "data_sharded_identity",
+        "global_draws",
+        "rank_states",
+    }:
+        raise ValueError("policy AUX reuse resume state fields drifted")
+    world_size = int(ddp["world_size"]) if ddp.get("enabled", False) else 1
+    if (
+        state.get("schema_version") != POLICY_AUX_SOURCE_REUSE_RESUME_SCHEMA
+        or state.get("world_size") != world_size
+        or state.get("data_sharded_identity") is not bool(data_sharded)
+        or state.get("global_draws") != int(expected_global_draws)
+        or not isinstance(state.get("rank_states"), list)
+        or len(state["rank_states"]) != world_size
+    ):
+        raise ValueError("policy AUX reuse resume state identity drifted")
+    decoded: dict[int, tuple[Counter[int], set[tuple[int, int]]]] = {}
+    total_draws = 0
+    for raw_record in state["rank_states"]:
+        if not isinstance(raw_record, Mapping):
+            raise ValueError("policy AUX reuse resume rank state is malformed")
+        rank, counts, games = _decode_policy_aux_source_reuse_rank_state(raw_record)
+        if rank in decoded or rank >= world_size:
+            raise ValueError("policy AUX reuse resume rank inventory drifted")
+        decoded[rank] = (counts, games)
+        total_draws += sum(counts.values())
+    if set(decoded) != set(range(world_size)) or total_draws != int(
+        expected_global_draws
+    ):
+        raise ValueError("policy AUX reuse resume cumulative draw count drifted")
+    return decoded[int(ddp.get("rank", 0))]
+
+
+def _validate_policy_aux_epoch_cycles(
+    raw_cycles: object,
+    *,
+    expected_global_draw_end: int,
+) -> list[dict[str, object]]:
+    """Validate the compact cumulative epoch-to-global-stream ledger."""
+
+    if not isinstance(raw_cycles, list):
+        raise ValueError("policy AUX epoch-cycle telemetry is not a list")
+    cycles: list[dict[str, object]] = []
+    expected_start = 0
+    total_draws = 0
+    observed_mode: str | None = None
+    expected_epoch = 1
+    for raw in raw_cycles:
+        mode = raw.get("mode") if isinstance(raw, Mapping) else None
+        if observed_mode is None and isinstance(mode, str):
+            observed_mode = mode
+        weighted_cycles = observed_mode == POLICY_AUX_SAMPLING_WEIGHTED_CYCLES_V1
+        if (
+            not isinstance(raw, Mapping)
+            or raw.get("schema_version") != "policy-aux-sampling-cycle-v1"
+            or raw.get("epoch") != expected_epoch
+            or mode != observed_mode
+            or raw.get("global_draw_offset")
+            != (expected_start if weighted_cycles else 0)
+            or isinstance(raw.get("global_draw_end"), bool)
+            or not isinstance(raw.get("global_draw_end"), int)
+            or int(raw["global_draw_end"])
+            < (expected_start if weighted_cycles else 0)
+            or isinstance(raw.get("global_draws"), bool)
+            or not isinstance(raw.get("global_draws"), int)
+            or int(raw["global_draws"]) < 0
+        ):
+            raise ValueError("policy AUX epoch-cycle telemetry chain drifted")
+        cycles.append(dict(raw))
+        total_draws += int(raw["global_draws"])
+        expected_start = (
+            int(raw["global_draw_end"]) if weighted_cycles else expected_start
+        )
+        expected_epoch += 1
+    terminal_draws = (
+        expected_start
+        if observed_mode == POLICY_AUX_SAMPLING_WEIGHTED_CYCLES_V1
+        else total_draws
+    )
+    if terminal_draws != int(expected_global_draw_end):
+        raise ValueError("policy AUX epoch-cycle telemetry terminal offset drifted")
+    return cycles
+
+
 def _a1_canonical_sample_row_identity(
     *,
     payload_member_sha256: str,
@@ -46225,6 +47496,62 @@ def _policy_aux_stream_slice_contract(
     }
 
 
+def _policy_aux_cumulative_realized_reuse_contract(
+    realized_reuse: object,
+    *,
+    eligible_rows: int,
+    data_sharded: bool,
+    resumed_invocation_global_draw_start: int,
+) -> dict[str, object]:
+    """Validate the trajectory-cumulative weighted-cycle reuse evidence."""
+
+    if not isinstance(realized_reuse, Mapping):
+        raise RuntimeError(
+            "weighted policy AUX cycles completed without reuse evidence"
+        )
+    # The restored counter already includes the prefix before this invocation.
+    # Evaluate cumulative cap/coverage from stream origin zero; adding the
+    # restored offset again would double-count that prefix.
+    realized_draws = int(realized_reuse["draws"])
+    realized_slice = _policy_aux_stream_slice_contract(
+        global_draw_offset=0,
+        global_draws=realized_draws,
+        eligible_rows=int(eligible_rows),
+    )
+    reuse_cap = int(realized_slice["maximum_source_row_reuse"])
+    observed_max = int(realized_reuse["max_source_row_reuse"])
+    unique_rows = int(realized_reuse["unique_source_rows"])
+    if observed_max > reuse_cap:
+        raise RuntimeError("weighted policy AUX sampler exceeded its reuse cap")
+    complete_cycle_observed = bool(realized_slice["contains_complete_cycle"])
+    if (
+        not bool(data_sharded)
+        and complete_cycle_observed
+        and unique_rows != int(eligible_rows)
+    ):
+        raise RuntimeError(
+            "weighted policy AUX sampler failed complete eligible-row coverage"
+        )
+    return {
+        "schema_version": "policy-aux-cycle-realized-reuse-v1",
+        "scope": "cumulative_training_trajectory",
+        "draws": realized_draws,
+        "global_draw_start": int(realized_slice["global_draw_start"]),
+        "global_draw_end": int(realized_slice["global_draw_end"]),
+        "resumed_invocation_global_draw_start": int(
+            resumed_invocation_global_draw_start
+        ),
+        "eligible_positive_mass_rows": int(eligible_rows),
+        "unique_source_rows": unique_rows,
+        "observed_max_source_row_reuse": observed_max,
+        "maximum_source_row_reuse_by_construction": reuse_cap,
+        "complete_eligible_coverage_required": bool(
+            not data_sharded and complete_cycle_observed
+        ),
+        "contract_satisfied": True,
+    }
+
+
 def _save_optimizer_sidecar(checkpoint_path: str, policy, optimizer, ddp: dict):
     """CAT-128 patch #8 wrapper: persist optimizer (Adam) state as
     ``<checkpoint_path>.optimizer.pt`` via the shared DDP-safe util. The util
@@ -46274,6 +47601,7 @@ def _save_training_progress_sidecar(
     policy_objective_lr_area: float,
     policy_aux_global_draw_offset: int,
     policy_kl_controller_state: dict[str, object] | None = None,
+    checkpoint_frontier_saved: str | Path | None = None,
     ddp: dict,
 ) -> None:
     """Write the checkpoint-set commit marker on rank 0 after optimizer save."""
@@ -46368,6 +47696,7 @@ def _save_training_progress_sidecar(
                 policy_aux_global_draw_offset
             ),
             policy_kl_controller_state=policy_kl_controller_state,
+            checkpoint_frontier_path=checkpoint_frontier_saved,
             ddp=ddp,
         )
     except TrainingProgressError as error:

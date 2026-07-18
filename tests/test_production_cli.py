@@ -326,9 +326,7 @@ def test_status_exposes_v7_parent_and_scratch_as_fail_closed() -> None:
     p10 = train["recipes"]["a1-parent-update-active-p10-35m-b200"]
     assert p10["authorized"] is False
     assert p10["status"] == "blocked"
-    assert p10["reason"] == (
-        "active_policy_parent_treatment_requires_fresh_commissioning"
-    )
+    assert p10["reason"] == "active_policy_p10_rejected_by_matched_control"
     assert len(p10["unresolved_requirements"]) == 1
     assert set(train["recipes"]) == {
         entry["name"] for entry in contracts.production_recipes("train")
@@ -338,6 +336,60 @@ def test_status_exposes_v7_parent_and_scratch_as_fail_closed() -> None:
         for readiness in train["recipes"].values()
     )
     assert status["pipelines"]["ppo"]["authorized"] is False
+
+
+def test_p10_matched_control_rejection_binds_adverse_exact_evidence() -> None:
+    admission = json.loads(
+        (ROOT / "configs/production/training_science_admission.json").read_text(
+            encoding="utf-8"
+        )
+    )["recipes"]["a1-parent-update-active-p10-35m-b200"]
+    assert admission["authorized"] is False
+    assert admission["reason"] == "active_policy_p10_rejected_by_matched_control"
+    assert admission["commissioning_evidence"] == [
+        "docs/evidence/A1_ACTIVE_POLICY_P10_MATCHED_CONTROL_REJECTION_20260718.json"
+    ]
+    evidence = json.loads(
+        (ROOT / admission["commissioning_evidence"][0]).read_text(encoding="utf-8")
+    )
+    assert evidence["recipes"]["control"]["recipe_canonical_sha256"] == (
+        "552e8c9d7a4ccee8715411205d5b86a3811b3ed238e18664945546205779e4fe"
+    )
+    assert evidence["recipes"]["treatment"]["recipe_canonical_sha256"] == (
+        "950b81c30728d6f5b98a1e30426a645937fe0ffea0dca61e22f870141b29d09a"
+    )
+    assert evidence["recipes"]["treatment"][
+        "current_catalog_recipe_canonical_sha256"
+    ] == (
+        admission["recipe_canonical_sha256"]
+    )
+    assert evidence["catalog_identity_migration"] == {
+        "from_typed_config_schema_version": 21,
+        "to_typed_config_schema_version": 22,
+        "science_fields_unchanged": True,
+        "matched_control_conclusion_applies_to_current_catalog_identity": True,
+    }
+    assert evidence["artifacts"]["comparison_sha256"] == (
+        "sha256:7b4198ffb7a50f4635d3ca82cc0bf14de8e3d25ff53469c8416759161ae7d2d7"
+    )
+    isolation = evidence["matched_control_isolation"]
+    assert isolation["step0_model_tensors_equal"] is True
+    assert isolation["base_planned_order_equal"] is True
+    assert isolation["same_lr_dose"] is True
+    delta = evidence["step12_treatment_minus_control"]
+    assert delta["active_policy_teacher_gap_closure"] < 0.0
+    assert delta["loss"] > 0.0
+    assert delta["policy_target_kl"] > 0.0
+    assert delta["sampled_action_top1_accuracy"] < 0.0
+    assert delta["move_robber_kl"] > 0.0
+    decision = evidence["decision"]
+    assert decision == {
+        "authorize_for_retraining": False,
+        "promotion_authority": False,
+        "diagnostic_replay_allowed": True,
+        "replacement_requires_new_recipe_identity": True,
+        "reason": decision["reason"],
+    }
 
 
 def test_training_launcher_resolution_fails_closed_on_unknown_mode(
@@ -939,6 +991,31 @@ def test_doctor_refuses_blocked_training_even_with_exact_runtime(
         in result["errors"]
     )
     assert any("authenticated plan receipt" in error for error in result["errors"])
+
+
+def test_doctor_refuses_rejected_p10_even_with_exact_runtime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    plan = cli.build_plan(
+        _write_job(
+            tmp_path,
+            "train",
+            recipe="a1-parent-update-active-p10-35m-b200",
+        )
+    )
+    _mock_exact_runtime(
+        plan,
+        monkeypatch,
+        device_names=["NVIDIA B200"] * 8,
+    )
+
+    result = cli.doctor(plan)
+
+    assert result["ok"] is False
+    assert (
+        "pipeline is blocked: active_policy_p10_rejected_by_matched_control"
+        in result["errors"]
+    )
 
 
 def test_execute_refuses_before_receipt_or_subprocess(

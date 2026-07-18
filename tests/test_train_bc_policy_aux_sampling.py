@@ -1,3 +1,6 @@
+from collections import Counter
+import json
+
 import numpy as np
 import pytest
 
@@ -162,6 +165,41 @@ def test_resumed_midcycle_slice_uses_slice_relative_reuse_and_coverage_bounds() 
     assert with_full_cycle["contains_complete_cycle"] is True
 
 
+def test_resumed_realized_reuse_contract_does_not_double_count_restored_prefix() -> None:
+    contract = train_bc._policy_aux_cumulative_realized_reuse_contract(  # noqa: SLF001
+        {
+            "draws": 8,
+            "unique_source_rows": 4,
+            "max_source_row_reuse": 2,
+        },
+        eligible_rows=4,
+        data_sharded=False,
+        resumed_invocation_global_draw_start=3,
+    )
+
+    assert contract["scope"] == "cumulative_training_trajectory"
+    assert contract["draws"] == 8
+    assert contract["global_draw_start"] == 0
+    assert contract["global_draw_end"] == 8
+    assert contract["resumed_invocation_global_draw_start"] == 3
+    assert contract["maximum_source_row_reuse_by_construction"] == 2
+    assert contract["complete_eligible_coverage_required"] is True
+
+
+def test_resumed_realized_reuse_requires_completed_cycle_coverage() -> None:
+    with pytest.raises(RuntimeError, match="complete eligible-row coverage"):
+        train_bc._policy_aux_cumulative_realized_reuse_contract(  # noqa: SLF001
+            {
+                "draws": 10,
+                "unique_source_rows": 9,
+                "max_source_row_reuse": 1,
+            },
+            eligible_rows=10,
+            data_sharded=False,
+            resumed_invocation_global_draw_start=9,
+        )
+
+
 def test_zero_weight_rows_are_never_drawn() -> None:
     order = _order([0.0, 5.0, 0.0, 1.0, 0.0], draws=100, seed=5)
 
@@ -187,6 +225,110 @@ def test_cycle_report_binds_coverage_ess_and_reuse_cap() -> None:
     assert report["partial_cycle_draws_at_end"] == 2
     assert report["maximum_source_row_reuse_by_construction"] == 3
     assert report["duplicates_before_cycle_exhaustion"] is False
+
+
+def test_source_reuse_resume_state_exactly_merges_disjoint_segments() -> None:
+    ddp = {"enabled": False, "world_size": 1, "rank": 0}
+    pre_counts = Counter({2: 2, 9: 1})
+    pre_games = {(0, 101), (0, 102)}
+    pre_state = train_bc._policy_aux_source_reuse_resume_state(  # noqa: SLF001
+        pre_counts,
+        game_identities=pre_games,
+        ddp=ddp,
+        data_sharded=False,
+    )
+
+    restored_counts, restored_games = (
+        train_bc._restore_policy_aux_source_reuse_resume_state(  # noqa: SLF001
+            pre_state,
+            ddp=ddp,
+            data_sharded=False,
+            expected_global_draws=3,
+        )
+    )
+    post_counts = Counter({17: 3, 23: 1})
+    post_games = {(1, 201), (1, 202)}
+    restored_counts.update(post_counts)
+    restored_games.update(post_games)
+
+    resumed = train_bc._policy_aux_source_reuse_summary(  # noqa: SLF001
+        restored_counts,
+        game_identities=restored_games,
+        ddp=ddp,
+        data_sharded=False,
+    )
+    uninterrupted_counts = pre_counts + post_counts
+    uninterrupted = train_bc._policy_aux_source_reuse_summary(  # noqa: SLF001
+        uninterrupted_counts,
+        game_identities=pre_games | post_games,
+        ddp=ddp,
+        data_sharded=False,
+    )
+
+    assert resumed == uninterrupted
+    assert resumed["draws"] == 7
+    assert resumed["unique_source_rows"] == 4
+    assert resumed["unique_source_games"] == 4
+    assert resumed["draws_per_unique_row"] == pytest.approx(1.75)
+    assert resumed["max_source_row_reuse"] == 3
+    # The authenticated journal contains one compressed blob per rank, not a
+    # massive JSON object with one key for every sampled source row.
+    assert "row_counts" not in json.dumps(pre_state, sort_keys=True)
+
+
+def test_epoch_cycle_resume_ledger_matches_uninterrupted_chain() -> None:
+    weights = np.asarray([1.0, 4.0, 2.0, 0.5], dtype=np.float64)
+    ddp = {"enabled": False, "world_size": 1, "rank": 0}
+    pre = {
+        "epoch": 1,
+        **train_bc._policy_aux_sampling_cycle_report(  # noqa: SLF001
+            weights,
+            local_draws=3,
+            ddp=ddp,
+            mode=MODE,
+            global_draw_offset=0,
+        ),
+    }
+    post = {
+        "epoch": 2,
+        **train_bc._policy_aux_sampling_cycle_report(  # noqa: SLF001
+            weights,
+            local_draws=5,
+            ddp=ddp,
+            mode=MODE,
+            global_draw_offset=3,
+        ),
+    }
+
+    resumed = train_bc._validate_policy_aux_epoch_cycles(  # noqa: SLF001
+        [pre, post],
+        expected_global_draw_end=8,
+    )
+
+    assert resumed == [pre, post]
+    assert resumed[-1]["complete_cycles_after_slice"] == 2
+    assert resumed[-1]["partial_cycle_draws_at_end"] == 0
+
+
+def test_source_reuse_resume_state_rejects_tampered_compact_payload() -> None:
+    ddp = {"enabled": False, "world_size": 1, "rank": 0}
+    state = train_bc._policy_aux_source_reuse_resume_state(  # noqa: SLF001
+        Counter({3: 2}),
+        game_identities={(0, 44)},
+        ddp=ddp,
+        data_sharded=False,
+    )
+    state["rank_states"][0]["payload"] = (
+        str(state["rank_states"][0]["payload"])[:-1] + "A"
+    )
+
+    with pytest.raises(ValueError, match="cannot be decoded|digest mismatch"):
+        train_bc._restore_policy_aux_source_reuse_resume_state(  # noqa: SLF001
+            state,
+            ddp=ddp,
+            data_sharded=False,
+            expected_global_draws=2,
+        )
 
 
 def test_train_config_binds_policy_aux_sampling_mode() -> None:

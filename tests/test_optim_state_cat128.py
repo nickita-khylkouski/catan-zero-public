@@ -25,6 +25,7 @@ from catan_zero.rl.optim_state import (  # noqa: E402
     TERMINAL_ADMITTED_CHECKPOINT_ROLE,
     TrainingProgressError,
     assert_finite_optimizer_generation,
+    checkpoint_frontier_sidecar_path,
     is_fsdp,
     load_training_progress,
     load_optimizer_state,
@@ -202,6 +203,7 @@ def _committed_progress(
     controller_state=None,
     checkpoint_role="resumable_epoch",
     policy_aux_global_draw_offset=0,
+    with_checkpoint_frontier=False,
 ):
     ckpt = tmp_path / "checkpoint.pt"
     ckpt.write_bytes(b"model-v1")
@@ -214,6 +216,13 @@ def _committed_progress(
         "lr": 3e-5,
         "world_size": 1,
     }
+    checkpoint_frontier = None
+    if with_checkpoint_frontier:
+        checkpoint_frontier = checkpoint_frontier_sidecar_path(ckpt)
+        checkpoint_frontier.write_text(
+            json.dumps({"schema_version": "test-frontier-v1"}),
+            encoding="utf-8",
+        )
     save_training_progress(
         ckpt,
         optimizer_step=713,
@@ -230,6 +239,7 @@ def _committed_progress(
         checkpoint_role=checkpoint_role,
         policy_aux_global_draw_offset=policy_aux_global_draw_offset,
         policy_kl_controller_state=controller_state,
+        checkpoint_frontier_path=checkpoint_frontier,
         ddp=_DDP_SINGLE,
     )
     return ckpt, identity, rng.bit_generator.state
@@ -248,6 +258,30 @@ def test_progress_commit_binds_model_optimizer_recipe_and_exact_step(tmp_path):
     assert training_progress_sidecar_path(ckpt).name.endswith(
         ".training-progress.json"
     )
+
+
+def test_progress_commit_binds_checkpoint_frontier_journal(tmp_path):
+    checkpoint, identity, _ = _committed_progress(
+        tmp_path,
+        with_checkpoint_frontier=True,
+    )
+
+    loaded = load_training_progress(
+        checkpoint,
+        expected_recipe_identity=identity,
+    )
+    frontier = checkpoint_frontier_sidecar_path(checkpoint)
+    assert loaded["checkpoint_frontier"]["path"] == frontier.name
+
+    frontier.write_text("{}", encoding="utf-8")
+    with pytest.raises(
+        TrainingProgressError,
+        match="checkpoint frontier journal binding mismatch",
+    ):
+        load_training_progress(
+            checkpoint,
+            expected_recipe_identity=identity,
+        )
 
 
 def test_progress_role_separates_resume_from_terminal_admission(tmp_path):

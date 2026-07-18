@@ -51,6 +51,7 @@ from typing import Any
 
 _OPTIM_SIDECAR_SUFFIX = ".optimizer.pt"
 _PROGRESS_SIDECAR_SUFFIX = ".training-progress.json"
+_CHECKPOINT_FRONTIER_SIDECAR_SUFFIX = ".checkpoint-frontier.json"
 LEGACY_TRAINING_PROGRESS_SCHEMA = "train-bc-progress-v1"
 TRAINING_PROGRESS_SCHEMA = "train-bc-progress-v2"
 RESUMABLE_EPOCH_CHECKPOINT_ROLE = "resumable_epoch"
@@ -208,6 +209,15 @@ def training_progress_sidecar_path(checkpoint_path: str | os.PathLike) -> Path:
     return p.with_name(p.name + _PROGRESS_SIDECAR_SUFFIX)
 
 
+def checkpoint_frontier_sidecar_path(
+    checkpoint_path: str | os.PathLike,
+) -> Path:
+    """Authenticated intermediate-checkpoint evidence for one resumable model."""
+
+    p = Path(checkpoint_path)
+    return p.with_name(p.name + _CHECKPOINT_FRONTIER_SIDECAR_SUFFIX)
+
+
 def _file_sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -252,6 +262,7 @@ def save_training_progress(
     policy_objective_lr_area: float = 0.0,
     policy_aux_global_draw_offset: int = 0,
     policy_kl_controller_state: dict[str, Any] | None = None,
+    checkpoint_frontier_path: str | os.PathLike | None = None,
     ddp: dict | None,
 ) -> Path | None:
     """Atomically commit progress after model and optimizer sidecars are durable.
@@ -299,6 +310,21 @@ def save_training_progress(
         "policy_objective_lr_area": float(policy_objective_lr_area),
         "policy_aux_global_draw_offset": int(policy_aux_global_draw_offset),
     }
+    if checkpoint_frontier_path is not None:
+        frontier_path = Path(checkpoint_frontier_path)
+        expected_frontier_path = checkpoint_frontier_sidecar_path(checkpoint)
+        if (
+            frontier_path != expected_frontier_path
+            or not frontier_path.is_file()
+            or frontier_path.is_symlink()
+        ):
+            raise TrainingProgressError(
+                "checkpoint frontier journal is missing or not checkpoint-local"
+            )
+        payload["checkpoint_frontier"] = {
+            "path": frontier_path.name,
+            "sha256": _file_sha256(frontier_path),
+        }
     if policy_kl_controller_state is not None:
         if not isinstance(policy_kl_controller_state, dict):
             raise TrainingProgressError(
@@ -376,6 +402,20 @@ def load_training_progress(
         or optimizer_record.get("sha256") != _file_sha256(optimizer_path)
     ):
         raise TrainingProgressError("model/optimizer checkpoint binding mismatch")
+    frontier_record = payload.get("checkpoint_frontier")
+    if frontier_record is not None:
+        frontier_path = checkpoint_frontier_sidecar_path(checkpoint)
+        if (
+            not isinstance(frontier_record, dict)
+            or set(frontier_record) != {"path", "sha256"}
+            or frontier_record.get("path") != frontier_path.name
+            or not frontier_path.is_file()
+            or frontier_path.is_symlink()
+            or frontier_record.get("sha256") != _file_sha256(frontier_path)
+        ):
+            raise TrainingProgressError(
+                "checkpoint frontier journal binding mismatch"
+            )
     for field in ("optimizer_step", "completed_epochs"):
         value = payload.get(field)
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
