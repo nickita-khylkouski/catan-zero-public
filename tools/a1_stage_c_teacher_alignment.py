@@ -109,6 +109,7 @@ RELIABILITY_CLASS = {
     "duplicate_search_audited": 2,
 }
 ROOT_BREADTH_SCHEMA = "a1-stage-c-policy-root-breadth-v1"
+GAME_TRACE_QUALIFICATION_SCHEMA = "a1-stage-c-game-trace-qualification-v1"
 PRODUCTION_ROOT_COUNT = 65_536
 LEGACY_CORPUS_ADMISSION_SCHEMA = "a1-coherent-n128-corpus-admission-v1"
 POST_WAVE_CORPUS_ADMISSION_SCHEMA = "a1-post-wave-stage-c-corpus-admission-v1"
@@ -209,6 +210,91 @@ def _resolve_stage_c_root_budget(
             f"breadth: requested={resolved:,} required_at_least={minimum:,}"
         )
     return resolved
+
+
+def _qualify_stage_c_game_traces(
+    *,
+    game_seeds: np.ndarray,
+    decision_indices: np.ndarray,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Classify traces that can replay from the canonical seeded initial state."""
+
+    games = np.asarray(game_seeds, dtype=np.int64)
+    decisions = np.asarray(decision_indices, dtype=np.int64)
+    if games.ndim != 1 or decisions.shape != games.shape or not len(games):
+        raise AlignmentError("Stage-C game-trace qualification inputs are malformed")
+    if np.any(games[1:] < games[:-1]):
+        raise AlignmentError("Stage-C corpus game_seed rows are not monotonically grouped")
+
+    starts = np.concatenate(
+        (
+            np.asarray([0], dtype=np.int64),
+            np.flatnonzero(games[1:] != games[:-1]).astype(np.int64) + 1,
+        )
+    )
+    stops = np.concatenate((starts[1:], np.asarray([len(games)], dtype=np.int64)))
+    qualified: list[int] = []
+    excluded: list[int] = []
+    reason_counts = {
+        "missing_initial_decision_prefix": 0,
+        "negative_decision_index": 0,
+        "non_increasing_decision_index": 0,
+    }
+    examples: list[dict[str, Any]] = []
+    for start, stop in zip(starts.tolist(), stops.tolist(), strict=True):
+        seed = int(games[start])
+        game_decisions = decisions[start:stop]
+        if np.any(game_decisions < 0):
+            reason = "negative_decision_index"
+        elif int(game_decisions[0]) != 0:
+            reason = "missing_initial_decision_prefix"
+        elif np.any(game_decisions[1:] <= game_decisions[:-1]):
+            reason = "non_increasing_decision_index"
+        else:
+            qualified.append(seed)
+            continue
+        excluded.append(seed)
+        reason_counts[reason] += 1
+        if len(examples) < 100:
+            examples.append(
+                {
+                    "game_seed": seed,
+                    "reason": reason,
+                    "first_decision_index": int(game_decisions[0]),
+                    "recorded_row_count": int(stop - start),
+                }
+            )
+
+    qualified_array = np.asarray(qualified, dtype=np.int64)
+    excluded_array = np.asarray(excluded, dtype=np.int64)
+    receipt: dict[str, Any] = {
+        "schema_version": GAME_TRACE_QUALIFICATION_SCHEMA,
+        "contract": {
+            "canonical_replay_start": "seeded_initial_state_at_decision_0",
+            "decision_indices": "unique_nonnegative_strictly_increasing",
+            "missing_initial_prefix_semantics": (
+                "unreconstructable: 2p-no-trade decision 0 is multi-action "
+                "BUILD_INITIAL_SETTLEMENT, never an automatic transition"
+            ),
+            "later_sparse_gaps": (
+                "retained; executor must prove each omitted transition has exactly "
+                "one legal action"
+            ),
+        },
+        "total_games": int(len(starts)),
+        "qualified_games": int(len(qualified_array)),
+        "excluded_games": int(len(excluded_array)),
+        "exclusion_counts": reason_counts,
+        "qualified_game_seed_set_sha256": _value_sha256(
+            qualified_array.astype(int).tolist()
+        ),
+        "excluded_game_seed_set_sha256": _value_sha256(
+            excluded_array.astype(int).tolist()
+        ),
+        "exclusion_examples": examples,
+    }
+    receipt["qualification_sha256"] = _value_sha256(receipt)
+    return qualified_array, receipt
 SEARCH_FIELDS = (
     "n_full",
     "n_fast",
@@ -1692,6 +1778,23 @@ def _build_plan(args: argparse.Namespace) -> dict[str, Any]:
     data = train_bc.MemmapCorpus(corpus_root)
     rows = len(data)
     population_game_seeds = np.asarray(data["game_seed"], dtype=np.int64)
+    population_decision_indices = np.asarray(data["decision_index"], dtype=np.int64)
+    game_trace_qualification: dict[str, Any] | None = None
+    if admission_schema == POST_WAVE_CORPUS_ADMISSION_SCHEMA:
+        (
+            reconstructable_game_seeds,
+            game_trace_qualification,
+        ) = _qualify_stage_c_game_traces(
+            game_seeds=population_game_seeds,
+            decision_indices=population_decision_indices,
+        )
+    else:
+        reconstructable_game_seeds = np.unique(population_game_seeds)
+    reconstructable_validation_game_seeds = np.intersect1d(
+        validation_game_seeds,
+        reconstructable_game_seeds,
+        assume_unique=True,
+    )
     requested_root_count = _resolve_stage_c_root_budget(
         requested_rows=args.subset_rows,
         admission_schema=admission_schema,
@@ -1717,7 +1820,10 @@ def _build_plan(args: argparse.Namespace) -> dict[str, Any]:
     # for stale active rows *and* for multi-action roots whose original fast
     # search did not store policy supervision.  Policy inactivity must not be
     # confused with state ineligibility.
-    reanalysis_candidate = legal_widths_all > 1
+    reconstructable_game_rows = np.isin(
+        population_game_seeds, reconstructable_game_seeds
+    )
+    reanalysis_candidate = (legal_widths_all > 1) & reconstructable_game_rows
     reliability_classes, reliability = _reliability_inventory(data, row_count=rows)
 
     candidate_rows = np.flatnonzero(reanalysis_candidate).astype(np.int64)
@@ -1744,8 +1850,8 @@ def _build_plan(args: argparse.Namespace) -> dict[str, Any]:
         surprise=surprise,
         reliability_class=candidate_reliability,
         policy_status=candidate_status,
-        population_game_seeds=population_game_seeds,
-        validation_game_seeds=validation_game_seeds,
+        population_game_seeds=reconstructable_game_seeds,
+        validation_game_seeds=reconstructable_validation_game_seeds,
         limit=requested_root_count,
         selection_seed=int(args.selection_seed),
         max_rows_per_game=int(args.max_rows_per_game),
@@ -1839,6 +1945,15 @@ def _build_plan(args: argparse.Namespace) -> dict[str, Any]:
         "policy_quarantine_changes_value_eligibility": False,
         "policy_quarantine_changes_state_reanalysis_eligibility": False,
     }
+    if game_trace_qualification is not None:
+        overlay["counts"].update(
+            {
+                "trace_qualified_games": int(len(reconstructable_game_seeds)),
+                "trace_excluded_games": int(
+                    game_trace_qualification["excluded_games"]
+                ),
+            }
+        )
     overlay["overlay_sha256"] = _value_sha256(overlay)
     overlay_path = output_root / "target_eligibility.overlay.json"
     _write_json_immutable(overlay_path, overlay)
@@ -1970,6 +2085,8 @@ def _build_plan(args: argparse.Namespace) -> dict[str, Any]:
             "blockers": blockers,
         },
     }
+    if game_trace_qualification is not None:
+        plan["source_game_trace_qualification"] = game_trace_qualification
     plan["plan_sha256"] = _value_sha256(plan)
     return plan
 
@@ -2166,19 +2283,51 @@ def _verify_plan(path: Path) -> dict[str, Any]:
         population_game_seeds = np.asarray(
             source_data["game_seed"], dtype=np.int64
         )
+        population_decision_indices = np.asarray(
+            source_data["decision_index"], dtype=np.int64
+        )
+        if admission_schema == POST_WAVE_CORPUS_ADMISSION_SCHEMA:
+            (
+                reconstructable_game_seeds,
+                replayed_trace_qualification,
+            ) = _qualify_stage_c_game_traces(
+                game_seeds=population_game_seeds,
+                decision_indices=population_decision_indices,
+            )
+            if plan.get("source_game_trace_qualification") != (
+                replayed_trace_qualification
+            ):
+                raise AlignmentError(
+                    "Stage-C source game-trace qualification drifted"
+                )
+        else:
+            reconstructable_game_seeds = np.unique(population_game_seeds)
+            if "source_game_trace_qualification" in plan:
+                raise AlignmentError(
+                    "legacy Stage-C plan unexpectedly changed its trace receipt"
+                )
+        selected_game_seeds = np.asarray(arrays["game_seed"], dtype=np.int64)
+        if np.setdiff1d(selected_game_seeds, reconstructable_game_seeds).size:
+            raise AlignmentError(
+                "Stage-C selected subset contains an unreconstructable game trace"
+            )
+        validation_game_seeds = np.asarray(
+            validation["game_seeds"], dtype=np.int64
+        )
+        reconstructable_validation_game_seeds = np.intersect1d(
+            validation_game_seeds,
+            reconstructable_game_seeds,
+            assume_unique=True,
+        )
         resolved_root_count = _resolve_stage_c_root_budget(
             requested_rows=requested_rows,
             admission_schema=admission_schema,
             population_game_seeds=population_game_seeds,
-            validation_game_seeds=np.asarray(
-                validation["game_seeds"], dtype=np.int64
-            ),
+            validation_game_seeds=validation_game_seeds,
         )
         minimum_root_count = _minimum_stage_c_root_budget(
-            population_game_seeds=population_game_seeds,
-            validation_game_seeds=np.asarray(
-                validation["game_seeds"], dtype=np.int64
-            ),
+            population_game_seeds=reconstructable_game_seeds,
+            validation_game_seeds=reconstructable_validation_game_seeds,
         )
         if (
             resolved_root_count != count
@@ -2187,9 +2336,9 @@ def _verify_plan(path: Path) -> dict[str, Any]:
         ):
             raise AlignmentError("Stage-C selected subset root budget drifted")
         replayed_breadth = _stage_c_root_breadth_inventory(
-            corpus_game_seeds=population_game_seeds,
-            validation_game_seeds=np.asarray(validation["game_seeds"], dtype=np.int64),
-            selected_game_seeds=np.asarray(arrays["game_seed"], dtype=np.int64),
+            corpus_game_seeds=reconstructable_game_seeds,
+            validation_game_seeds=reconstructable_validation_game_seeds,
+            selected_game_seeds=selected_game_seeds,
             selected_decision_indices=np.asarray(
                 arrays["decision_index"], dtype=np.int64
             ),

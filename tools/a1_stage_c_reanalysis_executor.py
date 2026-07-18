@@ -705,6 +705,10 @@ def _write_qualification_artifacts(
     }
     if partition_receipts:
         receipt["qualification_partitions"] = list(partition_receipts)
+    if "source_game_trace_qualification" in plan:
+        receipt["source_game_trace_qualification"] = plan[
+            "source_game_trace_qualification"
+        ]
     receipt["receipt_sha256"] = _value_sha256(receipt)
     return receipt
 
@@ -1046,6 +1050,8 @@ def _verify_receipt(
         plan_ref.get("file_sha256")
         != alignment._file_sha256(Path(str(plan_ref["path"])))  # noqa: SLF001
         or plan_ref.get("plan_sha256") != plan["plan_sha256"]
+        or receipt.get("source_game_trace_qualification")
+        != plan.get("source_game_trace_qualification")
     ):
         raise ExecutorError("Stage-C reconstruction plan bytes drifted")
     runtime = receipt.get("runtime")

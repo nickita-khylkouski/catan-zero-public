@@ -389,3 +389,64 @@ def test_post_wave_stage_c_root_budget_tracks_admitted_breadth() -> None:
             population_game_seeds=population,
             validation_game_seeds=validation,
         )
+
+
+def test_game_trace_qualification_excludes_only_proven_malformed_games() -> None:
+    game_seeds = np.asarray([10, 10, 11, 11, 12, 12, 13, 13], dtype=np.int64)
+    decision_indices = np.asarray([0, 2, 2, 3, 0, 0, -1, 0], dtype=np.int64)
+
+    qualified, receipt = alignment._qualify_stage_c_game_traces(  # noqa: SLF001
+        game_seeds=game_seeds,
+        decision_indices=decision_indices,
+    )
+
+    assert qualified.tolist() == [10]
+    assert receipt["total_games"] == 4
+    assert receipt["qualified_games"] == 1
+    assert receipt["excluded_games"] == 3
+    assert receipt["exclusion_counts"] == {
+        "missing_initial_decision_prefix": 1,
+        "negative_decision_index": 1,
+        "non_increasing_decision_index": 1,
+    }
+    assert [item["game_seed"] for item in receipt["exclusion_examples"]] == [
+        11,
+        12,
+        13,
+    ]
+
+
+def test_game_trace_quarantine_refills_the_exact_root_budget() -> None:
+    kwargs = _game_first_inputs()
+    population = np.unique(kwargs["population_game_seeds"])
+    trace_games = np.repeat(population, 2)
+    trace_decisions = np.tile(np.asarray([0, 1], dtype=np.int64), len(population))
+    trace_decisions[trace_games == 100] += 2
+    qualified, receipt = alignment._qualify_stage_c_game_traces(  # noqa: SLF001
+        game_seeds=trace_games,
+        decision_indices=trace_decisions,
+    )
+    keep = np.isin(kwargs["game_seeds"], qualified)
+    selected = alignment._select_game_first(  # noqa: SLF001
+        rows=kwargs["rows"][keep],
+        game_seeds=kwargs["game_seeds"][keep],
+        decision_indices=kwargs["decision_indices"][keep],
+        phases=kwargs["phases"][keep],
+        legal_widths=kwargs["legal_widths"][keep],
+        surprise=kwargs["surprise"][keep],
+        reliability_class=kwargs["reliability_class"][keep],
+        policy_status=kwargs["policy_status"][keep],
+        population_game_seeds=qualified,
+        validation_game_seeds=np.intersect1d(
+            kwargs["validation_game_seeds"], qualified
+        ),
+        limit=200,
+        selection_seed=kwargs["selection_seed"],
+        max_rows_per_game=kwargs["max_rows_per_game"],
+    )
+
+    selected_games = kwargs["game_seeds"][keep][selected[0]]
+    assert receipt["excluded_games"] == 1
+    assert len(selected[0]) == 200
+    assert 100 not in selected_games
+    assert selected[3]["requested_root_budget"] == 200
