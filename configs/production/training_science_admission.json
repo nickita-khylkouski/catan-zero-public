@@ -297,6 +297,25 @@
       },
       "commissioning_evidence": []
     },
+    "a1-parent-update-active-p10-warmup0-opening-value25-step16-35m-b200": {
+      "recipe_canonical_sha256": "20bae89580bfd57caf68977c4953b77a2c8b65ccaa0df1dac20b0dd6eb5843ee",
+      "authorized": false,
+      "reason": "diagnostic_short_dose_frontier_extension_requires_commissioning",
+      "unresolved_requirements": [
+        "compare the 16-step frontier against the independently initialized 12-step opening-value arm and V15"
+      ],
+      "observations": {
+        "active_policy_treatment": "policy_aux_active_batch_size_64_policy_aux_loss_weight_0.10",
+        "lr_warmup_steps": 0,
+        "opening_value_mix_fraction": 0.25,
+        "opening_value_phases": [
+          "BUILD_INITIAL_SETTLEMENT",
+          "BUILD_INITIAL_ROAD"
+        ],
+        "short_dose_steps": 16
+      },
+      "commissioning_evidence": []
+    },
     "a1-parent-update-active-p25-35m-b200": {
       "recipe_canonical_sha256": "940e70128bafeb6b35a8e267058e7551affc73922282bef19ada83042cab3b50",
       "authorized": false,

@@ -1,0 +1,76 @@
+{
+  "schema_version": "a1-opening-value-routing-evidence-v1",
+  "date": "2026-07-18",
+  "status": "commissioned_strength_neutral",
+  "code_commit": "d8549a132bd482537868ea06b899936b173cabb4",
+  "parent": {
+    "name": "warmup0",
+    "checkpoint_sha256": "sha256:2fcec9268810879ff152f1b65be54b603a0934a5f9fee0198ff85ad96d410c44"
+  },
+  "treatment": {
+    "name": "warmup0-openingvalue25",
+    "checkpoint_sha256": "sha256:40ca61b64a1b30681feb4ac677c77dba34357859bcf4bb2e217ea1b27a64b168",
+    "policy_aux_opening_value_mix_fraction": 0.25,
+    "phases": [
+      "BUILD_INITIAL_SETTLEMENT",
+      "BUILD_INITIAL_ROAD"
+    ],
+    "optimizer_steps": 12,
+    "policy_aux_opening_rows": 1510
+  },
+  "heldout_terminal_value": {
+    "warmup0": {
+      "BUILD_INITIAL_SETTLEMENT": {
+        "mse": 1.0294722,
+        "pearson": 0.0923727
+      },
+      "BUILD_INITIAL_ROAD": {
+        "mse": 1.0153889,
+        "pearson": 0.1198004
+      },
+      "PLAY_TURN": {
+        "mse": 0.5940986,
+        "pearson": 0.6348186
+      },
+      "overall_mse": 0.6069902,
+      "overall_pearson": 0.6239692
+    },
+    "openingvalue25": {
+      "BUILD_INITIAL_SETTLEMENT": {
+        "mse": 0.984670017329092,
+        "pearson": 0.12009161316880726
+      },
+      "BUILD_INITIAL_ROAD": {
+        "mse": 0.9710857153125013,
+        "pearson": 0.17312962212415423
+      },
+      "PLAY_TURN": {
+        "mse": 0.5949488329849257,
+        "pearson": 0.6340249538731599
+      },
+      "overall_mse": 0.6062767083,
+      "overall_pearson": 0.6246745784
+    }
+  },
+  "paired_h2h": {
+    "operator": "coherent_public_n128.schema22",
+    "base_seed": 202607183400,
+    "pairs": 50,
+    "games": 100,
+    "candidate_wins": 50,
+    "baseline_wins": 50,
+    "ww_pairs": 11,
+    "ll_pairs": 11,
+    "split_pairs": 28,
+    "truncations": 0,
+    "errors": [],
+    "elapsed_sec": 984.5759900679695,
+    "verdict": "strength_neutral_at_12_steps"
+  },
+  "conclusion": {
+    "retain_opening_value_routing": true,
+    "promotion_claim": false,
+    "reason": "The treatment materially improved opening value calibration, left PLAY_TURN calibration unchanged, and tied its exact parent in paired play.",
+    "next_experiment": "Extend the same independently initialized recipe to 16 optimizer steps because policy teacher-gap closure was still improving at step 12."
+  }
+}
