@@ -1961,26 +1961,40 @@ def _rare_action_balance_weights(
     labels: np.ndarray,
     *,
     selected: np.ndarray,
+    base_weights: np.ndarray,
     cap: float,
 ) -> tuple[np.ndarray, dict[str, Any]]:
-    """Give each observed rare teacher action a bounded objective-mass floor."""
+    """Add a bounded rare-action mass floor to an existing sampling measure."""
 
     action_types = np.asarray(labels).astype(str, copy=False)
     scope = np.asarray(selected, dtype=np.bool_)
-    if action_types.ndim != 1 or scope.shape != action_types.shape or not np.any(scope):
+    base = np.asarray(base_weights, dtype=np.float64)
+    if (
+        action_types.ndim != 1
+        or scope.shape != action_types.shape
+        or base.shape != action_types.shape
+        or not np.any(scope)
+        or not np.isfinite(base).all()
+        or np.any(base <= 0.0)
+    ):
         raise OverlayError("rare-action balancing scope is empty or malformed")
-    raw = np.ones(action_types.size, dtype=np.float64)
-    target_mass = float(RARE_ACTION_TARGET_MASS_FRACTION * np.count_nonzero(scope))
+    raw = base.copy()
+    target_mass = float(RARE_ACTION_TARGET_MASS_FRACTION * base[scope].sum())
     counts: dict[str, int] = {}
+    base_mass: dict[str, float] = {}
     requested_multipliers: dict[str, float] = {}
     for action_type in RARE_STRATEGIC_ACTION_TYPES:
         mask = scope & (action_types == action_type)
         count = int(np.count_nonzero(mask))
+        observed_mass = float(base[mask].sum())
         counts[action_type] = count
-        multiplier = max(1.0, target_mass / count) if count else 1.0
+        base_mass[action_type] = observed_mass
+        multiplier = (
+            max(1.0, target_mass / observed_mass) if observed_mass > 0.0 else 1.0
+        )
         requested_multipliers[action_type] = float(multiplier)
-        raw[mask] = multiplier
-    result = np.ones(action_types.size, dtype=np.float64)
+        raw[mask] *= multiplier
+    result = base.copy()
     result[scope] = _unit_mean_capped_weights(raw[scope], cap=cap)
     realized_mass = {
         action_type: float(result[scope & (action_types == action_type)].sum())
@@ -1993,8 +2007,12 @@ def _rare_action_balance_weights(
         ),
         "target_mass_per_type": target_mass,
         "row_counts": counts,
+        "base_weight_mass": base_mass,
         "requested_multipliers": requested_multipliers,
         "realized_weight_mass": realized_mass,
+        "composition": (
+            "production_inverse_inclusion_weight_times_rare_action_multiplier"
+        ),
         "cap": float(cap),
         "missing_types_are_not_synthesized": True,
     }
@@ -2062,8 +2080,9 @@ def _selected_sampling_weights(
         )
         if teacher_action_types.shape != raw.shape:
             raise OverlayError("Stage-C teacher action types are row-misaligned")
-    if arm == "PRODUCTION_WEIGHTED":
-        weights[train] = _unit_mean_capped_weights(
+    if arm in {"PRODUCTION_WEIGHTED", "RARE_ACTION_BALANCED"}:
+        production_weights = np.ones(raw.size, dtype=np.float64)
+        production_weights[train] = _unit_mean_capped_weights(
             raw[train], cap=float(production_weight_cap)
         )
         # Normalize held-out roots independently. Reusing the training scale or
@@ -2071,10 +2090,11 @@ def _selected_sampling_weights(
         # validated and made the production-weighted learner look as though it
         # trained on the strategic-balanced objective.
         if np.any(validation):
-            weights[validation] = _unit_mean_capped_weights(
+            production_weights[validation] = _unit_mean_capped_weights(
                 raw[validation], cap=float(production_weight_cap)
             )
-    elif arm == "RARE_ACTION_BALANCED":
+        weights = production_weights
+    if arm == "RARE_ACTION_BALANCED":
         if teacher_action_types is None:
             raise OverlayError(
                 "rare-action-balanced Stage-C sampling requires ActionCatalog types"
@@ -2082,6 +2102,7 @@ def _selected_sampling_weights(
         train_weights, training_balance = _rare_action_balance_weights(
             teacher_action_types,
             selected=train,
+            base_weights=production_weights,
             cap=float(production_weight_cap),
         )
         weights[train] = train_weights[train]
@@ -2090,6 +2111,7 @@ def _selected_sampling_weights(
             validation_weights, validation_balance = _rare_action_balance_weights(
                 teacher_action_types,
                 selected=validation,
+                base_weights=production_weights,
                 cap=float(production_weight_cap),
             )
             weights[validation] = validation_weights[validation]

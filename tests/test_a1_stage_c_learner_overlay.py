@@ -740,7 +740,7 @@ def test_rare_action_balanced_sampling_raises_observed_teacher_mass() -> None:
     rows = 100
     subset = {
         "row_index": np.arange(rows, dtype=np.int64),
-        "stratum": np.asarray(["common"] * rows),
+        "stratum": np.asarray(["low_inclusion"] * 50 + ["high_inclusion"] * 50),
         "phase": np.asarray(["PLAY_TURN"] * rows),
         "legal_width": np.full(rows, 2, dtype=np.int64),
     }
@@ -768,8 +768,14 @@ def test_rare_action_balanced_sampling_raises_observed_teacher_mass() -> None:
     }
     export = {
         "sampling_population": {
-            "candidate_counts_by_stratum": {"common": rows},
-            "selected_counts_by_stratum": {"common": rows},
+            "candidate_counts_by_stratum": {
+                "low_inclusion": 100,
+                "high_inclusion": 500,
+            },
+            "selected_counts_by_stratum": {
+                "low_inclusion": 50,
+                "high_inclusion": 50,
+            },
         }
     }
     validation = np.zeros(rows, dtype=np.bool_)
@@ -787,16 +793,22 @@ def test_rare_action_balanced_sampling_raises_observed_teacher_mass() -> None:
 
     assert np.mean(weights[~validation]) == pytest.approx(1.0)
     assert np.max(weights[~validation]) <= 4.0
+    # Rare emphasis composes on the production inverse-inclusion measure; it
+    # must not silently turn the rest of the arm into uniform strategic mass.
+    assert weights[60] > weights[10]
     for row, action_type in enumerate(overlay.RARE_STRATEGIC_ACTION_TYPES):
         assert weights[row] > weights[10]
+        balance = report["rare_action_balance"]["training"]
         assert (
-            report["rare_action_balance"]["training"]["row_counts"][action_type]
-            == 1
+            balance["row_counts"][action_type] == 1
         )
         assert (
             report["training_mass_by_teacher_argmax_action_type"][action_type]
-            > 1.0
+            > balance["base_weight_mass"][action_type]
         )
+    assert report["rare_action_balance"]["training"]["composition"] == (
+        "production_inverse_inclusion_weight_times_rare_action_multiplier"
+    )
     assert report["rare_action_balance"]["training"][
         "missing_types_are_not_synthesized"
     ]
