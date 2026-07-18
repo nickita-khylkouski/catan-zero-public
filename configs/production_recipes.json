@@ -61,6 +61,11 @@
         "path": "configs/training/a1_parent_update_active_p10_clip5_35m_b200.schema1.json"
       },
       {
+        "canonical_sha256": "070b65d3e35af26176fea79c682b4d142a1abd7b9accc681b4baaf20ff7625b2",
+        "name": "a1-parent-update-active-p10-warmup0-35m-b200",
+        "path": "configs/training/a1_parent_update_active_p10_warmup0_35m_b200.schema1.json"
+      },
+      {
         "canonical_sha256": "940e70128bafeb6b35a8e267058e7551affc73922282bef19ada83042cab3b50",
         "name": "a1-parent-update-active-p25-35m-b200",
         "path": "configs/training/a1_parent_update_active_p25_35m_b200.schema1.json"
