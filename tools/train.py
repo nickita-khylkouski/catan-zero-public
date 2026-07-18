@@ -41,14 +41,9 @@ from catan_zero.rl.production_recipe_catalog import (  # noqa: E402
 
 CANONICAL_TRAIN_LAUNCH_SCHEMA = 1
 REQUIRED_NOFILE_SOFT = 65_536
-CANONICAL_CONFIG_ROLES_BY_CATALOG_NAME = {
-    "a1-current-35m-b200": "scratch_fresh_optimizer",
-    "a1-parent-update-35m-b200": "parent_fresh_optimizer",
-    "a1-parent-update-shared-action25-35m-b200": "parent_fresh_optimizer",
-    "a1-parent-update-value25-35m-b200": "parent_fresh_optimizer",
-    "a1-parent-update-active-p10-35m-b200": "parent_fresh_optimizer",
-    "a1-parent-update-active-p25-35m-b200": "parent_fresh_optimizer",
-}
+CANONICAL_CONFIG_ROLES = frozenset(
+    {"scratch_fresh_optimizer", "parent_fresh_optimizer"}
+)
 _ENGINE_SETTING_KEYS = frozenset(
     {
         "base_sampler",
@@ -297,17 +292,11 @@ def _load_recipe(path: str | Path) -> tuple[TrainConfig, dict[str, Any]]:
     engine = payload.get("engine_settings")
     if not isinstance(engine, dict):
         raise SystemExit("canonical train config engine_settings must be an object")
-    expected_role = CANONICAL_CONFIG_ROLES_BY_CATALOG_NAME.get(recipe_name)
-    if expected_role is None:
-        raise SystemExit(
-            "production train recipe lacks an initialization-role binding: "
-            f"catalog_name={recipe_name!r}"
-        )
     recipe_role = str(engine.get("initialization_mode", "") or "")
-    if recipe_role != expected_role:
+    if recipe_role not in CANONICAL_CONFIG_ROLES:
         raise SystemExit(
-            "canonical train config role does not match its commissioned payload: "
-            f"expected_role={expected_role!r} actual_role={recipe_role!r}"
+            "production train recipe has an unsupported initialization role: "
+            f"catalog_name={recipe_name!r} role={recipe_role!r}"
         )
     if payload.get("launcher_schema") != CANONICAL_TRAIN_LAUNCH_SCHEMA:
         raise SystemExit(

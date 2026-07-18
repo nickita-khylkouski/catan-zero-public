@@ -9,6 +9,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from catan_zero.rl.production_recipe_catalog import production_recipes
 from tools import train, train_bc
 
 
@@ -458,8 +459,20 @@ def test_canonical_recipe_catalog_is_bound_to_role(
     catalog_name = train.require_production_recipe(
         entrypoint="train", path=recipe, payload=payload
     )
-    assert train.CANONICAL_CONFIG_ROLES_BY_CATALOG_NAME[catalog_name] == role
+    assert catalog_name
+    assert role in train.CANONICAL_CONFIG_ROLES
     train._load_recipe(recipe)
+
+
+def test_every_cataloged_training_recipe_resolves_without_name_registry() -> None:
+    for entry in production_recipes("train"):
+        path = Path(entry["path"])
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        role = payload["engine_settings"]["initialization_mode"]
+
+        assert role in train.CANONICAL_CONFIG_ROLES
+        _config, engine = train._load_recipe(path)
+        assert engine["initialization_mode"] == role
 
 
 @pytest.mark.parametrize("recipe", (RECIPE, PARENT_RECIPE))
