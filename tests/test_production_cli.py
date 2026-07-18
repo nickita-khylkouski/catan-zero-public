@@ -297,6 +297,24 @@ def test_status_exposes_v7_parent_and_scratch_as_fail_closed() -> None:
         "shared_action_trust_region_requires_fresh_commissioning"
     )
     assert len(shared_action["unresolved_requirements"]) == 1
+    action_local = train["recipes"][
+        "a1-parent-update-action25-shared-action25-35m-b200"
+    ]
+    assert action_local["authorized"] is False
+    assert action_local["status"] == "blocked"
+    assert action_local["reason"] == (
+        "action_local_trust_region_requires_fresh_commissioning"
+    )
+    assert len(action_local["unresolved_requirements"]) == 1
+    combined = train["recipes"][
+        "a1-parent-update-shared-action25-value25-35m-b200"
+    ]
+    assert combined["authorized"] is False
+    assert combined["status"] == "blocked"
+    assert combined["reason"] == (
+        "combined_trust_region_requires_fresh_commissioning"
+    )
+    assert len(combined["unresolved_requirements"]) == 1
     value_head = train["recipes"]["a1-parent-update-value25-35m-b200"]
     assert value_head["authorized"] is False
     assert value_head["status"] == "blocked"
