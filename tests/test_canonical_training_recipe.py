@@ -17,12 +17,10 @@ REPO = Path(__file__).resolve().parents[1]
 RECIPE = REPO / "configs/training/a1_current_35m_b200.schema1.json"
 PARENT_RECIPE = REPO / "configs/training/a1_parent_update_35m_b200.schema1.json"
 HARD_DECISION_EVIDENCE = (
-    REPO
-    / "docs/evidence/A1_V7_HARD_DECISION_POLICY_MASS_CORRECTION_20260717.json"
+    REPO / "docs/evidence/A1_V7_HARD_DECISION_POLICY_MASS_CORRECTION_20260717.json"
 )
 HARD_DECISION_POLICY_PHASE_WEIGHTS = (
-    "PLAY_TURN=4.0,MOVE_ROBBER=3.0,"
-    "BUILD_INITIAL_ROAD=2.0,DISCARD=1.5"
+    "PLAY_TURN=4.0,MOVE_ROBBER=3.0,BUILD_INITIAL_ROAD=2.0,DISCARD=1.5"
 )
 
 
@@ -58,19 +56,24 @@ def test_canonical_coverage_recipe_can_reach_composite_training() -> None:
 
     fields = _fields()
     assert _payload()["engine_settings"]["base_sampler"] == "coverage_importance_v1"
-    assert "minimum_policy_effective_rows_per_global_batch" not in _payload()[
-        "engine_settings"
-    ]
+    assert (
+        "minimum_policy_effective_rows_per_global_batch"
+        not in _payload()["engine_settings"]
+    )
     assert fields["minimum_policy_effective_rows_per_global_batch"] == 32.0
     assert fields["data_format"] == "memmap"
     assert fields["validation_max_samples"] == 0
 
 
-def test_production_hard_decision_mass_contract_is_fail_closed_until_reviewed() -> None:
+def test_production_hard_decision_mass_contract_is_commissioned() -> None:
     engine = _payload()["engine_settings"]
 
-    with pytest.raises(SystemExit, match="remains fail-closed"):
-        train._require_production_hard_decision_policy_mass_contract(engine)
+    assert train._require_production_hard_decision_policy_mass_contract(engine) == {
+        "minimum_initial_settlement_policy_mass_fraction": 0.02,
+        "minimum_initial_road_policy_mass_fraction": 0.02,
+        "minimum_discard_policy_mass_fraction": 0.02,
+        "minimum_move_robber_policy_mass_fraction": 0.02,
+    }
 
 
 def test_parent_production_recipe_can_collect_two_signal_observations() -> None:
@@ -388,9 +391,7 @@ def test_production_hard_decision_mass_contract_requires_every_phase() -> None:
     robber = "minimum_move_robber_policy_mass_fraction"
 
     with pytest.raises(SystemExit, match="missing=.*initial_road"):
-        train._require_production_hard_decision_policy_mass_contract(
-            {settlement: 0.01}
-        )
+        train._require_production_hard_decision_policy_mass_contract({settlement: 0.01})
 
     with pytest.raises(SystemExit, match="missing=.*discard.*move_robber"):
         train._require_production_hard_decision_policy_mass_contract(
@@ -436,9 +437,7 @@ def test_canonical_forced_value_baseline_preserves_boundary_evidence() -> None:
     fields = _fields()
     assert fields["forced_action_weight"] == 0.0
     assert fields["forced_row_value_weight"] == 1.0
-    assert fields["forced_row_value_action_type_weights"] == (
-        "END_TURN=1.0,ROLL=1.0"
-    )
+    assert fields["forced_row_value_action_type_weights"] == ("END_TURN=1.0,ROLL=1.0")
 
 
 def test_canonical_v7_value_routing_protects_only_the_shared_trunk() -> None:
@@ -460,9 +459,7 @@ def test_canonical_recipe_emphasizes_hard_decisions_without_weighting_value(
 ) -> None:
     """V7 keeps the proven PLAY_TURN repair but restores hard-decision mass."""
 
-    fields = json.loads(recipe.read_text(encoding="utf-8"))["train_config"][
-        "fields"
-    ]
+    fields = json.loads(recipe.read_text(encoding="utf-8"))["train_config"]["fields"]
 
     assert fields["phase_weights"] == HARD_DECISION_POLICY_PHASE_WEIGHTS
     assert fields["value_phase_weights"] == "none"
@@ -513,6 +510,7 @@ def test_hard_decision_mass_replay_uses_per_game_runtime_operator() -> None:
         "per_game_policy_weight": True,
         "per_game_policy_weight_mode": "equal",
     }
+
     def runtime_mass(
         phase_weights: dict[str, float], *, enforce_minima: bool = False
     ) -> tuple[dict[str, float], dict[str, object]]:
@@ -625,6 +623,21 @@ def test_canonical_scratch_recipe_rejects_candidate_chaining() -> None:
         )
 
 
+def test_canonical_scratch_recipe_binds_hard_decision_mass_minima() -> None:
+    config, engine = train._load_recipe(RECIPE)
+
+    resolved = train._engine_namespace(
+        config=config,
+        engine_settings=engine,
+        public_args=_public_args(),
+    )
+
+    assert resolved.minimum_initial_settlement_policy_mass_fraction == 0.02
+    assert resolved.minimum_initial_road_policy_mass_fraction == 0.02
+    assert resolved.minimum_discard_policy_mass_fraction == 0.02
+    assert resolved.minimum_move_robber_policy_mass_fraction == 0.02
+
+
 @pytest.mark.parametrize(
     ("recipe", "role"),
     (
@@ -632,9 +645,7 @@ def test_canonical_scratch_recipe_rejects_candidate_chaining() -> None:
         (PARENT_RECIPE, "parent_fresh_optimizer"),
     ),
 )
-def test_canonical_recipe_catalog_is_bound_to_role(
-    recipe: Path, role: str
-) -> None:
+def test_canonical_recipe_catalog_is_bound_to_role(recipe: Path, role: str) -> None:
     payload = json.loads(recipe.read_text(encoding="utf-8"))
     assert payload["engine_settings"]["initialization_mode"] == role
     catalog_name = train.require_production_recipe(
@@ -699,9 +710,7 @@ def test_parent_update_recipe_reproduces_split1_selected_step12() -> None:
     assert fields["freeze_modules"] == ""
     assert fields["forced_action_weight"] == 0.0
     assert fields["forced_row_value_weight"] == 1.0
-    assert fields["forced_row_value_action_type_weights"] == (
-        "END_TURN=1.0,ROLL=1.0"
-    )
+    assert fields["forced_row_value_action_type_weights"] == ("END_TURN=1.0,ROLL=1.0")
     assert fields["resume_optimizer"] is False
     assert fields["init_checkpoint"] == ""
     assert fields["grow_from_checkpoint"] == ""

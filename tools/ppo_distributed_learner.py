@@ -27,9 +27,11 @@ variant later — see the TODO in :func:`_vtrace_rewards`.
 
 Build-only: importing or ``--help``-ing this module must not start training.
 """
+
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import json
 import math
 import numbers
@@ -110,6 +112,8 @@ class LearnerConfig:
     trunk_lr_mult: float = 0.1
     clip_ratio: float = 0.1
     value_coef: float = 0.5
+    value_trunk_grad_scale: float = 0.1
+    legacy_value_trunk_grad_scale_compat: bool = False
     value_clip_range: float = 0.0
     entropy_coef: float = 0.01
     ppo_epochs: int = 2
@@ -132,7 +136,9 @@ class LearnerConfig:
     vtrace_clip_pg_rho: float = 1.0
     gamma: float = 1.0
     gae_lambda: float = 0.95
-    vtrace_use_current_values: bool = True  # recompute critic values vs reuse traj.old_values
+    vtrace_use_current_values: bool = (
+        True  # recompute critic values vs reuse traj.old_values
+    )
     # FIX H4: chunk the V-trace recompute forward into sub-batches of this many rows to bound
     # peak memory (one forward over 25k-150k rows x [action_size x ctx] would OOM the GPU).
     vtrace_forward_chunk: int = 8192
@@ -164,9 +170,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         description="GPU learner for distributed PPO (pull shards, KL-to-BC + V-trace, publish).",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("--config", default=None,
-                   help="JSON or YAML config (e.g. configs/selfplay/ppo_2p_v1.yaml). "
-                        "Keys overlay the defaults below; explicit CLI flags still win.")
+    p.add_argument(
+        "--config",
+        default=None,
+        help="JSON or YAML config (e.g. configs/selfplay/ppo_2p_v1.yaml). "
+        "Keys overlay the defaults below; explicit CLI flags still win.",
+    )
     p.add_argument(
         "--run-manifest",
         default=None,
@@ -177,35 +186,69 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
 
     g = p.add_argument_group("run wiring")
-    g.add_argument("--run-base", default="runs/distributed",
-                   help="Base dir holding the shared run directory (a Modal volume or NFS path).")
-    g.add_argument("--run-name", default="ppo_distributed_v1",
-                   help="Run name; the shared dir is {run-base}/{run-name}.")
-    g.add_argument("--init-checkpoint", default=None,
-                   help="BC warm-start checkpoint; also the frozen KL-to-BC anchor.")
+    g.add_argument(
+        "--run-base",
+        default="runs/distributed",
+        help="Base dir holding the shared run directory (a Modal volume or NFS path).",
+    )
+    g.add_argument(
+        "--run-name",
+        default="ppo_distributed_v1",
+        help="Run name; the shared dir is {run-base}/{run-name}.",
+    )
+    g.add_argument(
+        "--init-checkpoint",
+        default=None,
+        help="BC warm-start checkpoint; also the frozen KL-to-BC anchor.",
+    )
     g.add_argument(
         "--architecture",
         choices=(CANONICAL_PPO_ARCHITECTURE,),
         default=CANONICAL_PPO_ARCHITECTURE,
         help="Canonical W7 policy architecture (legacy architectures fail closed).",
     )
-    g.add_argument("--device", default="auto", help="auto|cpu|cuda|cuda:N for the learner.")
+    g.add_argument(
+        "--device", default="auto", help="auto|cpu|cuda|cuda:N for the learner."
+    )
 
     g = p.add_argument_group("pull / staleness")
     g.add_argument("--shards-per-step", type=int, default=16)
-    g.add_argument("--max-staleness", type=int, default=4,
-                   help="Drop shards whose policy_version < current_version - max_staleness.")
-    g.add_argument("--poll-secs", type=float, default=5.0,
-                   help="Sleep when no shards are available.")
-    g.add_argument("--stable-secs", type=float, default=0.0,
-                   help="Skip shards modified within the last N seconds (mid-write guard).")
-    g.add_argument("--max-steps", type=int, default=0, help="Stop after N steps (0 = forever).")
-    g.add_argument("--resume", dest="resume", action="store_true", default=True,
-                   help="Resume from the freshest checkpoints/step_{N}.pt + optimizer state "
-                        "(default). Essential on Modal: every ~24h container restart would "
-                        "otherwise wipe the run back to the BC warm-start.")
-    g.add_argument("--no-resume", dest="resume", action="store_false",
-                   help="Always cold-start from --init-checkpoint (step 0); ignore prior progress.")
+    g.add_argument(
+        "--max-staleness",
+        type=int,
+        default=4,
+        help="Drop shards whose policy_version < current_version - max_staleness.",
+    )
+    g.add_argument(
+        "--poll-secs",
+        type=float,
+        default=5.0,
+        help="Sleep when no shards are available.",
+    )
+    g.add_argument(
+        "--stable-secs",
+        type=float,
+        default=0.0,
+        help="Skip shards modified within the last N seconds (mid-write guard).",
+    )
+    g.add_argument(
+        "--max-steps", type=int, default=0, help="Stop after N steps (0 = forever)."
+    )
+    g.add_argument(
+        "--resume",
+        dest="resume",
+        action="store_true",
+        default=True,
+        help="Resume from the freshest checkpoints/step_{N}.pt + optimizer state "
+        "(default). Essential on Modal: every ~24h container restart would "
+        "otherwise wipe the run back to the BC warm-start.",
+    )
+    g.add_argument(
+        "--no-resume",
+        dest="resume",
+        action="store_false",
+        help="Always cold-start from --init-checkpoint (step 0); ignore prior progress.",
+    )
 
     g = p.add_argument_group("optimization")
     g.add_argument("--lr", type=float, default=2.0e-4)
@@ -217,6 +260,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     g.add_argument("--clip-ratio", type=float, default=0.1)
     g.add_argument("--value-coef", type=float, default=0.5)
+    g.add_argument(
+        "--value-trunk-grad-scale",
+        type=float,
+        default=0.1,
+        help=(
+            "Scale critic gradients entering the shared entity trunk; the private "
+            "value tower and head remain fully trainable."
+        ),
+    )
     g.add_argument(
         "--value-clip-range",
         type=float,
@@ -230,8 +282,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     g.add_argument("--entropy-coef", type=float, default=0.01)
     g.add_argument("--ppo-epochs", type=int, default=2)
     g.add_argument("--minibatch-size", type=int, default=65536)
-    g.add_argument("--target-kl", type=float, default=0.0075,
-                   help="Early-stop PPO epochs once approx_kl exceeds this.")
+    g.add_argument(
+        "--target-kl",
+        type=float,
+        default=0.0075,
+        help="Early-stop PPO epochs once approx_kl exceeds this.",
+    )
     g.add_argument(
         "--behavior-temperature",
         type=float,
@@ -285,40 +341,73 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     g = p.add_argument_group("V-trace")
     g.add_argument("--use-vtrace", dest="use_vtrace", action="store_true", default=True)
-    g.add_argument("--no-vtrace", dest="use_vtrace", action="store_false",
-                   help="Disable V-trace; keep actor-side GAE returns/advantages (bounded-staleness PPO).")
+    g.add_argument(
+        "--no-vtrace",
+        dest="use_vtrace",
+        action="store_false",
+        help="Disable V-trace; keep actor-side GAE returns/advantages (bounded-staleness PPO).",
+    )
     g.add_argument("--vtrace-clip-rho", type=float, default=1.0)
     g.add_argument("--vtrace-clip-pg-rho", type=float, default=1.0)
-    g.add_argument("--vtrace-forward-chunk", type=int, default=8192,
-                   help="Rows per sub-batch for the V-trace recompute forward (caps peak memory).")
+    g.add_argument(
+        "--vtrace-forward-chunk",
+        type=int,
+        default=8192,
+        help="Rows per sub-batch for the V-trace recompute forward (caps peak memory).",
+    )
     g.add_argument("--gamma", type=float, default=1.0)
     g.add_argument("--gae-lambda", type=float, default=0.95)
-    g.add_argument("--vtrace-reuse-old-values", dest="vtrace_use_current_values",
-                   action="store_false", default=True,
-                   help="Use the stored traj.old_values as the V-trace baseline instead of "
-                        "recomputing the current critic's values.")
+    g.add_argument(
+        "--vtrace-reuse-old-values",
+        dest="vtrace_use_current_values",
+        action="store_false",
+        default=True,
+        help="Use the stored traj.old_values as the V-trace baseline instead of "
+        "recomputing the current critic's values.",
+    )
 
     g = p.add_argument_group("checkpoint / eval / league")
     g.add_argument("--checkpoint-every", type=int, default=50)
-    g.add_argument("--keep-last-checkpoints", type=int, default=5,
-                   help="Rotation: keep the last N step_{N}.pt checkpoints (plus league-referenced "
-                        "and milestone ones); delete older ones and their .opt.pt.")
-    g.add_argument("--checkpoint-milestone-every", type=int, default=500,
-                   help="Rotation: always keep every Nth-step checkpoint as a permanent milestone.")
+    g.add_argument(
+        "--keep-last-checkpoints",
+        type=int,
+        default=5,
+        help="Rotation: keep the last N step_{N}.pt checkpoints (plus league-referenced "
+        "and milestone ones); delete older ones and their .opt.pt.",
+    )
+    g.add_argument(
+        "--checkpoint-milestone-every",
+        type=int,
+        default=500,
+        help="Rotation: always keep every Nth-step checkpoint as a permanent milestone.",
+    )
     g.add_argument("--eval-games", type=int, default=200)
     g.add_argument("--eval-tracks", default="2p_no_trade")
-    g.add_argument("--eval-opponents",
-                   default="random,heuristic,jsettlers_lite,catanatron_ab3,catanatron_ab4")
-    g.add_argument("--eval-workers", type=int, default=8,
-                   help="Scoreboard eval workers; eval runs inside the learner container so a "
-                        "higher value finishes faster.")
+    g.add_argument(
+        "--eval-opponents",
+        default="random,heuristic,jsettlers_lite,catanatron_ab3,catanatron_ab4",
+    )
+    g.add_argument(
+        "--eval-workers",
+        type=int,
+        default=8,
+        help="Scoreboard eval workers; eval runs inside the learner container so a "
+        "higher value finishes faster.",
+    )
     g.add_argument("--eval-max-decisions", type=int, default=1000)
-    g.add_argument("--eval-timeout-secs", type=float, default=1200.0,
-                   help="Hard cap on the scoreboard subprocess; on timeout the process group is "
-                        "killed and eval returns None (best-effort, never stalls training).")
-    g.add_argument("--eval-device", default="cpu",
-                   help="Device for the held-out scoreboard (cpu by default so eval cannot "
-                        "steal the training GPU).")
+    g.add_argument(
+        "--eval-timeout-secs",
+        type=float,
+        default=1200.0,
+        help="Hard cap on the scoreboard subprocess; on timeout the process group is "
+        "killed and eval returns None (best-effort, never stalls training).",
+    )
+    g.add_argument(
+        "--eval-device",
+        default="cpu",
+        help="Device for the held-out scoreboard (cpu by default so eval cannot "
+        "steal the training GPU).",
+    )
     g.add_argument("--league-snapshot-interval", type=int, default=200)
     g.add_argument("--league-promote-winrate", type=float, default=0.7)
     return p
@@ -350,6 +439,7 @@ def _flatten_config(raw: dict[str, Any]) -> dict[str, Any]:
     take(ppo.get("trunk_lr_mult"), "trunk_lr_mult")
     take(ppo.get("clip_ratio"), "clip_ratio")
     take(ppo.get("value_coef"), "value_coef")
+    take(ppo.get("value_trunk_grad_scale"), "value_trunk_grad_scale")
     take(ppo.get("value_clip_range"), "value_clip_range")
     take(ppo.get("entropy_coef"), "entropy_coef")
     take(ppo.get("epochs"), "ppo_epochs")
@@ -392,7 +482,9 @@ def _flatten_config(raw: dict[str, Any]) -> dict[str, Any]:
     take(league.get("snapshot_interval"), "league_snapshot_interval")
     take(league.get("promote_winrate"), "league_promote_winrate")
 
-    take(raw.get("track"), "eval_tracks")  # selfplay configs name the track at top level
+    take(
+        raw.get("track"), "eval_tracks"
+    )  # selfplay configs name the track at top level
     return flat
 
 
@@ -410,7 +502,9 @@ def load_config_file(path: str | os.PathLike) -> dict[str, Any]:
             ) from error
         raw = yaml.safe_load(text)
     if not isinstance(raw, dict):
-        raise SystemExit(f"config {path} must be a mapping at top level, got {type(raw).__name__}")
+        raise SystemExit(
+            f"config {path} must be a mapping at top level, got {type(raw).__name__}"
+        )
     return _flatten_config(raw)
 
 
@@ -435,6 +529,14 @@ def _manifest_config_values(manifest: PPORunManifest) -> dict[str, Any]:
         "trunk_lr_mult": learner.trunk_lr_mult,
         "clip_ratio": learner.clip_ratio,
         "value_coef": learner.value_coef,
+        "value_trunk_grad_scale": (
+            1.0
+            if learner.value_trunk_grad_scale is None
+            else learner.value_trunk_grad_scale
+        ),
+        "legacy_value_trunk_grad_scale_compat": (
+            learner.value_trunk_grad_scale is None
+        ),
         "value_clip_range": learner.value_clip_range,
         "entropy_coef": learner.entropy_coef,
         "ppo_epochs": learner.ppo_epochs,
@@ -479,7 +581,9 @@ _MANIFEST_RUNTIME_DESTS = {
 }
 
 
-def resolve_config(argv: list[str] | None = None) -> tuple[LearnerConfig, argparse.Namespace]:
+def resolve_config(
+    argv: list[str] | None = None,
+) -> tuple[LearnerConfig, argparse.Namespace]:
     """Build a LearnerConfig: argparse defaults < config file < explicit CLI flags."""
     parser = build_arg_parser()
     effective_argv = list(sys.argv[1:] if argv is None else argv)
@@ -511,6 +615,7 @@ def resolve_config(argv: list[str] | None = None) -> tuple[LearnerConfig, argpar
         "trunk_lr_mult": args.trunk_lr_mult,
         "clip_ratio": args.clip_ratio,
         "value_coef": args.value_coef,
+        "value_trunk_grad_scale": args.value_trunk_grad_scale,
         "value_clip_range": args.value_clip_range,
         "entropy_coef": args.entropy_coef,
         "ppo_epochs": args.ppo_epochs,
@@ -562,7 +667,9 @@ def resolve_config(argv: list[str] | None = None) -> tuple[LearnerConfig, argpar
         except (OSError, ManifestError) as error:
             parser.error(f"invalid --run-manifest: {error}")
         if manifest.status != "bound":
-            parser.error("--run-manifest must have status='bound'; templates cannot run")
+            parser.error(
+                "--run-manifest must have status='bound'; templates cannot run"
+            )
         try:
             actual_initializer_sha256 = (
                 f"sha256:{dist.checkpoint_sha256(args.init_checkpoint)}"
@@ -590,7 +697,9 @@ def resolve_config(argv: list[str] | None = None) -> tuple[LearnerConfig, argpar
 
     config = LearnerConfig(**cfg_kwargs)
     if not config.init_checkpoint:
-        parser.error("--init-checkpoint is required (BC warm-start + frozen KL-to-BC anchor)")
+        parser.error(
+            "--init-checkpoint is required (BC warm-start + frozen KL-to-BC anchor)"
+        )
     try:
         _validate_w7_config(config)
     except ValueError as error:
@@ -611,7 +720,21 @@ def _validate_w7_config(config: LearnerConfig) -> None:
     if not 0.005 <= float(config.target_kl) <= 0.01:
         raise ValueError("canonical PPO requires target_kl in [0.005, 0.01]")
     if float(config.clip_ratio) != 0.1:
-        raise ValueError(f"canonical PPO requires clip_ratio=0.1, got {config.clip_ratio}")
+        raise ValueError(
+            f"canonical PPO requires clip_ratio=0.1, got {config.clip_ratio}"
+        )
+    legacy_scale_compat = bool(config.legacy_value_trunk_grad_scale_compat)
+    if legacy_scale_compat:
+        if config.run_manifest_sha256 is None or float(config.value_trunk_grad_scale) != 1.0:
+            raise ValueError(
+                "legacy value-trunk scale compatibility requires an immutable "
+                "pre-field v2 run manifest and value_trunk_grad_scale=1.0"
+            )
+    elif float(config.value_trunk_grad_scale) != 0.1:
+        raise ValueError(
+            "canonical PPO requires value_trunk_grad_scale=0.1, got "
+            f"{config.value_trunk_grad_scale}"
+        )
     if not math.isfinite(float(config.trunk_lr_mult)) or not (
         0.0 < float(config.trunk_lr_mult) <= 0.1
     ):
@@ -696,9 +819,8 @@ def _recompute_target_logp_and_values_batched(
 
     behavior_temperature = max(float(behavior_temperature), 1.0e-6)
 
-    entity_mode = (
-        callable(getattr(policy, "forward_legal_np", None))
-        and all(getattr(sample, "entity_features", None) is not None for sample in samples)
+    entity_mode = callable(getattr(policy, "forward_legal_np", None)) and all(
+        getattr(sample, "entity_features", None) is not None for sample in samples
     )
     if entity_mode:
         actions_all = torch.as_tensor(
@@ -714,7 +836,9 @@ def _recompute_target_logp_and_values_batched(
         actions = np.asarray([s.action for s in samples], dtype=np.int64)
         valid_actions = [s.valid_actions for s in samples]
 
-        obs_all = torch.as_tensor(observations, dtype=torch.float32, device=policy.device)
+        obs_all = torch.as_tensor(
+            observations, dtype=torch.float32, device=policy.device
+        )
         context_all = _action_context_features_tensor(samples, policy)
         actions_all = torch.as_tensor(actions, dtype=torch.long, device=policy.device)
 
@@ -758,11 +882,19 @@ def _recompute_target_logp_and_values_batched(
             log_probs = dist.log_prob(actions_t)
             # Pull the cheap [chunk]-shaped outputs to host; the big ``logits``/``masked`` tensors
             # for this chunk are released as the loop iterates (never all held at once).
-            logp_parts.append(log_probs.detach().to(dtype=torch.float64).cpu().numpy().reshape(-1))
-            value_parts.append(values.detach().to(dtype=torch.float64).cpu().numpy().reshape(-1))
+            logp_parts.append(
+                log_probs.detach().to(dtype=torch.float64).cpu().numpy().reshape(-1)
+            )
+            value_parts.append(
+                values.detach().to(dtype=torch.float64).cpu().numpy().reshape(-1)
+            )
 
-    target_logp = np.concatenate(logp_parts) if logp_parts else np.zeros(0, dtype=np.float64)
-    current_values = np.concatenate(value_parts) if value_parts else np.zeros(0, dtype=np.float64)
+    target_logp = (
+        np.concatenate(logp_parts) if logp_parts else np.zeros(0, dtype=np.float64)
+    )
+    current_values = (
+        np.concatenate(value_parts) if value_parts else np.zeros(0, dtype=np.float64)
+    )
     return target_logp, current_values
 
 
@@ -781,7 +913,9 @@ def _vtrace_rewards(trajectory: Any) -> np.ndarray:
     """
     n = len(trajectory.samples)
     real = np.asarray(getattr(trajectory, "rewards", []) or [], dtype=np.float64)
-    shaped = np.asarray(getattr(trajectory, "shaped_rewards", []) or [], dtype=np.float64)
+    shaped = np.asarray(
+        getattr(trajectory, "shaped_rewards", []) or [], dtype=np.float64
+    )
 
     if real.shape[0] == 0:
         # Older shard: no real env reward recorded. Fall back to shaped rewards (may be zeros).
@@ -825,7 +959,9 @@ def _discounts_for_trajectory(trajectory: Any, *, gamma: float) -> np.ndarray:
     if n == 0:
         return np.zeros(0, dtype=np.float64)
     discounts = np.full(n, float(gamma), dtype=np.float64)
-    discounts[-1] = float(gamma) if bool(getattr(trajectory, "truncated", False)) else 0.0
+    discounts[-1] = (
+        float(gamma) if bool(getattr(trajectory, "truncated", False)) else 0.0
+    )
     return discounts
 
 
@@ -835,7 +971,25 @@ def _discounts_for_trajectory(trajectory: Any, *, gamma: float) -> np.ndarray:
 VTRACE_BAD_TRAJECTORY_SKIP_FRACTION = 0.10
 
 
-def apply_vtrace_in_place(policy: Any, trajectories: list[Any], config: LearnerConfig) -> dict[str, float]:
+@contextmanager
+def _temporary_policy_eval_mode(policy: Any):
+    """Make V-trace recomputation deterministic and restore caller state."""
+
+    model = getattr(policy, "model", None)
+    if model is None or not callable(getattr(model, "eval", None)):
+        yield
+        return
+    was_training = bool(getattr(model, "training", False))
+    model.eval()
+    try:
+        yield
+    finally:
+        model.train(was_training)
+
+
+def apply_vtrace_in_place(
+    policy: Any, trajectories: list[Any], config: LearnerConfig
+) -> dict[str, float]:
     """Off-policy correct each trajectory with V-trace under the CURRENT policy, OVERWRITING
     ``traj.returns`` (<- vs), ``traj.advantages`` (<- pg_advantages), and the learner-only PPO
     policy/value references (<- the current learner snapshot before the update).
@@ -877,48 +1031,58 @@ def apply_vtrace_in_place(policy: Any, trajectories: list[Any], config: LearnerC
         )
 
     # FIX 3 + H4: chunked batched forward over every step of every trajectory, then split by len.
-    batched_target_logp, batched_current_values = _recompute_target_logp_and_values_batched(
-        policy,
-        non_empty,
-        forward_chunk=getattr(config, "vtrace_forward_chunk", 8192),
-        behavior_temperature=getattr(config, "behavior_temperature", 1.0),
-    )
-    current_bootstrap_values: dict[int, float] = {}
-    missing_current_bootstrap = 0
-    if config.vtrace_use_current_values:
-        truncated_trajectories = [
-            trajectory
-            for trajectory in non_empty
-            if bool(getattr(trajectory, "truncated", False))
-        ]
-        bootstrap_samples = [
-            getattr(trajectory, "bootstrap_sample", None)
-            for trajectory in truncated_trajectories
-        ]
-        missing_current_bootstrap = sum(
-            sample is None for sample in bootstrap_samples
-        )
-        if missing_current_bootstrap:
-            return {
-                "vtrace_steps": 0.0,
-                "vtrace_bad_trajectories": float(missing_current_bootstrap),
-                "vtrace_total_trajectories": float(total),
-                "vtrace_skipped": 1.0,
-                "vtrace_missing_current_bootstrap": float(
-                    missing_current_bootstrap
-                ),
-            }
-        if bootstrap_samples:
-            _, recomputed_bootstrap_values = (
-                _recompute_target_logp_and_values_batched(
-                    policy,
-                    [SimpleNamespace(samples=bootstrap_samples)],
-                    forward_chunk=getattr(config, "vtrace_forward_chunk", 8192),
-                    behavior_temperature=getattr(
-                        config, "behavior_temperature", 1.0
-                    ),
-                )
+    with _temporary_policy_eval_mode(policy):
+        batched_target_logp, batched_current_values = (
+            _recompute_target_logp_and_values_batched(
+                policy,
+                non_empty,
+                forward_chunk=getattr(config, "vtrace_forward_chunk", 8192),
+                behavior_temperature=getattr(config, "behavior_temperature", 1.0),
             )
+        )
+        current_bootstrap_values: dict[int, float] = {}
+        missing_current_bootstrap = 0
+        if config.vtrace_use_current_values:
+            truncated_trajectories = [
+                trajectory
+                for trajectory in non_empty
+                if bool(getattr(trajectory, "truncated", False))
+            ]
+            bootstrap_samples = [
+                getattr(trajectory, "bootstrap_sample", None)
+                for trajectory in truncated_trajectories
+            ]
+            missing_current_bootstrap = sum(
+                sample is None for sample in bootstrap_samples
+            )
+            if missing_current_bootstrap:
+                return {
+                    "vtrace_steps": 0.0,
+                    "vtrace_bad_trajectories": float(missing_current_bootstrap),
+                    "vtrace_total_trajectories": float(total),
+                    "vtrace_skipped": 1.0,
+                    "vtrace_missing_current_bootstrap": float(
+                        missing_current_bootstrap
+                    ),
+                }
+            if bootstrap_samples:
+                _, recomputed_bootstrap_values = (
+                    _recompute_target_logp_and_values_batched(
+                        policy,
+                        [SimpleNamespace(samples=bootstrap_samples)],
+                        forward_chunk=getattr(config, "vtrace_forward_chunk", 8192),
+                        behavior_temperature=getattr(
+                            config, "behavior_temperature", 1.0
+                        ),
+                    )
+                )
+            else:
+                recomputed_bootstrap_values = np.asarray([], dtype=np.float32)
+        else:
+            truncated_trajectories = []
+            recomputed_bootstrap_values = np.asarray([], dtype=np.float32)
+    if config.vtrace_use_current_values:
+        if bootstrap_samples:
             if (
                 len(recomputed_bootstrap_values) != len(truncated_trajectories)
                 or not np.isfinite(recomputed_bootstrap_values).all()
@@ -942,9 +1106,7 @@ def apply_vtrace_in_place(policy: Any, trajectories: list[Any], config: LearnerC
     n_steps = 0
     n_bad = 0
     offset = 0
-    pending: list[
-        tuple[Any, list[float], list[float], list[float], list[float]]
-    ] = []
+    pending: list[tuple[Any, list[float], list[float], list[float], list[float]]] = []
     for trajectory in non_empty:
         n = len(trajectory.samples)
         target_logp = batched_target_logp[offset : offset + n]
@@ -1005,7 +1167,12 @@ def apply_vtrace_in_place(policy: Any, trajectories: list[Any], config: LearnerC
         )
         vs = np.asarray(_to_numpy(out.vs), dtype=np.float64).reshape(-1)
         pg = np.asarray(_to_numpy(out.pg_advantages), dtype=np.float64).reshape(-1)
-        if vs.shape[0] != n or pg.shape[0] != n or not np.isfinite(vs).all() or not np.isfinite(pg).all():
+        if (
+            vs.shape[0] != n
+            or pg.shape[0] != n
+            or not np.isfinite(vs).all()
+            or not np.isfinite(pg).all()
+        ):
             n_bad += 1
             continue
         # Stage the result; only commit once we know the whole step is healthy (FIX 4).
@@ -1040,9 +1207,7 @@ def apply_vtrace_in_place(policy: Any, trajectories: list[Any], config: LearnerC
             "vtrace_bad_trajectories": float(n_bad),
             "vtrace_total_trajectories": float(total),
             "vtrace_skipped": 1.0,
-            "vtrace_missing_current_bootstrap": float(
-                missing_current_bootstrap
-            ),
+            "vtrace_missing_current_bootstrap": float(missing_current_bootstrap),
         }
 
     for trajectory, vs_list, pg_list, target_logp_list, current_values_list in pending:
@@ -1086,11 +1251,20 @@ def read_shards(root: str | os.PathLike, shards: Iterable[Any]) -> list[Any]:
         if envelope is None:
             try:
                 envelope = dist.read_trajectory_shard(shard)
-            except Exception as exc:  # corrupt / mid-write shard: skip, do not crash the learner
+            except (
+                Exception
+            ) as exc:  # corrupt / mid-write shard: skip, do not crash the learner
                 # FIX M4 (quarantine): mark the bad shard consumed so it isn't re-read every poll
                 # forever. Mid-write shards are rare here (atomic rename), so a persistent failure
                 # means a genuinely corrupt file — drop it. Log once.
-                print({"event": "shard_read_error", "shard": str(shard), "error": repr(exc)}, flush=True)
+                print(
+                    {
+                        "event": "shard_read_error",
+                        "shard": str(shard),
+                        "error": repr(exc),
+                    },
+                    flush=True,
+                )
                 try:
                     dist.mark_consumed(root, shard)
                 except Exception:
@@ -1102,7 +1276,9 @@ def read_shards(root: str | os.PathLike, shards: Iterable[Any]) -> list[Any]:
 
 
 # --------------------------------------------------------------------------- eval + league
-def run_scoreboard_eval(checkpoint_path: str, out_path: str, config: LearnerConfig) -> dict[str, Any] | None:
+def run_scoreboard_eval(
+    checkpoint_path: str, out_path: str, config: LearnerConfig
+) -> dict[str, Any] | None:
     """Run the held-out scoreboard (``tools/evaluate_scoreboard.py``) on ``checkpoint_path`` and
     return the parsed JSON it writes to ``out_path``. Shells out so the heavyweight eval runs in
     its own process (and on ``eval_device``, cpu by default, so it can't steal the training GPU).
@@ -1112,15 +1288,24 @@ def run_scoreboard_eval(checkpoint_path: str, out_path: str, config: LearnerConf
     cmd = [
         sys.executable,
         str(_TOOLS_DIR / "evaluate_scoreboard.py"),
-        "--candidate", str(checkpoint_path),
-        "--candidate-kind", "checkpoint",
-        "--games", str(int(config.eval_games)),
-        "--tracks", str(config.eval_tracks),
-        "--opponents", str(config.eval_opponents),
-        "--workers", str(int(config.eval_workers)),
-        "--device", str(config.eval_device),
-        "--max-decisions", str(int(config.eval_max_decisions)),
-        "--out", str(out_path),
+        "--candidate",
+        str(checkpoint_path),
+        "--candidate-kind",
+        "checkpoint",
+        "--games",
+        str(int(config.eval_games)),
+        "--tracks",
+        str(config.eval_tracks),
+        "--opponents",
+        str(config.eval_opponents),
+        "--workers",
+        str(int(config.eval_workers)),
+        "--device",
+        str(config.eval_device),
+        "--max-decisions",
+        str(int(config.eval_max_decisions)),
+        "--out",
+        str(out_path),
     ]
     eval_env = os.environ.copy()
     # Scoreboard workers are CPU-bound game/eval processes. If PyTorch/BLAS inherits the
@@ -1144,7 +1329,10 @@ def run_scoreboard_eval(checkpoint_path: str, out_path: str, config: LearnerConf
         proc = subprocess.Popen(cmd, start_new_session=True, env=eval_env)
         proc.wait(timeout=timeout if timeout > 0 else None)
         if proc.returncode != 0:
-            print({"event": "eval_error", "returncode": proc.returncode, "cmd": cmd}, flush=True)
+            print(
+                {"event": "eval_error", "returncode": proc.returncode, "cmd": cmd},
+                flush=True,
+            )
             return None
     except subprocess.TimeoutExpired:
         # Kill the entire process group, then reap so we don't leak a zombie.
@@ -1157,7 +1345,9 @@ def run_scoreboard_eval(checkpoint_path: str, out_path: str, config: LearnerConf
                 proc.wait(timeout=10)
         except (ProcessLookupError, OSError):
             pass
-        print({"event": "eval_timeout", "timeout_secs": timeout, "cmd": cmd}, flush=True)
+        print(
+            {"event": "eval_timeout", "timeout_secs": timeout, "cmd": cmd}, flush=True
+        )
         return None
     except Exception as exc:
         if proc is not None and proc.poll() is None:
@@ -1170,7 +1360,10 @@ def run_scoreboard_eval(checkpoint_path: str, out_path: str, config: LearnerConf
     try:
         return json.loads(Path(out_path).read_text(encoding="utf-8"))
     except Exception as exc:
-        print({"event": "eval_parse_error", "error": repr(exc), "out": str(out_path)}, flush=True)
+        print(
+            {"event": "eval_parse_error", "error": repr(exc), "out": str(out_path)},
+            flush=True,
+        )
         return None
 
 
@@ -1204,7 +1397,9 @@ def record_eval_into_league(
         league.record_match(main_id, opp_id, win_rate)
 
 
-def cycling_check(league: League, baseline_ids: dict[str, str], main_id: str) -> dict[str, Any]:
+def cycling_check(
+    league: League, baseline_ids: dict[str, str], main_id: str
+) -> dict[str, Any]:
     """Cheap non-transitivity / regression check on the payoff matrix.
 
     Reports:
@@ -1214,7 +1409,11 @@ def cycling_check(league: League, baseline_ids: dict[str, str], main_id: str) ->
         win-rate regression against the structured bots (jsettlers/value/AB-k).
     """
     ids, matrix = league.payoff_matrix()
-    info: dict[str, Any] = {"dominant": False, "min_baseline_winrate": None, "worst_baseline": None}
+    info: dict[str, Any] = {
+        "dominant": False,
+        "min_baseline_winrate": None,
+        "worst_baseline": None,
+    }
     if matrix.size:
         for i in range(matrix.shape[0]):
             row = matrix[i]
@@ -1246,10 +1445,14 @@ def cycling_check(league: League, baseline_ids: dict[str, str], main_id: str) ->
 def _checkpoint_step(path: Path) -> int | None:
     """Parse N from a ``step_{N}.pt`` checkpoint filename (ignores ``.opt.pt`` sidecars)."""
     name = path.name
-    if not name.startswith("step_") or not name.endswith(".pt") or name.endswith(".opt.pt"):
+    if (
+        not name.startswith("step_")
+        or not name.endswith(".pt")
+        or name.endswith(".opt.pt")
+    ):
         return None
     try:
-        return int(name[len("step_"):-len(".pt")])
+        return int(name[len("step_") : -len(".pt")])
     except ValueError:
         return None
 
@@ -1270,7 +1473,7 @@ def _list_checkpoints(root: str | os.PathLike) -> list[tuple[int, Path]]:
 
 def _opt_path_for(ckpt_path: Path) -> Path:
     """The optimizer-state sidecar path for a ``step_{N}.pt`` checkpoint: ``step_{N}.opt.pt``."""
-    return ckpt_path.with_name(ckpt_path.name[:-len(".pt")] + ".opt.pt")
+    return ckpt_path.with_name(ckpt_path.name[: -len(".pt")] + ".opt.pt")
 
 
 def _capture_rng_state() -> dict[str, Any]:
@@ -1316,7 +1519,9 @@ def _restore_rng_state(state: Any) -> None:
         np.random.set_state(state["numpy"])
         torch.set_rng_state(state["torch_cpu"].cpu())
         if cuda_states:
-            torch.cuda.set_rng_state_all([cuda_state.cpu() for cuda_state in cuda_states])
+            torch.cuda.set_rng_state_all(
+                [cuda_state.cpu() for cuda_state in cuda_states]
+            )
     except Exception as error:
         raise RuntimeError(
             f"refusing PPO resume: cannot restore checkpoint RNG state: {error}"
@@ -1334,7 +1539,9 @@ def _relative_shard_frontier(
         try:
             relative = Path(shard).resolve().relative_to(base)
         except (OSError, ValueError) as error:
-            raise ValueError(f"shard is outside trajectories directory: {shard}") from error
+            raise ValueError(
+                f"shard is outside trajectories directory: {shard}"
+            ) from error
         if not relative.parts or ".." in relative.parts:
             raise ValueError(f"unsafe shard frontier path: {shard}")
         frontier.append(relative.as_posix())
@@ -1342,12 +1549,16 @@ def _relative_shard_frontier(
 
 
 def _validate_consumed_frontier(frontier: Any) -> list[str]:
-    if not isinstance(frontier, list) or not all(isinstance(item, str) for item in frontier):
+    if not isinstance(frontier, list) or not all(
+        isinstance(item, str) for item in frontier
+    ):
         raise RuntimeError("refusing PPO resume: consumed-shard frontier is malformed")
     for item in frontier:
         path = Path(item)
         if path.is_absolute() or not path.parts or ".." in path.parts:
-            raise RuntimeError("refusing PPO resume: unsafe consumed-shard frontier path")
+            raise RuntimeError(
+                "refusing PPO resume: unsafe consumed-shard frontier path"
+            )
     return frontier
 
 
@@ -1390,7 +1601,9 @@ def _save_checkpoint_set(
     checkpoint_path = checkpoint_dir / f"step_{completed_step}.pt"
     optimizer_path = _opt_path_for(checkpoint_path)
     if checkpoint_path.exists():
-        raise FileExistsError(f"refusing to overwrite PPO checkpoint: {checkpoint_path}")
+        raise FileExistsError(
+            f"refusing to overwrite PPO checkpoint: {checkpoint_path}"
+        )
     # An optimizer-only file is unreachable because resume discovery keys off the model.
     # It can only be an interrupted attempt at this same step, so clear it before retrying.
     if optimizer_path.exists():
@@ -1501,8 +1714,7 @@ def _checkpoint_schedule(
     if step <= 0:
         raise ValueError("completed PPO step must be positive")
     periodic = (
-        int(config.checkpoint_every) > 0
-        and step % int(config.checkpoint_every) == 0
+        int(config.checkpoint_every) > 0 and step % int(config.checkpoint_every) == 0
     )
     terminal = int(config.max_steps) > 0 and step >= int(config.max_steps)
     return periodic, terminal
@@ -1514,7 +1726,9 @@ def find_resume_checkpoint(root: str | os.PathLike) -> tuple[int, Path] | None:
     return ckpts[-1] if ckpts else None
 
 
-def prune_checkpoints(root: str | os.PathLike, league: League, config: LearnerConfig) -> list[str]:
+def prune_checkpoints(
+    root: str | os.PathLike, league: League, config: LearnerConfig
+) -> list[str]:
     """FIX C4: bound the checkpoints dir so a multi-day run doesn't fill the volume with TBs.
 
     KEEP: (a) the last ``keep_last_checkpoints``, (b) every league-referenced checkpoint
@@ -1572,8 +1786,14 @@ def prune_checkpoints(root: str | os.PathLike, league: League, config: LearnerCo
         except OSError:
             pass
     if deleted:
-        print({"event": "checkpoint_pruned", "deleted": len(deleted), "kept_steps": sorted(keep_steps)},
-              flush=True)
+        print(
+            {
+                "event": "checkpoint_pruned",
+                "deleted": len(deleted),
+                "kept_steps": sorted(keep_steps),
+            },
+            flush=True,
+        )
     return deleted
 
 
@@ -1586,29 +1806,19 @@ def _assert_finite_nested(value: Any, *, path: str) -> None:
         if (value.is_floating_point() or value.is_complex()) and not bool(
             torch.isfinite(value).all().item()
         ):
-            raise FloatingPointError(
-                f"refusing PPO recovery commit: non-finite {path}"
-            )
+            raise FloatingPointError(f"refusing PPO recovery commit: non-finite {path}")
         return
     if isinstance(value, np.ndarray):
-        if np.issubdtype(value.dtype, np.number) and not bool(
-            np.isfinite(value).all()
-        ):
-            raise FloatingPointError(
-                f"refusing PPO recovery commit: non-finite {path}"
-            )
+        if np.issubdtype(value.dtype, np.number) and not bool(np.isfinite(value).all()):
+            raise FloatingPointError(f"refusing PPO recovery commit: non-finite {path}")
         return
     if isinstance(value, np.generic):
         if np.issubdtype(value.dtype, np.number) and not bool(np.isfinite(value)):
-            raise FloatingPointError(
-                f"refusing PPO recovery commit: non-finite {path}"
-            )
+            raise FloatingPointError(f"refusing PPO recovery commit: non-finite {path}")
         return
     if isinstance(value, numbers.Complex) and not isinstance(value, bool):
         if not (math.isfinite(float(value.real)) and math.isfinite(float(value.imag))):
-            raise FloatingPointError(
-                f"refusing PPO recovery commit: non-finite {path}"
-            )
+            raise FloatingPointError(f"refusing PPO recovery commit: non-finite {path}")
         return
     if isinstance(value, Mapping):
         for key, nested in value.items():
@@ -1649,8 +1859,7 @@ def _assert_finite_update(
             _assert_finite_nested(
                 parameter,
                 path=(
-                    f"optimizer.param_groups[{group_index}]"
-                    f".params[{parameter_index}]"
+                    f"optimizer.param_groups[{group_index}].params[{parameter_index}]"
                 ),
             )
             if parameter.grad is not None:
@@ -1727,9 +1936,16 @@ def _bind_configured_run_identity(
         try:
             manifest = load_manifest(config.run_manifest_path)
         except (OSError, ManifestError) as error:
-            raise RuntimeError(f"cannot reload bound PPO run manifest: {error}") from error
-        if manifest.status != "bound" or manifest.sha256() != config.run_manifest_sha256:
-            raise RuntimeError("bound PPO run manifest changed after configuration resolution")
+            raise RuntimeError(
+                f"cannot reload bound PPO run manifest: {error}"
+            ) from error
+        if (
+            manifest.status != "bound"
+            or manifest.sha256() != config.run_manifest_sha256
+        ):
+            raise RuntimeError(
+                "bound PPO run manifest changed after configuration resolution"
+            )
         return dist.bind_run_manifest(root, manifest)
     return dist.bind_run_contract(
         root,
@@ -1771,7 +1987,10 @@ def train(
     device = config.device
     if device == "auto":
         device = "cuda" if torch.cuda.is_available() else "cpu"
-    print({"event": "learner_start", "device": device, "config": config.__dict__}, flush=True)
+    print(
+        {"event": "learner_start", "device": device, "config": config.__dict__},
+        flush=True,
+    )
 
     root = dist.run_root(config.run_base, config.run_name)
     dist.ensure_run_dirs(root)
@@ -1779,18 +1998,31 @@ def train(
     _validate_w7_config(config)
     run_contract = _bind_configured_run_identity(root, config)
     print({"event": "run_contract", **run_contract}, flush=True)
+    if config.legacy_value_trunk_grad_scale_compat:
+        print(
+            {
+                "event": "legacy_value_trunk_grad_scale_compat",
+                "value_trunk_grad_scale": config.value_trunk_grad_scale,
+                "reason": "pre-field immutable canonical_entity_ppo_run_v2 manifest",
+            },
+            flush=True,
+        )
 
     # 1. TRAINABLE policy + separate FROZEN anchor.  A cold start loads both
     # copies through one equality-checked factory call; a resume intentionally
     # restores the trainable checkpoint while keeping the exact initializer as
     # its immutable anchor.
-    resume_ckpt = find_resume_checkpoint(root) if getattr(config, "resume", True) else None
+    resume_ckpt = (
+        find_resume_checkpoint(root) if getattr(config, "resume", True) else None
+    )
     if resume_ckpt is not None:
         bc_anchor = load_frozen_bc_anchor(
             config.init_checkpoint, architecture=config.architecture, device=device
         )
         resume_step, resume_path = resume_ckpt
-        policy = load_ppo_policy(str(resume_path), architecture=config.architecture, device=device)
+        policy = load_ppo_policy(
+            str(resume_path), architecture=config.architecture, device=device
+        )
         optimizer = make_ppo_optimizer(
             policy,
             learning_rate=config.lr,
@@ -1806,7 +2038,9 @@ def train(
         opt_restored = True
         # current_version comes from version.json (do NOT reset to 0/1 — actors track it).
         published_meta = dist.read_version(root)
-        current_version = published_meta.version if published_meta is not None else resume_step
+        current_version = (
+            published_meta.version if published_meta is not None else resume_step
+        )
         step = int(resume_step)
         print(
             {
@@ -1841,9 +2075,11 @@ def train(
     try:
         league = League.load(str(league_path))
         main_agents = [a for a in league._agents.values() if a.role == "main"]
-        main_id = main_agents[0].id if main_agents else league.add_main(
-            str(dist.current_weights_path(root)), step=step
-        ).id
+        main_id = (
+            main_agents[0].id
+            if main_agents
+            else league.add_main(str(dist.current_weights_path(root)), step=step).id
+        )
     except (FileNotFoundError, OSError, json.JSONDecodeError):
         league = League(
             snapshot_interval=config.league_snapshot_interval,
@@ -1859,7 +2095,9 @@ def train(
         published = dist.publish_weights(root, policy.save, step=step)
         current_version = published.version
         _maybe_commit(volume_commit_fn)
-        print({"event": "published", "version": current_version, "step": step}, flush=True)
+        print(
+            {"event": "published", "version": current_version, "step": step}, flush=True
+        )
     else:
         # The recovery checkpoint commits this input frontier before publishing or
         # deleting it. Finish that deletion idempotently, then republish the exact
@@ -1870,7 +2108,14 @@ def train(
         current_version = published.version
         _commit_or_raise(volume_commit_fn, operation="resume weight publication")
         _restore_rng_state(resume_payload["rng_state"])
-        print({"event": "republished_on_resume", "version": current_version, "step": step}, flush=True)
+        print(
+            {
+                "event": "republished_on_resume",
+                "version": current_version,
+                "step": step,
+            },
+            flush=True,
+        )
 
     baseline_ids: dict[str, str] = {}
     while config.max_steps <= 0 or step < config.max_steps:
@@ -1898,7 +2143,10 @@ def train(
                     expected_run_manifest_sha256=config.run_manifest_sha256,
                 )
             except Exception as exc:
-                print({"event": "sweep_drop_policy_window_error", "error": repr(exc)}, flush=True)
+                print(
+                    {"event": "sweep_drop_policy_window_error", "error": repr(exc)},
+                    flush=True,
+                )
 
         # FIX C2 (train on the FRESHEST data): ask for newest-first so the scanned window is the
         # freshest shards, not the stalest. ``newest_first`` may not exist yet (parallel edit) —
@@ -1989,6 +2237,7 @@ def train(
             behavior_temperature=config.behavior_temperature,
             advantage_normalization=config.advantage_normalization,
             advantage_group_weights=config.advantage_group_weights,
+            value_trunk_grad_scale=config.value_trunk_grad_scale,
         )
 
         # 3f. Every applied update is a recovery point. Commit model + optimizer
@@ -2037,6 +2286,7 @@ def train(
             "beta": beta,
             "mean_return": mean_return,
             "use_vtrace": config.use_vtrace,
+            "value_trunk_grad_scale": config.value_trunk_grad_scale,
             **vtrace_stats,
         }
         print(log, flush=True)
@@ -2102,7 +2352,9 @@ def _checkpoint_eval_league(
     out_path = dist.eval_dir(root) / f"scoreboard_step_{step}.json"
     report = run_scoreboard_eval(str(ckpt_path), str(out_path), config)
     if report is not None:
-        record_eval_into_league(league, main_id, report, baseline_ids=baseline_ids, step=step)
+        record_eval_into_league(
+            league, main_id, report, baseline_ids=baseline_ids, step=step
+        )
         league.save(str(dist.league_dir(root)))
         ids, matrix = league.payoff_matrix()
         cyc = cycling_check(league, baseline_ids, main_id)
@@ -2122,11 +2374,21 @@ def _checkpoint_eval_league(
     if league.should_snapshot_main(main_id, step):
         snap = league.snapshot(main_id, str(ckpt_path), step=step)
         league.save(str(dist.league_dir(root)))
-        print({"event": "league_snapshot_main", "step": step, "frozen_id": snap.id}, flush=True)
+        print(
+            {"event": "league_snapshot_main", "step": step, "frozen_id": snap.id},
+            flush=True,
+        )
     for agent in list(league._agents.values()):
-        if agent.role in ("main_exploiter", "league_exploiter") and league.should_reset_exploiter(agent.id):
+        if agent.role in (
+            "main_exploiter",
+            "league_exploiter",
+        ) and league.should_reset_exploiter(agent.id):
             print(
-                {"event": "league_exploiter_reset_recommended", "step": step, "agent": agent.id},
+                {
+                    "event": "league_exploiter_reset_recommended",
+                    "step": step,
+                    "agent": agent.id,
+                },
                 flush=True,
             )
 

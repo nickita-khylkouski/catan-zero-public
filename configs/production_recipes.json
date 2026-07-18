@@ -21,7 +21,7 @@
     ],
     "train": [
       {
-        "canonical_sha256": "0142bb6e88b39a2852fa0cc548a2f7433d94c974c42b98cac186c16a1ed3286a",
+        "canonical_sha256": "6718db0847b3a3a86a73b3af7c80d3cacf3ffad431e64dba9f69a1a6b61868c6",
         "name": "a1-current-35m-b200",
         "path": "configs/training/a1_current_35m_b200.schema1.json"
       },

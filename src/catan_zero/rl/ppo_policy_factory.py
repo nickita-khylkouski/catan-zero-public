@@ -6,6 +6,7 @@ the research (AlphaStar-style BC warm-start). The KL-to-BC anchor is just a seco
 of the same checkpoint passed to ``ppo_update(..., ema_policy=<frozen bc>, ema_policy_kl_coef=β)``
 — no edit to ``ppo_update`` needed.
 """
+
 from __future__ import annotations
 
 import math
@@ -92,7 +93,16 @@ def load_ppo_policy(
     require_canonical_ppo_architecture(architecture)
     from catan_zero.rl.entity_token_policy import EntityGraphPolicy
 
-    return EntityGraphPolicy.load(checkpoint, device=device)
+    # PPO is a serving/training runtime, not an upgrader.  Route every parent,
+    # anchor, and resume load through the same executable-forward guard used by
+    # evaluation.  Historical checkpoints remain supported only through the
+    # guard's explicit reviewed-checkpoint compatibility table; malformed or
+    # unstamped unknown checkpoints fail closed.
+    return EntityGraphPolicy.load(
+        checkpoint,
+        device=device,
+        enforce_runtime_semantics=True,
+    )
 
 
 def load_frozen_bc_anchor(
@@ -133,7 +143,9 @@ def load_exact_parent_and_frozen_anchor(
     if parent_state.keys() != anchor_state.keys() or any(
         not torch.equal(parent_state[name], anchor_state[name]) for name in parent_state
     ):
-        raise RuntimeError("PPO parent and frozen anchor did not load identical checkpoint state")
+        raise RuntimeError(
+            "PPO parent and frozen anchor did not load identical checkpoint state"
+        )
     parent_parameters = dict(parent.model.named_parameters())
     anchor_parameters = dict(anchor.model.named_parameters())
     if parent_parameters.keys() != anchor_parameters.keys() or any(

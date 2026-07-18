@@ -59,7 +59,9 @@ def _resolve_device(device: str | None):
         requested = "cuda" if torch.cuda.is_available() else "cpu"
     resolved = torch.device(requested)
     if resolved.type == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError(f"requested CUDA device {device!r}, but CUDA is not available")
+        raise RuntimeError(
+            f"requested CUDA device {device!r}, but CUDA is not available"
+        )
     return resolved
 
 
@@ -130,9 +132,13 @@ def _ppo_reference_array(
     flattened: list[float] = []
     for trajectory in trajectories:
         reference = getattr(trajectory, reference_attr, None)
-        values = reference if reference is not None and len(reference) > 0 else getattr(
-            trajectory,
-            fallback_attr,
+        values = (
+            reference
+            if reference is not None and len(reference) > 0
+            else getattr(
+                trajectory,
+                fallback_attr,
+            )
         )
         expected = len(trajectory.samples)
         if len(values) != expected:
@@ -295,7 +301,11 @@ def _apply_advantage_group_weights(
     )
     scalars = np.where(np.isfinite(scalars), scalars, 1.0)
     scalars = np.clip(scalars, 0.0, 10.0)
-    return advantages.astype(np.float32, copy=True) * scalars, len(parsed), float(scalars.mean())
+    return (
+        advantages.astype(np.float32, copy=True) * scalars,
+        len(parsed),
+        float(scalars.mean()),
+    )
 
 
 class TorchPPOPolicy:
@@ -343,7 +353,9 @@ class TorchPPOPolicy:
         self.q_action_bias = None
         if _is_candidate_architecture(architecture):
             if action_features is None:
-                raise ValueError(f"{architecture} architecture requires action_features")
+                raise ValueError(
+                    f"{architecture} architecture requires action_features"
+                )
             action_features = np.asarray(action_features, dtype=np.float32)
             if action_features.shape[0] != action_size:
                 raise ValueError("action_features row count must match action_size")
@@ -352,7 +364,9 @@ class TorchPPOPolicy:
                 dtype=torch.float32,
                 device=self.device,
             )
-            feature_size = int(action_features.shape[1]) + self.context_action_feature_size
+            feature_size = (
+                int(action_features.shape[1]) + self.context_action_feature_size
+            )
             self.actor = nn.Linear(hidden_size, hidden_size).to(self.device)
             self.action_encoder = nn.Sequential(
                 nn.Linear(feature_size, hidden_size),
@@ -469,13 +483,13 @@ class TorchPPOPolicy:
             ]
             action_index = int(action.item())
             return (
-            action_index,
-            float(dist.log_prob(action).item()),
-            float(value.item()),
-            float(q_values[0, action_index].item()),
-            valid_probs.detach().cpu().numpy().astype(np.float32),
-            valid_q_values.detach().cpu().numpy().astype(np.float32),
-        )
+                action_index,
+                float(dist.log_prob(action).item()),
+                float(value.item()),
+                float(q_values[0, action_index].item()),
+                valid_probs.detach().cpu().numpy().astype(np.float32),
+                valid_q_values.detach().cpu().numpy().astype(np.float32),
+            )
 
     def _observation_tensor(self, observation: np.ndarray):
         import torch
@@ -516,9 +530,9 @@ class TorchPPOPolicy:
                 action_features = action_features + self.action_id_embedding(
                     action_ids,
                 ).unsqueeze(0)
-            logits = (
-                state_features.unsqueeze(1) * action_features
-            ).sum(dim=-1) / math.sqrt(self.hidden_size)
+            logits = (state_features.unsqueeze(1) * action_features).sum(
+                dim=-1
+            ) / math.sqrt(self.hidden_size)
             logits = logits + self.action_bias(flat_features).reshape(
                 int(observations.shape[0]),
                 self.action_size,
@@ -547,9 +561,9 @@ class TorchPPOPolicy:
                 self.action_size,
                 self.hidden_size,
             )
-            values = (
-                state_features.unsqueeze(1) * action_features
-            ).sum(dim=-1) / math.sqrt(self.hidden_size)
+            values = (state_features.unsqueeze(1) * action_features).sum(
+                dim=-1
+            ) / math.sqrt(self.hidden_size)
             return values + self.q_action_bias(flat_features).reshape(
                 int(observations.shape[0]),
                 self.action_size,
@@ -581,7 +595,9 @@ class TorchPPOPolicy:
             if context.ndim == 2:
                 context = context.unsqueeze(0)
             if context.shape[0] != batch_size or context.shape[1] != self.action_size:
-                raise ValueError("action context features must be [batch, actions, features]")
+                raise ValueError(
+                    "action context features must be [batch, actions, features]"
+                )
             if context.shape[2] != self.context_action_feature_size:
                 context = _resize_context_tensor(
                     context,
@@ -693,10 +709,7 @@ class TorchPPOPolicy:
             policy.q_head.load_state_dict(copy.deepcopy(self.q_head.state_dict()))
         if policy.q_state is not None and self.q_state is not None:
             policy.q_state.load_state_dict(copy.deepcopy(self.q_state.state_dict()))
-        if (
-            policy.q_action_encoder is not None
-            and self.q_action_encoder is not None
-        ):
+        if policy.q_action_encoder is not None and self.q_action_encoder is not None:
             policy.q_action_encoder.load_state_dict(
                 copy.deepcopy(self.q_action_encoder.state_dict())
             )
@@ -896,9 +909,7 @@ def collect_ppo_episode(
     old_action_q_values: list[np.ndarray] = []
     shaped_rewards: list[float] = []
     players: list[str] = []
-    shaping_value_fn = (
-        _make_catanatron_value_fn() if value_shaping_coef > 0.0 else None
-    )
+    shaping_value_fn = _make_catanatron_value_fn() if value_shaping_coef > 0.0 else None
     opponent_names = {
         str(seat): str(getattr(opponent, "name", opponent.__class__.__name__))
         for seat, opponent in opponents.items()
@@ -1013,14 +1024,11 @@ def collect_ppo_episode(
             decisions += 1
         bootstrap_values = None
         bootstrap_sample = None
-        time_limit_truncated = (
-            not terminated
-            and (
-                decisions >= max_decisions
-                or (
-                    truncated
-                    and env.invalid_actions_count <= env.config.max_invalid_actions
-                )
+        time_limit_truncated = not terminated and (
+            decisions >= max_decisions
+            or (
+                truncated
+                and env.invalid_actions_count <= env.config.max_invalid_actions
             )
         )
         if not terminated and decisions >= max_decisions:
@@ -1097,7 +1105,11 @@ def _bootstrap_values(
     if callable(entity_outputs_from_env) and env is not None and info is not None:
         current_player = str(info.get("current_player") or "")
         valid_actions = tuple(int(action) for action in info.get("valid_actions", ()))
-        if current_player in players and current_player in observations and valid_actions:
+        if (
+            current_player in players
+            and current_player in observations
+            and valid_actions
+        ):
             with torch.no_grad():
                 outputs, raw_entity_features, _legal_context = entity_outputs_from_env(
                     env,
@@ -1113,7 +1125,9 @@ def _bootstrap_values(
                 if key != "schema"
             }
             return values, StepSample(
-                observation=np.asarray(observations[current_player], dtype=np.float64).copy(),
+                observation=np.asarray(
+                    observations[current_player], dtype=np.float64
+                ).copy(),
                 valid_actions=valid_actions,
                 action=valid_actions[0],
                 player=current_player,
@@ -1137,15 +1151,15 @@ def _bootstrap_values(
             _, value = policy.forward(obs, None)
             values[player] = float(value.item())
     current_player = str((info or {}).get("current_player") or "")
-    valid_actions = tuple(int(action) for action in (info or {}).get("valid_actions", ()))
+    valid_actions = tuple(
+        int(action) for action in (info or {}).get("valid_actions", ())
+    )
     sample = None
-    if (
-        current_player in players
-        and current_player in observations
-        and valid_actions
-    ):
+    if current_player in players and current_player in observations and valid_actions:
         sample = StepSample(
-            observation=np.asarray(observations[current_player], dtype=np.float64).copy(),
+            observation=np.asarray(
+                observations[current_player], dtype=np.float64
+            ).copy(),
             valid_actions=valid_actions,
             action=valid_actions[0],
             player=current_player,
@@ -1279,6 +1293,7 @@ def ppo_update(
     behavior_temperature: float = 1.0,
     advantage_normalization: str = "global",
     advantage_group_weights: Any | None = None,
+    value_trunk_grad_scale: float = 1.0,
 ) -> dict[str, float]:
     import torch
     from torch import nn
@@ -1305,6 +1320,7 @@ def ppo_update(
             behavior_temperature=behavior_temperature,
             advantage_normalization=advantage_normalization,
             advantage_group_weights=advantage_group_weights,
+            value_trunk_grad_scale=value_trunk_grad_scale,
         )
 
     samples = [sample for trajectory in trajectories for sample in trajectory.samples]
@@ -1329,6 +1345,7 @@ def ppo_update(
             "samples_before_filter": 0.0,
             "advantage_filter_kept_fraction": 1.0,
             "advantage_filter_threshold": 0.0,
+            "value_trunk_grad_scale": float(value_trunk_grad_scale),
         }
     returns = np.asarray(
         [ret for trajectory in trajectories for ret in trajectory.returns],
@@ -1371,9 +1388,8 @@ def ppo_update(
             gamma=q_expected_sarsa_gamma,
         )
         q_targets = (
-            (1.0 - q_expected_sarsa_mix) * q_targets
-            + q_expected_sarsa_mix * sarsa_targets
-        )
+            1.0 - q_expected_sarsa_mix
+        ) * q_targets + q_expected_sarsa_mix * sarsa_targets
     if q_advantage_mix > 0.0:
         q_advantage_mix = min(max(float(q_advantage_mix), 0.0), 1.0)
         q_baselines = _old_q_policy_baselines(
@@ -1382,9 +1398,8 @@ def ppo_update(
         )
         q_advantages = old_q_values - q_baselines
         raw_advantages = (
-            (1.0 - q_advantage_mix) * raw_advantages
-            + q_advantage_mix * q_advantages
-        )
+            1.0 - q_advantage_mix
+        ) * raw_advantages + q_advantage_mix * q_advantages
     # A sole legal action has probability one under every masked policy. Such a
     # row is useful critic evidence, but its PPO ratio and policy gradient are
     # identically fixed, so it must not rank or normalize policy advantages.
@@ -1392,7 +1407,9 @@ def ppo_update(
         [len(sample.valid_actions) > 1 for sample in samples],
         dtype=np.bool_,
     )
-    advantage_normalization_mode = str(advantage_normalization or "global").strip().lower()
+    advantage_normalization_mode = (
+        str(advantage_normalization or "global").strip().lower()
+    )
     advantage_group_count = 0
     advantage_group_labels = _advantage_group_labels(trajectories)
     if advantage_normalization_mode not in {"global", "standard", "default"}:
@@ -1519,7 +1536,9 @@ def ppo_update(
             batch_old_values = old_values_t[batch_idx]
             batch_old_q_values = old_q_values_t[batch_idx]
             batch_old_policy = old_policy_t[batch_idx]
-            batch_ema_policy = ema_policy_t[batch_idx] if ema_policy_t is not None else None
+            batch_ema_policy = (
+                ema_policy_t[batch_idx] if ema_policy_t is not None else None
+            )
             batch_advantages = advantages[batch_idx]
             batch_policy_active = policy_active[batch_idx]
             batch_valid = [valid_actions[int(i)] for i in batch_idx]
@@ -1537,7 +1556,10 @@ def ppo_update(
             log_probs = dist.log_prob(batch_actions)
             ratio = torch.exp(log_probs - batch_old_log_probs)
             unclipped = ratio * batch_advantages
-            clipped = torch.clamp(ratio, 1.0 - clip_ratio, 1.0 + clip_ratio) * batch_advantages
+            clipped = (
+                torch.clamp(ratio, 1.0 - clip_ratio, 1.0 + clip_ratio)
+                * batch_advantages
+            )
             per_sample_policy_loss = -torch.min(unclipped, clipped)
             if bool(batch_policy_active.any()):
                 policy_loss = per_sample_policy_loss[batch_policy_active].mean()
@@ -1551,7 +1573,9 @@ def ppo_update(
             )
             if q_value_coef > 0.0:
                 q_values = policy.q_values(batch_obs, batch_context)
-                action_q_values = q_values.gather(1, batch_actions.unsqueeze(1)).squeeze(1)
+                action_q_values = q_values.gather(
+                    1, batch_actions.unsqueeze(1)
+                ).squeeze(1)
                 q_value_loss = _ppo_value_loss(
                     action_q_values,
                     batch_q_targets,
@@ -1585,15 +1609,10 @@ def ppo_update(
                 log_policy = nn.functional.log_softmax(masked, dim=-1)
                 per_sample_old_policy_kl = (
                     batch_old_policy
-                    * (
-                        torch.log(torch.clamp(batch_old_policy, min=1e-8))
-                        - log_policy
-                    )
+                    * (torch.log(torch.clamp(batch_old_policy, min=1e-8)) - log_policy)
                 ).sum(dim=-1)
                 if bool(batch_policy_active.any()):
-                    old_policy_kl = per_sample_old_policy_kl[
-                        batch_policy_active
-                    ].mean()
+                    old_policy_kl = per_sample_old_policy_kl[batch_policy_active].mean()
                 else:
                     old_policy_kl = per_sample_old_policy_kl.new_tensor(0.0)
             else:
@@ -1604,15 +1623,10 @@ def ppo_update(
                     log_policy = nn.functional.log_softmax(masked, dim=-1)
                 per_sample_ema_policy_kl = (
                     batch_ema_policy
-                    * (
-                        torch.log(torch.clamp(batch_ema_policy, min=1e-8))
-                        - log_policy
-                    )
+                    * (torch.log(torch.clamp(batch_ema_policy, min=1e-8)) - log_policy)
                 ).sum(dim=-1)
                 if bool(batch_policy_active.any()):
-                    ema_policy_kl = per_sample_ema_policy_kl[
-                        batch_policy_active
-                    ].mean()
+                    ema_policy_kl = per_sample_ema_policy_kl[batch_policy_active].mean()
                 else:
                     ema_policy_kl = per_sample_ema_policy_kl.new_tensor(0.0)
             else:
@@ -1653,15 +1667,15 @@ def ppo_update(
         "q_chosen_return_corr": q_diagnostics["q_chosen_return_corr"],
         "q_legal_std": q_diagnostics["q_legal_std"],
         "q_legal_spread_entropy": q_diagnostics["q_legal_spread_entropy"],
-        "q_advantage_sign_agreement": q_diagnostics[
-            "q_advantage_sign_agreement"
-        ],
+        "q_advantage_sign_agreement": q_diagnostics["q_advantage_sign_agreement"],
         "entropy": last_entropy,
         "approx_kl": last_approx_kl,
         "old_policy_kl": last_old_policy_kl,
         "ema_policy_kl": last_ema_policy_kl,
         "clip_fraction": last_clip_fraction,
-        "mean_shaped_reward": float(shaped_rewards.mean()) if len(shaped_rewards) else 0.0,
+        "mean_shaped_reward": float(shaped_rewards.mean())
+        if len(shaped_rewards)
+        else 0.0,
         "minibatches": float(minibatches),
         "early_stop": 1.0 if early_stop else 0.0,
         "samples_before_filter": float(samples_before_filter),
@@ -1674,7 +1688,9 @@ def ppo_update(
         "advantage_groups": float(advantage_group_count),
         "advantage_group_weight_count": float(advantage_group_weight_count),
         "advantage_group_weight_mean": float(advantage_group_weight_mean),
-        "policy_active_fraction": float(policy_active_np.mean()) if len(policy_active_np) else 1.0,
+        "policy_active_fraction": float(policy_active_np.mean())
+        if len(policy_active_np)
+        else 1.0,
     }
 
 
@@ -1752,9 +1768,14 @@ def _standardize_advantages_excluding_forced(advantages, policy_active):
     """
     import torch
 
-    stats_advantages = advantages[policy_active] if bool(policy_active.any()) else advantages
+    stats_advantages = (
+        advantages[policy_active] if bool(policy_active.any()) else advantages
+    )
     advantage_std = stats_advantages.std(unbiased=False)
-    if bool(torch.isfinite(advantage_std).item()) and float(advantage_std.item()) > 1e-8:
+    if (
+        bool(torch.isfinite(advantage_std).item())
+        and float(advantage_std.item()) > 1e-8
+    ):
         return (advantages - stats_advantages.mean()) / advantage_std
     return advantages - stats_advantages.mean()
 
@@ -1780,6 +1801,7 @@ def _ppo_update_entity_graph(
     behavior_temperature: float = 1.0,
     advantage_normalization: str = "global",
     advantage_group_weights: Any | None = None,
+    value_trunk_grad_scale: float = 1.0,
 ) -> dict[str, float]:
     # PPO ratios are only meaningful when the learner recomputes the exact
     # behavior distribution recorded by actors. Actors serve EntityGraphPolicy
@@ -1810,6 +1832,7 @@ def _ppo_update_entity_graph(
             behavior_temperature=behavior_temperature,
             advantage_normalization=advantage_normalization,
             advantage_group_weights=advantage_group_weights,
+            value_trunk_grad_scale=value_trunk_grad_scale,
         )
     finally:
         policy.model.eval()
@@ -1836,9 +1859,16 @@ def _ppo_update_entity_graph_body(
     behavior_temperature: float = 1.0,
     advantage_normalization: str = "global",
     advantage_group_weights: Any | None = None,
+    value_trunk_grad_scale: float = 1.0,
 ) -> dict[str, float]:
     import torch
     from torch import nn
+
+    value_trunk_grad_scale = float(value_trunk_grad_scale)
+    if not math.isfinite(value_trunk_grad_scale) or not (
+        0.0 <= value_trunk_grad_scale <= 1.0
+    ):
+        raise ValueError("value_trunk_grad_scale must be finite and in [0, 1]")
 
     samples = [sample for trajectory in trajectories for sample in trajectory.samples]
     if not samples:
@@ -1862,6 +1892,7 @@ def _ppo_update_entity_graph_body(
             "samples_before_filter": 0.0,
             "advantage_filter_kept_fraction": 1.0,
             "advantage_filter_threshold": 0.0,
+            "value_trunk_grad_scale": float(value_trunk_grad_scale),
         }
     missing_entity = sum(1 for sample in samples if sample.entity_features is None)
     if missing_entity:
@@ -1902,7 +1933,9 @@ def _ppo_update_entity_graph_body(
         [len(sample.valid_actions) > 1 for sample in samples],
         dtype=np.bool_,
     )
-    advantage_normalization_mode = str(advantage_normalization or "global").strip().lower()
+    advantage_normalization_mode = (
+        str(advantage_normalization or "global").strip().lower()
+    )
     advantage_group_count = 0
     advantage_group_labels = _advantage_group_labels(trajectories)
     if advantage_normalization_mode not in {"global", "standard", "default"}:
@@ -1970,9 +2003,15 @@ def _ppo_update_entity_graph_body(
     optimizer = optimizer or make_ppo_optimizer(policy, learning_rate=learning_rate)
     returns_t = torch.as_tensor(returns, dtype=torch.float32, device=policy.device)
     q_targets_t = torch.as_tensor(q_targets, dtype=torch.float32, device=policy.device)
-    old_log_probs_t = torch.as_tensor(old_log_probs, dtype=torch.float32, device=policy.device)
-    old_values_t = torch.as_tensor(old_values, dtype=torch.float32, device=policy.device)
-    old_q_values_t = torch.as_tensor(old_q_values, dtype=torch.float32, device=policy.device)
+    old_log_probs_t = torch.as_tensor(
+        old_log_probs, dtype=torch.float32, device=policy.device
+    )
+    old_values_t = torch.as_tensor(
+        old_values, dtype=torch.float32, device=policy.device
+    )
+    old_q_values_t = torch.as_tensor(
+        old_q_values, dtype=torch.float32, device=policy.device
+    )
     policy_active = torch.as_tensor(policy_active_np, device=policy.device)
 
     behavior_temperature = max(float(behavior_temperature), 1.0e-6)
@@ -2006,11 +2045,10 @@ def _ppo_update_entity_graph_body(
             batch_advantages = advantages[batch_idx]
             batch_policy_active = policy_active[batch_idx]
 
-            outputs = _entity_graph_outputs(
-                policy,
-                batch_samples,
-                return_q=q_value_coef > 0.0,
-            )
+            output_kwargs = {"return_q": q_value_coef > 0.0}
+            if value_trunk_grad_scale != 1.0:
+                output_kwargs["value_trunk_grad_scale"] = value_trunk_grad_scale
+            outputs = _entity_graph_outputs(policy, batch_samples, **output_kwargs)
             logits = outputs["logits"]
             values = outputs["value"]
             valid_mask = _entity_behavior_valid_mask(batch_samples, logits)
@@ -2023,7 +2061,10 @@ def _ppo_update_entity_graph_body(
             log_probs = dist.log_prob(batch_actions)
             ratio = torch.exp(log_probs - batch_old_log_probs)
             unclipped = ratio * batch_advantages
-            clipped = torch.clamp(ratio, 1.0 - clip_ratio, 1.0 + clip_ratio) * batch_advantages
+            clipped = (
+                torch.clamp(ratio, 1.0 - clip_ratio, 1.0 + clip_ratio)
+                * batch_advantages
+            )
             per_sample_policy_loss = -torch.min(unclipped, clipped)
             # FIX A9: forced (legal_count == 1) rows have ratio == 1 identically -- zero policy
             # gradient by construction -- so exclude them from the policy-loss MEAN instead of
@@ -2041,7 +2082,9 @@ def _ppo_update_entity_graph_body(
             )
             if q_value_coef > 0.0:
                 q_values = outputs["q_values"]
-                action_q_values = q_values.gather(1, batch_actions.unsqueeze(1)).squeeze(1)
+                action_q_values = q_values.gather(
+                    1, batch_actions.unsqueeze(1)
+                ).squeeze(1)
                 q_value_loss = _ppo_value_loss(
                     action_q_values,
                     batch_q_targets,
@@ -2072,7 +2115,9 @@ def _ppo_update_entity_graph_body(
                     clip_fraction = per_sample_clipped.new_tensor(0.0)
             if ema_policy is not None and ema_policy_kl_coef > 0.0:
                 with torch.no_grad():
-                    ema_outputs = _entity_graph_outputs(ema_policy, batch_samples, return_q=False)
+                    ema_outputs = _entity_graph_outputs(
+                        ema_policy, batch_samples, return_q=False
+                    )
                     ema_logits = _behavior_policy_logits(
                         ema_outputs["logits"],
                         behavior_temperature,
@@ -2088,9 +2133,7 @@ def _ppo_update_entity_graph_body(
                     * (torch.log(torch.clamp(ema_policy_t, min=1e-8)) - log_policy)
                 ).sum(dim=-1)
                 if bool(batch_policy_active.any()):
-                    ema_policy_kl = per_sample_ema_policy_kl[
-                        batch_policy_active
-                    ].mean()
+                    ema_policy_kl = per_sample_ema_policy_kl[batch_policy_active].mean()
                 else:
                     ema_policy_kl = per_sample_ema_policy_kl.new_tensor(0.0)
             else:
@@ -2135,7 +2178,9 @@ def _ppo_update_entity_graph_body(
         "old_policy_kl": last_old_policy_kl,
         "ema_policy_kl": last_ema_policy_kl,
         "clip_fraction": last_clip_fraction,
-        "mean_shaped_reward": float(shaped_rewards.mean()) if len(shaped_rewards) else 0.0,
+        "mean_shaped_reward": float(shaped_rewards.mean())
+        if len(shaped_rewards)
+        else 0.0,
         "minibatches": float(minibatches),
         "early_stop": 1.0 if early_stop else 0.0,
         "samples_before_filter": float(samples_before_filter),
@@ -2146,13 +2191,18 @@ def _ppo_update_entity_graph_body(
         "advantage_groups": float(advantage_group_count),
         "advantage_group_weight_count": float(advantage_group_weight_count),
         "advantage_group_weight_mean": float(advantage_group_weight_mean),
-        "policy_active_fraction": float(policy_active_np.mean()) if len(policy_active_np) else 1.0,
+        "policy_active_fraction": float(policy_active_np.mean())
+        if len(policy_active_np)
+        else 1.0,
+        "value_trunk_grad_scale": float(value_trunk_grad_scale),
     }
 
 
 def _entity_action_column(sample: StepSample) -> int:
     try:
-        return tuple(int(action) for action in sample.valid_actions).index(int(sample.action))
+        return tuple(int(action) for action in sample.valid_actions).index(
+            int(sample.action)
+        )
     except ValueError as error:
         raise ValueError(
             f"sample action {sample.action} is not in valid_actions={sample.valid_actions}"
@@ -2171,13 +2221,22 @@ def _entity_behavior_valid_mask(samples: list[StepSample], logits):
     return torch.arange(width, device=logits.device).unsqueeze(0) < counts.unsqueeze(1)
 
 
-def _entity_graph_outputs(policy: Any, samples: list[StepSample], *, return_q: bool = False):
+def _entity_graph_outputs(
+    policy: Any,
+    samples: list[StepSample],
+    *,
+    return_q: bool = False,
+    value_trunk_grad_scale: float = 1.0,
+):
     batch, legal_action_ids, legal_action_context = _entity_graph_batch(samples, policy)
+    forward_kwargs = {"return_q": return_q}
+    if float(value_trunk_grad_scale) != 1.0:
+        forward_kwargs["value_trunk_grad_scale"] = float(value_trunk_grad_scale)
     return policy.forward_legal_np(
         batch,
         legal_action_ids,
         legal_action_context,
-        return_q=return_q,
+        **forward_kwargs,
     )
 
 
@@ -2193,10 +2252,14 @@ def _entity_graph_batch(
         for sample in samples
         if sample.entity_features is not None
     )
-    context_size = int(getattr(policy, "context_action_feature_size", CONTEXT_ACTION_FEATURE_SIZE))
+    context_size = int(
+        getattr(policy, "context_action_feature_size", CONTEXT_ACTION_FEATURE_SIZE)
+    )
     legal_feature_size = int(getattr(policy.config, "legal_action_feature_size"))
     legal_action_ids = np.full((len(samples), max_legal), -1, dtype=np.int64)
-    legal_action_context = np.zeros((len(samples), max_legal, context_size), dtype=np.float32)
+    legal_action_context = np.zeros(
+        (len(samples), max_legal, context_size), dtype=np.float32
+    )
     batch_lists: dict[str, list[np.ndarray]] = {}
     for row, sample in enumerate(samples):
         entity = sample.entity_features
@@ -2213,7 +2276,9 @@ def _entity_graph_batch(
             context_array = np.asarray(context, dtype=np.float32)
             selected_context = context_array[list(valid_actions), :]
             if selected_context.shape[1] != context_size:
-                selected_context = _resize_context_array(selected_context, feature_size=context_size)
+                selected_context = _resize_context_array(
+                    selected_context, feature_size=context_size
+                )
         legal_action_context[row, :legal_count, :] = selected_context
 
         for key, value in entity.items():
@@ -2227,14 +2292,14 @@ def _entity_graph_batch(
                 # is a valid hex/vertex/edge/player id, so zero-padding makes a
                 # padded action look targeted and target-aware policies reject
                 # ordinary mixed-legal-width batches before the forward pass.
-                padded_targets = np.full(
-                    (max_legal, arr.shape[1]), -1, dtype=arr.dtype
-                )
+                padded_targets = np.full((max_legal, arr.shape[1]), -1, dtype=arr.dtype)
                 padded_targets[:legal_count, :] = arr[:legal_count]
                 arr = padded_targets
             elif key == "legal_action_mask":
                 padded_mask = np.zeros((max_legal,), dtype=np.bool_)
-                padded_mask[:legal_count] = np.asarray(arr, dtype=np.bool_)[:legal_count]
+                padded_mask[:legal_count] = np.asarray(arr, dtype=np.bool_)[
+                    :legal_count
+                ]
                 arr = padded_mask
             elif key == "event_tokens":
                 padded_events = np.zeros((max_events, arr.shape[1]), dtype=np.float32)
@@ -2247,7 +2312,9 @@ def _entity_graph_batch(
             elif key == "event_mask":
                 padded_event_mask = np.zeros((max_events,), dtype=np.bool_)
                 event_count = min(max_events, int(arr.shape[0]))
-                padded_event_mask[:event_count] = np.asarray(arr, dtype=np.bool_)[:event_count]
+                padded_event_mask[:event_count] = np.asarray(arr, dtype=np.bool_)[
+                    :event_count
+                ]
                 arr = padded_event_mask
             batch_lists.setdefault(key, []).append(arr)
     batch = {key: np.stack(values, axis=0) for key, values in batch_lists.items()}
@@ -2269,7 +2336,7 @@ def _dense_old_policy_tensor(
         dense[row, np.asarray(actions, dtype=np.int64)] = np.asarray(
             probs,
             dtype=np.float32,
-    )
+        )
     return torch.as_tensor(dense, dtype=torch.float32, device=device)
 
 
@@ -2513,10 +2580,9 @@ def _ppo_q_diagnostics(
     for trajectory in trajectories:
         trajectory_q_values = trajectory.old_q_values
         action_q_values = trajectory.old_action_q_values
-        has_chosen_q_values = (
-            trajectory_q_values is not None
-            and len(trajectory_q_values) == len(trajectory.samples)
-        )
+        has_chosen_q_values = trajectory_q_values is not None and len(
+            trajectory_q_values
+        ) == len(trajectory.samples)
         for row, sample in enumerate(trajectory.samples):
             q_value = None
             if has_chosen_q_values:
@@ -2602,9 +2668,7 @@ def _normalized_q_spread_entropy(q_values: np.ndarray) -> float:
     if not math.isfinite(total) or total <= 0.0:
         return 0.0
     probabilities = weights / total
-    entropy = -float(
-        np.sum(probabilities * np.log(np.clip(probabilities, 1e-12, 1.0)))
-    )
+    entropy = -float(np.sum(probabilities * np.log(np.clip(probabilities, 1e-12, 1.0))))
     return float(entropy / math.log(float(q_values.size)))
 
 
@@ -2613,11 +2677,7 @@ def _action_context_features_tensor(samples: list[StepSample], policy: TorchPPOP
 
     action_size = int(getattr(policy, "action_size", 0))
     context_size = int(getattr(policy, "context_action_feature_size", 0))
-    if (
-        context_size <= 0
-        or action_size <= 0
-        or not samples
-    ):
+    if context_size <= 0 or action_size <= 0 or not samples:
         return None
     rows = []
     for sample in samples:
@@ -2642,8 +2702,12 @@ def _action_context_features_tensor(samples: list[StepSample], policy: TorchPPOP
     )
 
 
-def _policy_observation_array(policy: TorchPPOPolicy, samples: list[StepSample]) -> np.ndarray:
-    raw = np.stack([sample.observation for sample in samples], axis=0).astype(np.float32)
+def _policy_observation_array(
+    policy: TorchPPOPolicy, samples: list[StepSample]
+) -> np.ndarray:
+    raw = np.stack([sample.observation for sample in samples], axis=0).astype(
+        np.float32
+    )
     normalizer = getattr(policy, "normalize_observation_array", None)
     if callable(normalizer):
         return np.asarray(normalizer(raw), dtype=np.float32)
@@ -2716,13 +2780,13 @@ def make_ppo_optimizer(
             if not parameter.requires_grad:
                 continue
             destination = (
-                head_parameters
-                if name.startswith(head_prefixes)
-                else trunk_parameters
+                head_parameters if name.startswith(head_prefixes) else trunk_parameters
             )
             destination.append(parameter)
         if not trunk_parameters or not head_parameters:
-            raise ValueError("entity_graph PPO optimizer could not partition trunk and heads")
+            raise ValueError(
+                "entity_graph PPO optimizer could not partition trunk and heads"
+            )
         return torch.optim.Adam(
             [
                 {
@@ -2863,7 +2927,11 @@ def imitation_update(
                 )
             else:
                 value_loss = values.new_tensor(0.0)
-            if score_coef > 0.0 and score_targets_t is not None and score_mask_t is not None:
+            if (
+                score_coef > 0.0
+                and score_targets_t is not None
+                and score_mask_t is not None
+            ):
                 score_loss = _score_margin_loss(
                     masked,
                     score_targets_t[batch_idx],
@@ -2876,7 +2944,9 @@ def imitation_update(
             optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(
-                _policy_parameters(policy, include_critic=returns_t is not None and value_coef > 0.0),
+                _policy_parameters(
+                    policy, include_critic=returns_t is not None and value_coef > 0.0
+                ),
                 1.0,
             )
             optimizer.step()
@@ -3022,7 +3092,9 @@ def _action_feature_vector(
     receive_total = float(receive.sum())
     features[cursor] = give_total / 4.0
     features[cursor + 1] = receive_total / 4.0
-    features[cursor + 2] = 1.0 if action_type in ("offer_trade", "MARITIME_TRADE") else 0.0
+    features[cursor + 2] = (
+        1.0 if action_type in ("offer_trade", "MARITIME_TRADE") else 0.0
+    )
     features[cursor + 3] = 1.0 if value is None else 0.0
     return features
 
@@ -3090,7 +3162,9 @@ def _target_policy_tensor(
     if not has_soft_targets:
         return None
     hard_target_weight = min(max(float(hard_target_weight), 0.0), 1.0)
-    targets = torch.zeros((len(samples), action_size), dtype=torch.float32, device=device)
+    targets = torch.zeros(
+        (len(samples), action_size), dtype=torch.float32, device=device
+    )
     for row, sample in enumerate(samples):
         if sample.target_policy:
             total = 0.0
@@ -3121,7 +3195,9 @@ def _target_score_tensors(
 
     if not any(sample.target_scores for sample in samples):
         return None, None
-    targets = torch.zeros((len(samples), action_size), dtype=torch.float32, device=device)
+    targets = torch.zeros(
+        (len(samples), action_size), dtype=torch.float32, device=device
+    )
     mask = torch.zeros((len(samples), action_size), dtype=torch.bool, device=device)
     for row, sample in enumerate(samples):
         if not sample.target_scores:
@@ -3131,7 +3207,11 @@ def _target_score_tensors(
         for action, score in sample.target_scores.items():
             action_index = int(action)
             score_value = float(score)
-            if action_index in valid and 0 <= action_index < action_size and np.isfinite(score_value):
+            if (
+                action_index in valid
+                and 0 <= action_index < action_size
+                and np.isfinite(score_value)
+            ):
                 scored.append((action_index, score_value))
         if len(scored) < 2:
             continue
@@ -3209,8 +3289,7 @@ def _sample_weight_tensor(samples: list[StepSample], device: Any):
     import torch
 
     weights = [
-        max(0.0, float(getattr(sample, "sample_weight", 1.0)))
-        for sample in samples
+        max(0.0, float(getattr(sample, "sample_weight", 1.0))) for sample in samples
     ]
     if not any(weight > 0.0 for weight in weights):
         weights = [1.0 for _ in samples]
@@ -3254,7 +3333,9 @@ def _normalize_observation(observation: np.ndarray) -> np.ndarray:
     return normalized
 
 
-def _resize_observation(observation: np.ndarray, *, observation_size: int) -> np.ndarray:
+def _resize_observation(
+    observation: np.ndarray, *, observation_size: int
+) -> np.ndarray:
     x = np.asarray(observation, dtype=np.float32)
     if x.shape[0] == observation_size:
         return x
@@ -3326,14 +3407,10 @@ def _gae_returns(
         raise ValueError("players and shaped_rewards must have the same length")
     bootstrap_values = bootstrap_values or {}
     next_value = {
-        player: float(bootstrap_values.get(player, 0.0))
-        for player in rewards
+        player: float(bootstrap_values.get(player, 0.0)) for player in rewards
     }
     next_advantage = {player: 0.0 for player in rewards}
-    has_future_sample = {
-        player: player in bootstrap_values
-        for player in rewards
-    }
+    has_future_sample = {player: player in bootstrap_values for player in rewards}
     returns = [0.0] * len(players)
     advantages = [0.0] * len(players)
     for idx in range(len(players) - 1, -1, -1):
@@ -3344,13 +3421,7 @@ def _gae_returns(
         nonterminal = 1.0 if has_future_sample[player] else 0.0
         value = float(values[idx])
         delta = reward + gamma * next_value[player] * nonterminal - value
-        advantage = (
-            delta
-            + gamma
-            * gae_lambda
-            * nonterminal
-            * next_advantage[player]
-        )
+        advantage = delta + gamma * gae_lambda * nonterminal * next_advantage[player]
         advantages[idx] = advantage
         returns[idx] = advantage + value
         next_value[player] = value

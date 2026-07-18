@@ -38,13 +38,17 @@ def _collect_real_samples(n: int):
                     valid_actions=valid_actions,
                     action=int(valid_actions[0]),
                     player=player,
-                    action_context_features=build_action_context_feature_table(env, info),
+                    action_context_features=build_action_context_feature_table(
+                        env, info
+                    ),
                     entity_features=entity_features,
                     phase=_phase_from_info(info),
                     decision_index=decision_index,
                 )
             )
-            observations, _rewards, terminated, truncated, info = env.step(int(valid_actions[0]))
+            observations, _rewards, terminated, truncated, info = env.step(
+                int(valid_actions[0])
+            )
             if terminated or truncated:
                 observations, info = env.reset(seed=4 + decision_index + 1)
     finally:
@@ -77,7 +81,9 @@ def _make_trajectory(samples, *, force_indices: set[int]):
             # match -- constructs a genuine legal_count == 1 ("forced") row for the test.
             forced_valid = sample.valid_actions[:1]
             entity = dict(sample.entity_features)
-            entity["legal_action_tokens"] = np.asarray(entity["legal_action_tokens"])[:1]
+            entity["legal_action_tokens"] = np.asarray(entity["legal_action_tokens"])[
+                :1
+            ]
             sample = dataclasses.replace(
                 sample,
                 valid_actions=forced_valid,
@@ -122,6 +128,94 @@ def test_entity_ppo_update_reports_policy_active_fraction() -> None:
     assert np.isfinite(metrics["value_loss"])
 
 
+def test_entity_ppo_routes_configured_value_gradient_scale() -> None:
+    from catan_zero.rl.torch_ppo import ppo_update
+
+    samples = _collect_real_samples(2)
+    trajectory = _make_trajectory(samples, force_indices=set())
+    policy = _make_entity_policy()
+    observed_scales: list[float] = []
+    original_forward = policy.forward_legal_np
+
+    def recording_forward(*args, **kwargs):
+        observed_scales.append(float(kwargs.get("value_trunk_grad_scale", 1.0)))
+        return original_forward(*args, **kwargs)
+
+    policy.forward_legal_np = recording_forward
+    metrics = ppo_update(
+        policy,
+        [trajectory],
+        learning_rate=0.0,
+        clip_ratio=0.2,
+        value_coef=0.5,
+        entropy_coef=0.0,
+        epochs=1,
+        minibatch_size=64,
+        value_trunk_grad_scale=0.1,
+    )
+
+    assert observed_scales == [pytest.approx(0.1)]
+    assert metrics["value_trunk_grad_scale"] == pytest.approx(0.1)
+
+
+def test_entity_ppo_scales_only_shared_value_gradients() -> None:
+    import torch
+    from catan_zero.rl.torch_ppo import _entity_graph_outputs, ppo_update
+
+    samples = _collect_real_samples(3)
+    force_indices = set(range(len(samples)))
+    baseline_policy = _make_entity_policy()
+    scaled_policy = _make_entity_policy()
+    scaled_policy.model.load_state_dict(baseline_policy.model.state_dict())
+    baseline_trajectory = _make_trajectory(samples, force_indices=force_indices)
+    scaled_trajectory = _make_trajectory(samples, force_indices=force_indices)
+    with torch.no_grad():
+        target_values = (
+            _entity_graph_outputs(baseline_policy, baseline_trajectory.samples)["value"]
+            .cpu()
+            .numpy()
+            + 0.01
+        )
+    for trajectory in (baseline_trajectory, scaled_trajectory):
+        trajectory.returns = target_values.tolist()
+        trajectory.advantages = [0.0] * len(samples)
+
+    def run(policy, trajectory, scale: float) -> tuple[float, float]:
+        ppo_update(
+            policy,
+            [trajectory],
+            learning_rate=0.0,
+            clip_ratio=0.2,
+            value_coef=1.0,
+            entropy_coef=0.0,
+            epochs=1,
+            minibatch_size=64,
+            advantage_normalization="none",
+            value_trunk_grad_scale=scale,
+        )
+
+        def grad_norm(module) -> float:
+            return float(
+                torch.sqrt(
+                    sum(
+                        parameter.grad.detach().square().sum()
+                        for parameter in module.parameters()
+                        if parameter.grad is not None
+                    )
+                ).item()
+            )
+
+        return grad_norm(policy.model.hex_encoder), grad_norm(policy.model.value_head)
+
+    shared_full, private_full = run(baseline_policy, baseline_trajectory, 1.0)
+    shared_scaled, private_scaled = run(scaled_policy, scaled_trajectory, 0.1)
+
+    assert shared_full > 0.0
+    assert private_full > 0.0
+    assert shared_scaled / shared_full == pytest.approx(0.1, rel=1e-4, abs=1e-6)
+    assert private_scaled / private_full == pytest.approx(1.0, rel=1e-4, abs=1e-6)
+
+
 def test_entity_ppo_update_all_forced_batch_does_not_crash() -> None:
     """Every sample forced (legal_count == 1): policy_loss must fall back to 0 instead of
     crashing on an empty policy_active mask, while the value loss still trains normally."""
@@ -160,7 +254,8 @@ def test_entity_top_advantage_filter_retains_forced_value_and_policy_signal() ->
     trajectory.old_log_probs = [0.0] * 4
     policy = _make_entity_policy()
     model_before = {
-        name: value.detach().clone() for name, value in policy.model.state_dict().items()
+        name: value.detach().clone()
+        for name, value in policy.model.state_dict().items()
     }
 
     metrics = ppo_update(

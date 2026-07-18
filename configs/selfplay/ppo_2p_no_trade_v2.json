@@ -8,7 +8,7 @@
       "games_per_shard": 8,
       "gamma": 1.0,
       "max_decisions": 1000,
-      "opponent_mode": "league",
+      "opponent_mode": "fixed",
       "opponents": [
         "random",
         "heuristic",
@@ -23,7 +23,7 @@
       "value_shaping_scale": 100.0
     },
     "checkpoint": {
-      "every_steps": 1,
+      "every_steps": 50,
       "keep_last": 20,
       "milestone_every": 500
     },
@@ -75,6 +75,7 @@
       "use_vtrace": true,
       "value_clip_range": 0.2,
       "value_coef": 0.5,
+      "value_trunk_grad_scale": 0.1,
       "vtrace_clip_pg_rho": 1.0,
       "vtrace_clip_rho": 1.0,
       "vtrace_forward_chunk": 8192,

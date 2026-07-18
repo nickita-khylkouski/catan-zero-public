@@ -75,7 +75,9 @@ def test_recompute_target_logp_matches_manual_temperature_scaling() -> None:
     observations = _policy_observation_array(policy, samples)
     obs_t = torch.as_tensor(observations, dtype=torch.float32, device=policy.device)
     logits, _ = policy.forward(obs_t, None)
-    masked = _masked_logits(logits, [s.valid_actions for s in samples], policy.action_size)
+    masked = _masked_logits(
+        logits, [s.valid_actions for s in samples], policy.action_size
+    )
     scaled = torch.clamp(masked / 0.25, min=-50.0, max=50.0)
     actions_t = torch.as_tensor(
         [s.action for s in samples], dtype=torch.long, device=policy.device
@@ -104,6 +106,111 @@ def test_recompute_target_logp_defaults_to_unscaled_temperature() -> None:
     )
 
     np.testing.assert_allclose(default_logp, explicit_logp, atol=1e-9)
+
+
+@pytest.mark.parametrize("initial_training", [True, False])
+def test_vtrace_recompute_is_eval_only_and_restores_model_mode(
+    monkeypatch: pytest.MonkeyPatch,
+    initial_training: bool,
+) -> None:
+    import torch
+
+    policy = SimpleNamespace(model=torch.nn.Dropout(0.5))
+    policy.model.train(initial_training)
+    trajectory = SimpleNamespace(
+        samples=[object()],
+        old_log_probs=[0.0],
+        old_values=[0.0],
+        returns=[0.0],
+        advantages=[0.0],
+        shaped_rewards=[0.0],
+        rewards=[0.0],
+        truncated=False,
+        bootstrap_value=0.0,
+    )
+    observed_modes: list[bool] = []
+
+    def recompute(current_policy, *_args, **_kwargs):
+        observed_modes.append(current_policy.model.training)
+        return np.asarray([0.0]), np.asarray([0.0])
+
+    monkeypatch.setattr(
+        learner,
+        "_recompute_target_logp_and_values_batched",
+        recompute,
+    )
+    config = SimpleNamespace(
+        vtrace_forward_chunk=8192,
+        behavior_temperature=1.0,
+        vtrace_use_current_values=True,
+        gamma=1.0,
+        vtrace_clip_rho=1.0,
+        vtrace_clip_pg_rho=1.0,
+    )
+
+    stats = apply_vtrace_in_place(policy, [trajectory], config)
+
+    assert stats["vtrace_skipped"] == 0.0
+    assert observed_modes == [False]
+    assert policy.model.training is initial_training
+
+
+def test_vtrace_eval_mode_restores_on_early_return_and_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import torch
+
+    policy = SimpleNamespace(model=torch.nn.Dropout(0.5))
+    policy.model.train()
+    sample, bootstrap_sample = object(), object()
+    truncated = SimpleNamespace(
+        samples=[sample],
+        old_log_probs=[0.0],
+        old_values=[0.0],
+        returns=[0.0],
+        advantages=[0.0],
+        shaped_rewards=[0.0],
+        rewards=[0.0],
+        truncated=True,
+        bootstrap_value=0.0,
+        bootstrap_sample=None,
+    )
+    config = SimpleNamespace(
+        vtrace_forward_chunk=8192,
+        behavior_temperature=1.0,
+        vtrace_use_current_values=True,
+        gamma=1.0,
+        vtrace_clip_rho=1.0,
+        vtrace_clip_pg_rho=1.0,
+    )
+
+    monkeypatch.setattr(
+        learner,
+        "_recompute_target_logp_and_values_batched",
+        lambda current, *_args, **_kwargs: (
+            pytest.fail("V-trace forward ran with dropout active")
+            if current.model.training
+            else (np.asarray([0.0]), np.asarray([0.0]))
+        ),
+    )
+    stats = apply_vtrace_in_place(policy, [truncated], config)
+    assert stats["vtrace_skipped"] == 1.0
+    assert policy.model.training
+
+    truncated.bootstrap_sample = bootstrap_sample
+
+    def explode(current, *_args, **_kwargs):
+        assert not current.model.training
+        raise RuntimeError("recompute failed")
+
+    monkeypatch.setattr(
+        learner,
+        "_recompute_target_logp_and_values_batched",
+        explode,
+    )
+    with pytest.raises(RuntimeError, match="recompute failed"):
+        apply_vtrace_in_place(policy, [truncated], config)
+    assert policy.model.training
 
 
 def test_entity_recompute_uses_actor_saturation_at_temperature_one(
@@ -157,9 +264,7 @@ def test_entity_recompute_uses_actor_saturation_at_temperature_one(
     expected_logits = torch_ppo._behavior_policy_logits(  # noqa: SLF001
         raw_logits,
         1.0,
-        valid_mask=torch.as_tensor(
-            [[True, True, False], [True, True, True]]
-        ),
+        valid_mask=torch.as_tensor([[True, True, False], [True, True, True]]),
     )
     expected = (
         torch.distributions.Categorical(logits=expected_logits)

@@ -32,6 +32,62 @@ def test_checked_manifest_is_strict_and_deterministic() -> None:
     assert first.status == "template"
     assert first.spec.identity.track == "2p_no_trade"
     assert first.spec.identity.initializer_sha256.endswith("0" * 64)
+    assert first.spec.actor.opponent_mode == "fixed"
+    assert first.spec.learner.value_trunk_grad_scale == pytest.approx(0.1)
+    assert first.spec.checkpoint.every_steps == 50
+
+
+def test_shipped_template_actor_science_resolves_once_bound(tmp_path: Path) -> None:
+    from catan_zero.rl import ppo_distributed as dist
+    from tools import run_local_entity_ppo_shards as actor
+
+    checkpoint = tmp_path / "initializer.pt"
+    checkpoint.write_bytes(b"initializer")
+    payload = _payload()
+    payload["status"] = "bound"
+    payload["spec"]["identity"]["initializer_sha256"] = (
+        f"sha256:{dist.checkpoint_sha256(checkpoint)}"
+    )
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    args, manifest = actor.resolve_config(
+        [
+            "--run-manifest",
+            str(manifest_path),
+            "--run-name",
+            "template-contract-test",
+            "--checkpoint",
+            str(checkpoint),
+        ]
+    )
+
+    assert manifest is not None
+    assert args.opponent_mode == "fixed"
+
+
+def test_pre_scale_v2_manifest_preserves_hash_and_legacy_execution_contract() -> None:
+    payload = _payload()
+    del payload["spec"]["learner"]["value_trunk_grad_scale"]
+    expected_json = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    )
+
+    manifest = PPORunManifest.from_dict(payload)
+
+    assert manifest.spec.learner.value_trunk_grad_scale is None
+    assert manifest.canonical_json() == expected_json
+
+
+def test_manifest_rejects_explicit_null_value_trunk_scale() -> None:
+    payload = _payload()
+    payload["spec"]["learner"]["value_trunk_grad_scale"] = None
+
+    with pytest.raises(ManifestError, match="floating-point"):
+        PPORunManifest.from_dict(payload)
 
 
 @pytest.mark.parametrize(
@@ -105,6 +161,7 @@ def test_every_science_field_change_changes_full_hash() -> None:
         ("actor", "action_temperature", 0.75),
         ("actor", "value_shaping_coef", 0.1),
         ("learner", "lr", 0.0001),
+        ("learner", "value_trunk_grad_scale", 0.25),
         ("learner", "max_staleness", 3),
         ("learner", "target_kl", 0.006),
         ("checkpoint", "keep_last", 19),

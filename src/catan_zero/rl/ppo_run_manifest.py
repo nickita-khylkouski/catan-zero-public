@@ -200,6 +200,10 @@ class PPOLearnerSpec:
     trunk_lr_mult: float
     clip_ratio: float
     value_coef: float
+    # None preserves the canonical bytes/hash of an already-bound v2 manifest
+    # created before this field existed.  That historical contract executed at
+    # the model default of 1.0; new manifests must bind the scale explicitly.
+    value_trunk_grad_scale: float | None
     value_clip_range: float
     entropy_coef: float
     ppo_epochs: int
@@ -220,7 +224,16 @@ class PPOLearnerSpec:
 
     @classmethod
     def from_dict(cls, raw: Any) -> "PPOLearnerSpec":
-        value = _object(raw, where="spec.learner", keys=set(cls.__annotations__))
+        if not isinstance(raw, Mapping):
+            raise ManifestError("spec.learner must be an object")
+        legacy_missing_value_trunk_scale = "value_trunk_grad_scale" not in raw
+        normalized = dict(raw)
+        normalized.setdefault("value_trunk_grad_scale", None)
+        value = _object(
+            normalized,
+            where="spec.learner",
+            keys=set(cls.__annotations__),
+        )
         result = cls(
             shards_per_step=_integer(
                 value["shards_per_step"],
@@ -247,6 +260,16 @@ class PPOLearnerSpec:
             ),
             value_coef=_number(
                 value["value_coef"], where="spec.learner.value_coef", minimum=0.0
+            ),
+            value_trunk_grad_scale=(
+                None
+                if legacy_missing_value_trunk_scale
+                else _number(
+                    value["value_trunk_grad_scale"],
+                    where="spec.learner.value_trunk_grad_scale",
+                    minimum=0.0,
+                    maximum=1.0,
+                )
             ),
             value_clip_range=_number(
                 value["value_clip_range"],
@@ -476,7 +499,11 @@ class PPORunManifest:
         return cls.from_dict(value)
 
     def to_dict(self) -> dict[str, Any]:
-        return {"schema": SCHEMA, "status": self.status, "spec": asdict(self.spec)}
+        spec = asdict(self.spec)
+        if self.spec.learner.value_trunk_grad_scale is None:
+            # Hash-preserving compatibility for immutable pre-field v2 manifests.
+            spec["learner"].pop("value_trunk_grad_scale")
+        return {"schema": SCHEMA, "status": self.status, "spec": spec}
 
     def canonical_json(self) -> str:
         return json.dumps(

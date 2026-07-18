@@ -79,6 +79,7 @@ def test_bound_manifest_maps_all_learner_science_fields_exactly(
         trunk_lr_mult=0.08,
         clip_ratio=0.2,
         value_coef=0.7,
+        value_trunk_grad_scale=0.1,
         value_clip_range=0.15,
         entropy_coef=0.02,
         ppo_epochs=3,
@@ -140,6 +141,7 @@ def test_bound_manifest_maps_all_learner_science_fields_exactly(
         "trunk_lr_mult": spec.learner.trunk_lr_mult,
         "clip_ratio": spec.learner.clip_ratio,
         "value_coef": spec.learner.value_coef,
+        "value_trunk_grad_scale": spec.learner.value_trunk_grad_scale,
         "value_clip_range": spec.learner.value_clip_range,
         "entropy_coef": spec.learner.entropy_coef,
         "ppo_epochs": spec.learner.ppo_epochs,
@@ -148,9 +150,7 @@ def test_bound_manifest_maps_all_learner_science_fields_exactly(
         "top_advantage_fraction": spec.learner.top_advantage_fraction,
         "min_advantage_samples": spec.learner.min_advantage_samples,
         "advantage_normalization": spec.learner.advantage_normalization,
-        "advantage_group_weights": ",".join(
-            spec.learner.advantage_group_weights
-        ),
+        "advantage_group_weights": ",".join(spec.learner.advantage_group_weights),
         "kl_to_bc_init": spec.learner.kl_to_bc_init,
         "kl_to_bc_final": spec.learner.kl_to_bc_final,
         "kl_to_bc_anneal_steps": spec.learner.kl_to_bc_anneal_steps,
@@ -302,3 +302,18 @@ def test_legacy_resolution_is_unchanged_without_run_manifest(
     assert config.lr == 0.0003
     assert config.max_steps == 12
     assert config.poll_secs == 0.75
+
+
+def test_pre_scale_v2_manifest_resumes_with_exact_historical_scale(
+    tmp_path: Path,
+) -> None:
+    payload = _manifest_payload()
+    del payload["spec"]["learner"]["value_trunk_grad_scale"]
+
+    config, _args, _manifest_path, _initializer = _resolve_manifest(
+        tmp_path,
+        payload=payload,
+    )
+
+    assert config.value_trunk_grad_scale == pytest.approx(1.0)
+    assert config.legacy_value_trunk_grad_scale_compat is True

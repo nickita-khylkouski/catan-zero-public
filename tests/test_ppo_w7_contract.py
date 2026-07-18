@@ -29,11 +29,45 @@ def _config(**overrides) -> LearnerConfig:
 
 
 def test_canonical_loader_rejects_legacy_architecture_before_loading() -> None:
-    with pytest.raises(ValueError, match="canonical PPO requires architecture='entity_graph'"):
+    with pytest.raises(
+        ValueError, match="canonical PPO requires architecture='entity_graph'"
+    ):
         load_ppo_policy("unused.pt", architecture="xdim_graph")
 
 
-def test_exact_parent_factory_returns_equal_independent_frozen_anchor(monkeypatch) -> None:
+def test_canonical_loader_rejects_corrupt_runtime_semantics(tmp_path) -> None:
+    import torch
+    from catan_zero.rl.checkpoint_runtime_semantics import (
+        ENTITY_GRAPH_FORWARD_SEMANTICS_KEY,
+    )
+    from catan_zero.rl.entity_token_policy import EntityGraphPolicy
+    from catan_zero.rl.self_play import make_env_config
+
+    checkpoint = tmp_path / "policy.pt"
+    policy = EntityGraphPolicy.create(
+        env_config=make_env_config(vps_to_win=3),
+        hidden_size=16,
+        state_layers=1,
+        attention_heads=2,
+        dropout=0.0,
+        seed=0,
+    )
+    policy.save(checkpoint)
+    payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    payload[ENTITY_GRAPH_FORWARD_SEMANTICS_KEY] = {
+        "schema_version": "entity-graph-forward-semantics-v3",
+        "semantic_token_sha256": "sha256:" + "0" * 64,
+        "components": {},
+    }
+    torch.save(payload, checkpoint)
+
+    with pytest.raises(RuntimeError, match="semantic"):
+        load_ppo_policy(str(checkpoint), device="cpu")
+
+
+def test_exact_parent_factory_returns_equal_independent_frozen_anchor(
+    monkeypatch,
+) -> None:
     import torch
     from catan_zero.rl.entity_token_policy import EntityGraphPolicy
 
@@ -49,7 +83,11 @@ def test_exact_parent_factory_returns_equal_independent_frozen_anchor(monkeypatc
     monkeypatch.setattr(
         EntityGraphPolicy,
         "load",
-        lambda checkpoint, device=None: FakePolicy(),
+        lambda checkpoint, device=None, enforce_runtime_semantics=False: (
+            FakePolicy()
+            if enforce_runtime_semantics
+            else pytest.fail("PPO checkpoint load bypassed runtime semantic guard")
+        ),
     )
 
     parent, anchor = load_exact_parent_and_frozen_anchor("parent.pt")
@@ -57,14 +95,16 @@ def test_exact_parent_factory_returns_equal_independent_frozen_anchor(monkeypatc
     assert parent is not anchor
     assert parent.model is not anchor.model
     for name, tensor in parent.model.state_dict().items():
-        torch.testing.assert_close(tensor, anchor.model.state_dict()[name], rtol=0, atol=0)
+        torch.testing.assert_close(
+            tensor, anchor.model.state_dict()[name], rtol=0, atol=0
+        )
     assert parent.model.training
     assert not anchor.model.training
     assert all(parameter.requires_grad for parameter in parent.model.parameters())
     assert all(not parameter.requires_grad for parameter in anchor.model.parameters())
-    assert {
-        parameter.data_ptr() for parameter in parent.model.parameters()
-    }.isdisjoint({parameter.data_ptr() for parameter in anchor.model.parameters()})
+    assert {parameter.data_ptr() for parameter in parent.model.parameters()}.isdisjoint(
+        {parameter.data_ptr() for parameter in anchor.model.parameters()}
+    )
 
 
 def test_w7_defaults_are_canonical() -> None:
@@ -73,6 +113,7 @@ def test_w7_defaults_are_canonical() -> None:
     assert config.architecture == CANONICAL_PPO_ARCHITECTURE
     assert config.gamma == 1.0
     assert config.clip_ratio == 0.1
+    assert config.value_trunk_grad_scale == pytest.approx(0.1)
     assert 0.005 <= config.target_kl <= 0.01
     assert 2 <= config.ppo_epochs <= 4
 
@@ -99,12 +140,25 @@ def test_explicit_cli_value_equal_to_default_wins_over_config(tmp_path) -> None:
     assert explicit_default.lr == pytest.approx(2.0e-4)
 
 
+def test_nonmanifest_value_trunk_scale_is_propagated_then_rejected() -> None:
+    with pytest.raises(SystemExit):
+        resolve_config(
+            [
+                "--init-checkpoint",
+                "parent.pt",
+                "--value-trunk-grad-scale",
+                "1.0",
+            ]
+        )
+
+
 @pytest.mark.parametrize(
     ("overrides", "message"),
     [
         ({"architecture": "xdim_graph"}, "architecture='entity_graph'"),
         ({"gamma": 0.997}, "gamma=1.0"),
         ({"clip_ratio": 0.15}, "clip_ratio=0.1"),
+        ({"value_trunk_grad_scale": 1.0}, "value_trunk_grad_scale=0.1"),
         ({"target_kl": 0.0}, "target_kl"),
         ({"ppo_epochs": 1}, "2-4 update epochs"),
         ({"trunk_lr_mult": 0.25}, "trunk_lr_mult"),
@@ -212,14 +266,17 @@ def test_run_contract_binds_initializer_and_behavior_identity(tmp_path) -> None:
     )
 
     assert expected["initializer_sha256"] == dist.checkpoint_sha256(checkpoint)
-    assert dist.bind_run_contract(
-        root,
-        init_checkpoint=checkpoint,
-        architecture="entity_graph",
-        gamma=1.0,
-        gae_lambda=0.95,
-        behavior_temperature=0.7,
-    ) == expected
+    assert (
+        dist.bind_run_contract(
+            root,
+            init_checkpoint=checkpoint,
+            architecture="entity_graph",
+            gamma=1.0,
+            gae_lambda=0.95,
+            behavior_temperature=0.7,
+        )
+        == expected
+    )
     with pytest.raises(RuntimeError, match="run contract mismatch"):
         dist.bind_run_contract(
             root,
@@ -259,7 +316,9 @@ def test_no_vtrace_policy_window_rejects_old_and_future_shards(tmp_path) -> None
     current = 8
     old = dist.write_trajectory_shard(root, "old", 0, [], policy_version=current - 1)
     exact = dist.write_trajectory_shard(root, "exact", 0, [], policy_version=current)
-    future = dist.write_trajectory_shard(root, "future", 0, [], policy_version=current + 1)
+    future = dist.write_trajectory_shard(
+        root, "future", 0, [], policy_version=current + 1
+    )
 
     accepted = list(
         dist.iter_unconsumed_shards(
