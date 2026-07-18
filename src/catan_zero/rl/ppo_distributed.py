@@ -14,6 +14,8 @@ shared run directory (a Modal volume path, or any shared filesystem):
           shard_000123.pkl  # a pickled list[PPOTrajectory] from one actor
       consumed/
         {worker_id}__shard_000123.pkl   # empty marker; learner marks shards it has ingested
+      trajectory_completed/
+        {worker_id}__shard_000123.pkl.json  # permanent no-regeneration receipt
       checkpoints/          # periodic learner checkpoints
       league/               # League.save() / League.load() (see league.py)
       eval/                 # scoreboard json outputs
@@ -49,6 +51,7 @@ RUN_MANIFEST_BINDING_SCHEMA = "canonical_entity_ppo_run_binding_v2"
 KEEP_VERSIONED_WEIGHTS = 3
 TRAJ_DIRNAME = "trajectories"
 CONSUMED_DIRNAME = "consumed"
+COMPLETED_DIRNAME = "trajectory_completed"
 CHECKPOINTS_DIRNAME = "checkpoints"
 LEAGUE_DIRNAME = "league"
 EVAL_DIRNAME = "eval"
@@ -98,6 +101,12 @@ def consumed_dir(root: str | os.PathLike) -> Path:
     return Path(root) / CONSUMED_DIRNAME
 
 
+def completed_dir(root: str | os.PathLike) -> Path:
+    """Permanent actor/learner receipts; unlike consumed markers these are never pruned."""
+
+    return Path(root) / COMPLETED_DIRNAME
+
+
 def checkpoints_dir(root: str | os.PathLike) -> Path:
     return Path(root) / CHECKPOINTS_DIRNAME
 
@@ -111,7 +120,7 @@ def eval_dir(root: str | os.PathLike) -> Path:
 
 
 def ensure_run_dirs(root: str | os.PathLike) -> None:
-    for d in (policy_dir(root), trajectories_dir(root), consumed_dir(root),
+    for d in (policy_dir(root), trajectories_dir(root), consumed_dir(root), completed_dir(root),
               checkpoints_dir(root), league_dir(root), eval_dir(root)):
         Path(d).mkdir(parents=True, exist_ok=True)
 
@@ -202,6 +211,7 @@ def _assert_pristine_v2_root(root: Path) -> None:
         POLICY_DIRNAME,
         TRAJ_DIRNAME,
         CONSUMED_DIRNAME,
+        COMPLETED_DIRNAME,
         CHECKPOINTS_DIRNAME,
         LEAGUE_DIRNAME,
         EVAL_DIRNAME,
@@ -474,8 +484,82 @@ def read_trajectory_shard(
 
 def _consumed_marker(root: str | os.PathLike, shard_path: Path) -> Path:
     # flatten {worker_id}/{shard}.pkl -> {worker_id}__{shard}.pkl marker
-    rel = shard_path.relative_to(trajectories_dir(root))
+    rel = shard_path.resolve().relative_to(trajectories_dir(root).resolve())
     return consumed_dir(root) / str(rel).replace(os.sep, "__")
+
+
+def trajectory_completion_path(
+    root: str | os.PathLike, shard_path: str | os.PathLike
+) -> Path:
+    """Return the permanent production-completion receipt for one shard path."""
+
+    path = Path(shard_path).resolve()
+    try:
+        relative = path.relative_to(trajectories_dir(root).resolve())
+    except ValueError as error:
+        raise ValueError(f"trajectory shard is outside run root: {path}") from error
+    return completed_dir(root) / f"{str(relative).replace(os.sep, '__')}.json"
+
+
+def mark_trajectory_complete(
+    root: str | os.PathLike, shard_path: str | os.PathLike
+) -> Path:
+    """Atomically record that a shard was published and must never be produced again.
+
+    Actors call this only after atomic shard publication. The learner repeats the
+    same idempotent binding before deleting a consumed shard, closing the actor
+    crash/learner-consume race. These receipts intentionally outlive the bounded
+    consumed-marker retention window.
+    """
+
+    path = Path(shard_path).resolve()
+    try:
+        relative = path.relative_to(trajectories_dir(root).resolve())
+    except ValueError as error:
+        raise ValueError(f"trajectory shard is outside run root: {path}") from error
+    if len(relative.parts) != 2 or not relative.name.startswith("shard_"):
+        raise ValueError(f"invalid trajectory shard path: {path}")
+    receipt = trajectory_completion_path(root, path)
+    receipt.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "schema": "ppo_trajectory_production_completed_v1",
+        "worker_id": relative.parts[0],
+        "shard": relative.name,
+    }
+    temporary = receipt.with_name(
+        f".{receipt.name}.{os.getpid()}.{time.time_ns()}.tmp"
+    )
+    temporary.write_text(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    try:
+        try:
+            os.link(temporary, receipt)
+        except FileExistsError:
+            pass
+    finally:
+        temporary.unlink(missing_ok=True)
+    try:
+        existing = json.loads(receipt.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"invalid trajectory completion receipt at {receipt}") from error
+    if existing != payload:
+        raise RuntimeError(
+            "trajectory completion receipt mismatch: "
+            f"expected={existing!r} requested={payload!r}"
+        )
+    return receipt
+
+
+def trajectory_is_complete(
+    root: str | os.PathLike, shard_path: str | os.PathLike
+) -> bool:
+    receipt = trajectory_completion_path(root, shard_path)
+    if not receipt.is_file():
+        return False
+    mark_trajectory_complete(root, shard_path)  # authenticate the immutable receipt
+    return True
 
 
 def iter_unconsumed_shards(
@@ -707,6 +791,9 @@ def mark_consumed(root: str | os.PathLike, shard_path: str | os.PathLike) -> Non
     leaves the shard discoverable-but-marked (it will be skipped, never double-ingested) rather
     than lost. Removing an already-gone shard is ignored (idempotent / robust to retries).
     """
+    # This durable receipt is the actor's authoritative resume guard. It must
+    # succeed before either the bounded marker or the queue payload is removed.
+    mark_trajectory_complete(root, shard_path)
     marker = _consumed_marker(root, Path(shard_path))
     marker.parent.mkdir(parents=True, exist_ok=True)
     try:

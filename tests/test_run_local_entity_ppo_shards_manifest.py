@@ -302,9 +302,14 @@ def test_worker_stamps_manifest_sha_on_every_shard(
             "1",
         ]
     )
+    weights = tmp_path / "weights.pt"
+    weights.write_bytes(b"weights")
+    published = SimpleNamespace(path=str(weights), version=3)
+    launch = actor._prepare_launch(args, published)  # noqa: SLF001
     payloads, _devices, _games = actor._build_worker_payloads(  # noqa: SLF001
         args,
-        SimpleNamespace(path=str(tmp_path / "weights.pt"), version=3),
+        published,
+        launch,
     )
 
     class _Policy:
@@ -334,3 +339,415 @@ def test_worker_stamps_manifest_sha_on_every_shard(
     assert all(
         write["run_manifest_sha256"] == manifest.sha256() for write in writes
     )
+
+
+def test_distinct_launches_use_disjoint_paths_seeds_and_game_offsets(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "initializer.pt"
+    checkpoint.write_bytes(b"initializer")
+    args, _manifest = actor.resolve_config(
+        [
+            "--run-base",
+            str(tmp_path),
+            "--run-name",
+            "integrity",
+            "--checkpoint",
+            str(checkpoint),
+            "--games",
+            "4",
+            "--workers",
+            "2",
+        ]
+    )
+    weights = tmp_path / "weights.pt"
+    weights.write_bytes(b"weights")
+    published = SimpleNamespace(path=str(weights), version=7)
+
+    first = actor._prepare_launch(args, published)  # noqa: SLF001
+    second = actor._prepare_launch(args, published)  # noqa: SLF001
+    first_payloads, _devices, _games = actor._build_worker_payloads(  # noqa: SLF001
+        args, published, first
+    )
+    second_payloads, _devices, _games = actor._build_worker_payloads(  # noqa: SLF001
+        args, published, second
+    )
+
+    assert first["launch_id"] != second["launch_id"]
+    assert {item["worker_id"] for item in first_payloads}.isdisjoint(
+        item["worker_id"] for item in second_payloads
+    )
+    assert {item["seed"] for item in first_payloads}.isdisjoint(
+        item["seed"] for item in second_payloads
+    )
+    first_games = {
+        item["game_offset"] + game
+        for item in first_payloads
+        for game in range(item["games"])
+    }
+    second_games = {
+        item["game_offset"] + game
+        for item in second_payloads
+        for game in range(item["games"])
+    }
+    assert first_games.isdisjoint(second_games)
+
+
+def test_named_launch_resumes_exact_identity_and_refuses_drift(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "initializer.pt"
+    checkpoint.write_bytes(b"initializer")
+    base_argv = [
+        "--run-base",
+        str(tmp_path),
+        "--run-name",
+        "resume",
+        "--checkpoint",
+        str(checkpoint),
+        "--launch-id",
+        "retry-001",
+        "--games",
+        "4",
+        "--workers",
+        "2",
+    ]
+    args, _manifest = actor.resolve_config(base_argv)
+    weights = tmp_path / "weights.pt"
+    weights.write_bytes(b"weights")
+    published = SimpleNamespace(path=str(weights), version=2)
+
+    first = actor._prepare_launch(args, published)  # noqa: SLF001
+    resumed = actor._prepare_launch(args, published)  # noqa: SLF001
+
+    assert resumed == first
+    changed, _manifest = actor.resolve_config([*base_argv, "--devices", "cpu"])
+    assert actor._prepare_launch(changed, published) == first  # noqa: SLF001
+    changed.seed += 1
+    with pytest.raises(RuntimeError, match="launch contract mismatch"):
+        actor._prepare_launch(changed, published)  # noqa: SLF001
+
+
+def test_worker_resume_skips_consumed_shards_instead_of_hiding_rewrites(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = dist.run_root(tmp_path, "resume-worker")
+    dist.ensure_run_dirs(root)
+    payload = {
+        "run_base": str(tmp_path),
+        "run_name": "resume-worker",
+        "launch_id": "retry-001",
+        "worker_id": "local_retry-001_000",
+        "checkpoint": str(tmp_path / "weights.pt"),
+        "policy_version": 3,
+        "architecture": "entity_graph",
+        "device": "cpu",
+        "track": "2p_no_trade",
+        "vps_to_win": 10,
+        "games": 2,
+        "game_offset": 100,
+        "games_per_shard": 1,
+        "max_decisions": 10,
+        "opponents": "random",
+        "opponent_mode": "fixed",
+        "pfsp_mode": "pfsp",
+        "seed": 123,
+        "gamma": 1.0,
+        "gae_lambda": 0.95,
+        "value_shaping_coef": 0.0,
+        "value_shaping_scale": 100.0,
+        "value_shaping_opponent_penalty": 0.05,
+        "action_temperature": 1.0,
+        "run_manifest_sha256": None,
+    }
+    worker_dir = dist.trajectories_dir(root, payload["worker_id"])
+    worker_dir.mkdir(parents=True)
+    consumed = dist.consumed_dir(root)
+    consumed.mkdir(parents=True, exist_ok=True)
+    dist.write_trajectory_shard(
+        root,
+        payload["worker_id"],
+        0,
+        [{"published_before_actor_receipt": True}],
+        policy_version=payload["policy_version"],
+    )
+    calls = 0
+
+    class _Policy:
+        model = SimpleNamespace(eval=lambda: None)
+
+    def collect(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return SimpleNamespace(samples=[1])
+
+    monkeypatch.setattr(actor, "load_ppo_policy", lambda *_args, **_kwargs: _Policy())
+    monkeypatch.setattr(
+        actor, "parse_track", lambda *_args, **_kwargs: SimpleNamespace(players=2)
+    )
+    monkeypatch.setattr(actor, "make_named_policy", lambda _name: object())
+    monkeypatch.setattr(actor, "collect_ppo_episode", collect)
+
+    report = actor._worker(payload)  # noqa: SLF001
+
+    assert calls == 1
+    assert report["games"] == 1
+    assert report["shards"] == 1
+    assert (worker_dir / "shard_000000.pkl").exists()
+    assert dist.trajectory_is_complete(root, worker_dir / "shard_000000.pkl")
+    assert (worker_dir / "shard_000001.pkl").exists()
+    dist.mark_consumed(root, worker_dir / "shard_000000.pkl")
+    dist.mark_consumed(root, worker_dir / "shard_000001.pkl")
+    assert dist.prune_consumed_markers(root, older_than_secs=0.0) == 2
+    assert not (consumed / f'{payload["worker_id"]}__shard_000001.pkl').exists()
+    assert dist.trajectory_is_complete(root, worker_dir / "shard_000001.pkl")
+
+    resumed = actor._worker(payload)  # noqa: SLF001
+
+    assert calls == 1
+    assert resumed["games"] == 0
+    assert resumed["shards"] == 0
+    assert resumed["resumed_games"] == 2
+    assert resumed["resumed_shards"] == 2
+
+
+def test_publish_flag_cannot_replace_existing_learned_weights(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = dist.run_root(tmp_path, "publish-safe")
+    dist.ensure_run_dirs(root)
+    existing = SimpleNamespace(version=9, step=42, path=str(tmp_path / "learned.pt"))
+    args = SimpleNamespace(
+        publish=True,
+        checkpoint=str(tmp_path / "initializer.pt"),
+        architecture="entity_graph",
+    )
+    monkeypatch.setattr(dist, "read_version", lambda _root: existing)
+    monkeypatch.setattr(
+        actor,
+        "load_ppo_policy",
+        lambda *_args, **_kwargs: pytest.fail("initializer must not be loaded"),
+    )
+    monkeypatch.setattr(
+        dist,
+        "publish_weights",
+        lambda *_args, **_kwargs: pytest.fail("learned weights must not be replaced"),
+    )
+
+    with pytest.raises(RuntimeError, match="bootstrap-only"):
+        actor._resolve_published_weights(args, root)  # noqa: SLF001
+
+
+def test_named_resume_snapshots_mutable_current_weights_before_learner_advances(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkpoint = tmp_path / "initializer.pt"
+    checkpoint.write_bytes(b"initializer")
+    args, _manifest = actor.resolve_config(
+        [
+            "--run-base",
+            str(tmp_path),
+            "--run-name",
+            "advanced-learner",
+            "--checkpoint",
+            str(checkpoint),
+            "--launch-id",
+            "partial-launch",
+        ]
+    )
+    root = dist.run_root(args.run_base, args.run_name)
+    dist.ensure_run_dirs(root)
+    dist.publish_weights(
+        root, lambda path: Path(path).write_bytes(b"version two"), step=10
+    )
+    weights_v2 = dist.current_weights_path(root)
+    original = dist.PublishedVersion(
+        version=2,
+        step=10,
+        updated_at=12.5,
+        path=str(weights_v2),
+    )
+    launch = actor._prepare_launch(args, original)  # noqa: SLF001
+    dist.publish_weights(
+        root, lambda path: Path(path).write_bytes(b"version three"), step=11
+    )
+    monkeypatch.setattr(
+        dist,
+        "read_version",
+        lambda _root: pytest.fail("resume must not consult mutable current weights"),
+    )
+
+    resumed, published = actor._resolve_launch_and_weights(args, root)  # noqa: SLF001
+
+    assert resumed == launch
+    assert published.version == 2
+    assert published.step == 10
+    assert published.updated_at == 12.5
+    assert Path(published.path) == Path(launch["checkpoint"])
+    assert Path(published.path).read_bytes() == b"version two"
+    assert dist.checkpoint_sha256(published.path) == launch["checkpoint_sha256"]
+
+
+def test_named_resume_fails_closed_when_bound_weights_were_removed(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "initializer.pt"
+    checkpoint.write_bytes(b"initializer")
+    args, _manifest = actor.resolve_config(
+        [
+            "--run-base",
+            str(tmp_path),
+            "--run-name",
+            "missing-policy",
+            "--checkpoint",
+            str(checkpoint),
+            "--launch-id",
+            "partial-launch",
+        ]
+    )
+    root = dist.run_root(args.run_base, args.run_name)
+    dist.ensure_run_dirs(root)
+    weights = dist.policy_dir(root) / "weights_v2.pt"
+    weights.write_bytes(b"version two")
+    actor._prepare_launch(  # noqa: SLF001
+        args,
+        dist.PublishedVersion(version=2, step=1, updated_at=2.0, path=str(weights)),
+    )
+    Path(
+        json.loads(
+            (
+                root
+                / "actor_launches"
+                / "partial-launch"
+                / "launch.json"
+            ).read_text(encoding="utf-8")
+        )["checkpoint"]
+    ).unlink()
+
+    with pytest.raises(RuntimeError, match="immutable policy checkpoint.*unavailable"):
+        actor._resolve_launch_and_weights(args, root)  # noqa: SLF001
+
+
+def test_launch_policy_snapshot_survives_versioned_weight_gc(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "initializer.pt"
+    checkpoint.write_bytes(b"initializer")
+    args, _manifest = actor.resolve_config(
+        [
+            "--run-base",
+            str(tmp_path),
+            "--run-name",
+            "gc-resume",
+            "--checkpoint",
+            str(checkpoint),
+            "--launch-id",
+            "long-running-launch",
+        ]
+    )
+    root = dist.run_root(args.run_base, args.run_name)
+    dist.ensure_run_dirs(root)
+    first = dist.publish_weights(
+        root, lambda path: Path(path).write_bytes(b"version one"), step=0
+    )
+    launch = actor._prepare_launch(args, first)  # noqa: SLF001
+
+    for version in range(2, dist.KEEP_VERSIONED_WEIGHTS + 3):
+        dist.publish_weights(
+            root,
+            lambda path, version=version: Path(path).write_bytes(
+                f"version {version}".encode()
+            ),
+            step=version,
+        )
+
+    assert not Path(first.path).exists()
+    resumed, published = actor._resolve_launch_and_weights(args, root)  # noqa: SLF001
+    assert resumed == launch
+    assert published.version == first.version
+    assert Path(published.path).read_bytes() == b"version one"
+
+
+def test_orphan_policy_snapshot_is_recovered_before_launch_binding(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "initializer.pt"
+    checkpoint.write_bytes(b"initializer")
+    args, _manifest = actor.resolve_config(
+        [
+            "--run-base",
+            str(tmp_path),
+            "--run-name",
+            "orphan-recovery",
+            "--checkpoint",
+            str(checkpoint),
+            "--launch-id",
+            "crashed-launch",
+        ]
+    )
+    root = dist.run_root(args.run_base, args.run_name)
+    dist.ensure_run_dirs(root)
+    source = dist.policy_dir(root) / "weights_v4.pt"
+    source.write_bytes(b"current policy")
+    launch_dir = root / "actor_launches" / "crashed-launch"
+    launch_dir.mkdir(parents=True)
+    (launch_dir / "policy.pt").write_bytes(b"orphaned stale bytes")
+
+    launch = actor._prepare_launch(  # noqa: SLF001
+        args,
+        dist.PublishedVersion(version=4, step=20, updated_at=5.0, path=str(source)),
+    )
+
+    assert Path(launch["checkpoint"]).read_bytes() == b"current policy"
+    assert dist.checkpoint_sha256(launch["checkpoint"]) == launch["checkpoint_sha256"]
+    assert (launch_dir / "policy_snapshot.json").is_file()
+
+
+def test_staged_policy_snapshot_resumes_after_crash_before_launch_binding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkpoint = tmp_path / "initializer.pt"
+    checkpoint.write_bytes(b"initializer")
+    args, _manifest = actor.resolve_config(
+        [
+            "--run-base",
+            str(tmp_path),
+            "--run-name",
+            "staged-recovery",
+            "--checkpoint",
+            str(checkpoint),
+            "--launch-id",
+            "crashed-launch",
+        ]
+    )
+    root = dist.run_root(args.run_base, args.run_name)
+    dist.ensure_run_dirs(root)
+    first = dist.publish_weights(
+        root, lambda path: Path(path).write_bytes(b"version one"), step=1
+    )
+    real_bind = actor._atomic_bind_json  # noqa: SLF001
+
+    def crash_before_launch(path, payload):
+        if path.name == "launch.json":
+            raise RuntimeError("simulated crash")
+        return real_bind(path, payload)
+
+    monkeypatch.setattr(actor, "_atomic_bind_json", crash_before_launch)
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        actor._prepare_launch(args, first)  # noqa: SLF001
+    monkeypatch.setattr(actor, "_atomic_bind_json", real_bind)
+    latest = dist.publish_weights(
+        root, lambda path: Path(path).write_bytes(b"version two"), step=2
+    )
+    assert latest.version != first.version
+    monkeypatch.setattr(
+        dist,
+        "read_version",
+        lambda _root: pytest.fail("staged recovery must not consult mutable current weights"),
+    )
+
+    launch, published = actor._resolve_launch_and_weights(args, root)  # noqa: SLF001
+
+    assert launch["policy_version"] == first.version
+    assert published.version == first.version
+    assert Path(launch["checkpoint"]).read_bytes() == b"version one"

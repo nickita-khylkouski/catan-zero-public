@@ -190,3 +190,41 @@ def test_legacy_contract_and_shard_calls_remain_unchanged(tmp_path: Path) -> Non
         "trajectories",
     }
     assert list(dist.iter_unconsumed_shards(root)) == [shard]
+
+
+def test_consumption_receipt_survives_queue_and_marker_cleanup(tmp_path: Path) -> None:
+    root = tmp_path / "durable-completion"
+    dist.ensure_run_dirs(root)
+    shard = dist.write_trajectory_shard(
+        root, "worker", 4, [{"trajectory": 1}], policy_version=2
+    )
+
+    dist.mark_consumed(root, shard)
+    marker = dist.consumed_dir(root) / "worker__shard_000004.pkl"
+    receipt = dist.trajectory_completion_path(root, shard)
+
+    assert not shard.exists()
+    assert marker.exists()
+    assert receipt.exists()
+    assert dist.trajectory_is_complete(root, shard)
+    assert dist.prune_consumed_markers(root, older_than_secs=0.0) == 1
+    assert not marker.exists()
+    assert receipt.exists()
+    assert dist.trajectory_is_complete(root, shard)
+
+
+def test_absolute_shard_finalizes_under_relative_run_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    root = Path("relative-run")
+    dist.ensure_run_dirs(root)
+    shard = dist.write_trajectory_shard(
+        root, "worker", 1, [{"trajectory": 1}], policy_version=1
+    )
+
+    dist.mark_consumed(root, shard.resolve())
+
+    assert not shard.exists()
+    assert (dist.consumed_dir(root) / "worker__shard_000001.pkl").exists()
+    assert dist.trajectory_is_complete(root, shard.resolve())
