@@ -1006,16 +1006,6 @@ def build_parser() -> argparse.ArgumentParser:
         "change, so shipping is gated on a strength-based H2H A/B.",
     )
     parser.add_argument(
-        "--rng-stream-separation",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help=(
-            "Use independent deterministic RNG domains for root control/Gumbel, "
-            "interior chance, and coherent-public belief materialization. Native "
-            "execution requires a wheel advertising rng_stream_separation."
-        ),
-    )
-    parser.add_argument(
         "--information-set-search",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -1319,19 +1309,6 @@ def main(argv: Sequence[str] | None = None) -> None:
             "--native-mcts-hot-loop requires a matching catanatron_rs wheel "
             "exporting gumbel_search; refusing silent Python fallback"
         )
-    if bool(args.native_mcts_hot_loop) and bool(args.rng_stream_separation):
-        try:
-            import catanatron_rs  # type: ignore
-
-            capability_fn = getattr(catanatron_rs, "gumbel_search_capabilities", None)
-            capabilities = set(capability_fn()) if callable(capability_fn) else set()
-        except ImportError:
-            capabilities = set()
-        if "rng_stream_separation" not in capabilities:
-            parser.error(
-                "--rng-stream-separation with --native-mcts-hot-loop requires "
-                "a wheel advertising rng_stream_separation"
-            )
     if (
         bool(args.native_mcts_hot_loop)
         and str(args.forced_root_target_mode) == "trajectory_only"
@@ -1709,7 +1686,6 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "score_actions": bool(args.score_actions),
                 "correct_rust_chance_spectra": bool(args.correct_rust_chance_spectra),
                 "lazy_interior_chance": bool(args.lazy_interior_chance),
-                "rng_stream_separation": bool(args.rng_stream_separation),
                 "exact_budget_sh": bool(args.exact_budget_sh),
                 "exact_budget_sh_min_n": int(args.exact_budget_sh_min_n),
                 "root_wave_batching": bool(args.root_wave_batching),
@@ -2436,9 +2412,6 @@ def _run_worker(
         wide_candidates_threshold=int(worker_args.get("wide_candidates_threshold", 24)),
         correct_rust_chance_spectra=bool(worker_args["correct_rust_chance_spectra"]),
         lazy_interior_chance=bool(worker_args["lazy_interior_chance"]),
-        rng_stream_separation=bool(
-            worker_args.get("rng_stream_separation", False)
-        ),
         exact_budget_sh=bool(worker_args.get("exact_budget_sh", False)),
         exact_budget_sh_min_n=int(worker_args.get("exact_budget_sh_min_n", 0)),
         root_wave_batching=bool(worker_args.get("root_wave_batching", False)),

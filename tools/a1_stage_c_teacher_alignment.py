@@ -57,11 +57,7 @@ from catan_zero.rl.target_reliability import (  # noqa: E402
     TARGET_RELIABILITY_VERSION,
     target_reliability_confidence,
 )
-from catan_zero.search.rng_streams import (  # noqa: E402
-    SEARCH_RNG_STREAM_NAMES,
-    SEARCH_RNG_STREAM_SCHEMA,
-    SHARED_SEARCH_RNG_STREAM_SCHEMA,
-)
+from catan_zero.search.rng_streams import SEARCH_RNG_STREAM_SCHEMA  # noqa: E402
 from catan_zero.search.gumbel_chance_mcts import (  # noqa: E402
     GumbelChanceMCTSConfig,
 )
@@ -329,7 +325,6 @@ BELIEF_FIELDS = (
 CHANCE_FIELDS = (
     "correct_rust_chance_spectra",
     "lazy_interior_chance",
-    "rng_stream_separation",
 )
 SYMMETRY_FIELDS = (
     "symmetry_averaged_eval",
@@ -884,7 +879,6 @@ def _operator_identity(
         or belief["determinization_particles"] != 1
         or chance["correct_rust_chance_spectra"] is not True
         or chance["lazy_interior_chance"] is not True
-        or chance["rng_stream_separation"] is not True
         or symmetry["symmetry_averaged_eval"] is not True
         or semantics["public_observation"] is not True
     ):
@@ -913,16 +907,8 @@ def _operator_identity(
         },
         "chance": {
             **chance,
-            "rng_stream_schema": (
-                SEARCH_RNG_STREAM_SCHEMA
-                if chance["rng_stream_separation"] is True
-                else SHARED_SEARCH_RNG_STREAM_SCHEMA
-            ),
-            "separate_rng_domains": (
-                list(SEARCH_RNG_STREAM_NAMES)
-                if chance["rng_stream_separation"] is True
-                else []
-            ),
+            "rng_stream_schema": SEARCH_RNG_STREAM_SCHEMA,
+            "separate_rng_domains": ["gumbel", "chance", "belief"],
         },
         "symmetry": symmetry,
         "target_semantics": {

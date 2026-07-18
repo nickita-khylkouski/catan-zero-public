@@ -36,7 +36,6 @@
     "learner_entity_feature_adapter_version": "rust_entity_adapter_v6_exact_actor_resources_initial_road_two_hop",
     "preserve_search_evidence": true,
     "native_mcts_hot_loop": true,
-    "rng_stream_separation": true,
     "rust_featurize": true
   },
   "execution": {
@@ -109,11 +108,11 @@
   "artifacts": {
     "typed_generation_config": {
       "path": "configs/experiments/teacher_transition/coherent_public_n128_v6_history64_teacher.schema13.json",
-      "sha256": "sha256:95a6e5a92edc471f8902be75e1d685e06c4fa65528145fa427c0a9e01dcb61c4"
+      "sha256": "sha256:9d08faa4724da0b73f24cb56e0c110c4f5d6fca5c8e845ddf57817a91dd0a1c5"
     },
     "generation_guard": {
       "path": "configs/guards/a1_generation_coherent_public_n128_v6_history64_rd.json",
-      "sha256": "sha256:c7a0c0908d204b7b7c22b9704d08f4f4d6b9d85278cfd2df693f2ab3b9337923"
+      "sha256": "sha256:6d7e96e21173ed46ec520d8d5d866af890d277d1c2fa2f1cd5caa22492f77279"
     }
   },
   "acceptance": {
@@ -134,5 +133,5 @@
     "self_play_generation_eligible": false,
     "stage_c_root_reanalysis_eligible": true
   },
-  "contract_sha256": "sha256:b19899056df75f6355ded53f28c49517c57079196b7511b6f619215eeda7058d"
+  "contract_sha256": "sha256:4b5c1bf36d9a373c79b155adc0fd9d663292738a0c8edea47efbf9c78a15d548"
 }

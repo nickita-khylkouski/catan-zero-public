@@ -591,10 +591,6 @@ class GenerateConfig(PipelineConfig):
     value_readout: str = "scalar"
     correct_rust_chance_spectra: bool = True
     lazy_interior_chance: bool = False
-    # Keep root control/Gumbel draws, interior chance, and public-belief
-    # materialization in independently seeded domains. This changes target
-    # stochasticity and therefore belongs in the typed producer identity.
-    rng_stream_separation: bool = False
     exact_budget_sh: bool = False
     exact_budget_sh_min_n: int = 0
     root_wave_batching: bool = False

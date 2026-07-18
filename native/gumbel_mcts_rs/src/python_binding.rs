@@ -229,33 +229,6 @@ fn gumbel_search(
     if let Some(v) = config_dict.get_item("seed")? {
         config.seed = v.extract()?;
     }
-    if let Some(v) = config_dict.get_item("control_seed")?
-        && !v.is_none()
-    {
-        config.control_seed = Some(v.extract()?);
-    }
-    if let Some(v) = config_dict.get_item("chance_seed")?
-        && !v.is_none()
-    {
-        config.chance_seed = Some(v.extract()?);
-    }
-    if let Some(v) = config_dict.get_item("belief_seed")?
-        && !v.is_none()
-    {
-        config.belief_seed = Some(v.extract()?);
-    }
-    let seed_domains = [
-        config.control_seed.is_some(),
-        config.chance_seed.is_some(),
-        config.belief_seed.is_some(),
-    ];
-    if seed_domains.iter().any(|present| *present)
-        && !seed_domains.iter().all(|present| *present)
-    {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "control_seed, chance_seed, and belief_seed must be supplied together",
-        ));
-    }
     if let Some(v) = config_dict.get_item("c_visit")? {
         config.c_visit = v.extract()?;
     }
@@ -493,7 +466,6 @@ fn gumbel_search_capabilities() -> Vec<&'static str> {
         "coherent_public_belief_search",
         "boundary_value_particles",
         "forced_root_trajectory_only",
-        "rng_stream_separation",
     ]
 }
 
