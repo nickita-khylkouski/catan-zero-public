@@ -27,6 +27,9 @@ from catan_zero.rl.entity_feature_adapter import (  # noqa: E402
     ENTITY_FEATURE_ADAPTER_CHECKPOINT_SCHEMA,
     RUST_ENTITY_ADAPTER_V6,
 )
+from catan_zero.rl.meaningful_history import (  # noqa: E402
+    MEANINGFUL_PUBLIC_HISTORY_SCHEMA_V2,
+)
 from tools import a1_stage_c_teacher_alignment as alignment  # noqa: E402
 from tools import a1_target_eligibility_inventory as inventory  # noqa: E402
 from tools import train_bc  # noqa: E402
@@ -64,6 +67,39 @@ def _write_immutable(path: Path, payload: Mapping[str, Any]) -> None:
         os.chmod(target, stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def _checkpoint_history_contract(checkpoint: Path) -> dict[str, Any]:
+    """Read the checkpoint-owned history surface used by native inference."""
+
+    try:
+        enabled, limit, schema, _pooling, _target_gather = (
+            train_bc._checkpoint_meaningful_public_history(str(checkpoint))  # noqa: SLF001
+        )
+    except (OSError, RuntimeError, SystemExit, ValueError) as error:
+        raise BindingError(f"cannot authenticate checkpoint history: {error}") from error
+    return {
+        "meaningful_public_history": bool(enabled),
+        "meaningful_public_history_schema": str(schema),
+        "event_history_limit": int(limit),
+    }
+
+
+def _typed_history_contract(fields: Mapping[str, Any]) -> dict[str, Any]:
+    """Resolve the typed generator's implicit V6 history schema."""
+
+    enabled = fields.get("meaningful_public_history")
+    limit = fields.get("event_history_limit")
+    if type(enabled) is not bool or type(limit) is not int:
+        raise BindingError(
+            "typed V6 generation config must explicitly bind "
+            "meaningful_public_history and event_history_limit"
+        )
+    return {
+        "meaningful_public_history": enabled,
+        "meaningful_public_history_schema": MEANINGFUL_PUBLIC_HISTORY_SCHEMA_V2,
+        "event_history_limit": limit,
+    }
 
 
 def bind(
@@ -111,6 +147,13 @@ def bind(
         raise BindingError(
             "checkpoint, teacher evaluator, and learner rows must all bind exact V6"
         )
+    checkpoint_history = _checkpoint_history_contract(checkpoint)
+    typed_history = _typed_history_contract(fields)
+    if checkpoint_history != typed_history:
+        raise BindingError(
+            "checkpoint and typed generator history contracts differ: "
+            f"checkpoint={checkpoint_history!r} typed={typed_history!r}"
+        )
     drift = {
         key: {"base_contract": value, "typed_config": fields.get(key)}
         for key, value in operator.items()
@@ -142,6 +185,7 @@ def bind(
         "teacher_feature_contract": {
             "schema_version": ENTITY_FEATURE_ADAPTER_CHECKPOINT_SCHEMA,
             "entity_feature_adapter_version": checkpoint_adapter,
+            **checkpoint_history,
         },
         "base_operator_contract": {
             "path": str(base_path),

@@ -11,9 +11,9 @@ Create the immutable host-local binding after the selected checkpoint exists:
 python tools/a1_rd_teacher_transition.py bind \
   --checkpoint /absolute/path/to/selected-v8-v6.pt \
   --base-operator-contract \
-    configs/operations/a1-target-identity-coherent-n128-rd-v2/contract.json \
+    configs/operations/a1-target-identity-coherent-n128-v6-history64-rd-v1/contract.json \
   --typed-generation-config \
-    configs/experiments/teacher_transition/coherent_public_n128_v6_teacher.schema13.json \
+    configs/experiments/teacher_transition/coherent_public_n128_v6_history64_teacher.schema13.json \
   --binding-id v8-v6-selected-coherent-n128-r1 \
   --output /absolute/path/to/v8-v6-selected.teacher-binding.json
 ```
@@ -26,5 +26,9 @@ The binding is deliberately not accepted by the fleet generation executor. It
 has no seed schedule and carries `production_authority=false`,
 `promotion_eligible=false`, and `diagnostic_only=true`. Stage-C fails before
 search construction unless the checkpoint bytes, checkpoint-declared adapter,
-typed teacher adapter, and learner row adapter are all the same exact V6
-contract.
+typed teacher adapter, learner row adapter, meaningful-history schema, and
+64-event limit are all the same exact V6 contract.
+
+The older `coherent_public_n128_v6_teacher.schema13.json` file is retained as
+evidence of the rejected 32-event transition attempt. It must not be used for a
+V6 checkpoint.
