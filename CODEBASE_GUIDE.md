@@ -316,16 +316,15 @@ affordance summaries, a scalar win readout, and a final-VP auxiliary.
 
 **Remaining representation ceilings:**
 
-1. Scratch and migrated-parent routes do not yet use the exact-resource signal
-   identically.
-2. One topology message-passing step weakly represents long road components,
+1. One topology message-passing step weakly represents long road components,
    forks, blocks, and multi-hop extension threats.
-3. Opponent dev-card belief is conservation-based, not conditioned on observed
+2. Opponent dev-card belief is conservation-based, not conditioned on observed
    opponent choices or card age.
-4. The commissioned teacher uses adapter V2 while the learner uses V6, so new
-   learner information cannot improve the search policy that produced its
-   target.
-5. The value readout predicts a scalar mean without calibrated epistemic or
+3. Existing production targets were produced by the V2 teacher. The R&D
+   transition can now bind a V6 checkpoint and its declared adapter as a
+   non-promotable coherent teacher, but a V6 reanalysis overlay still must be
+   produced before the learner consumes aligned V6 policy evidence.
+4. The value readout predicts a scalar mean without calibrated epistemic or
    return uncertainty.
 
 **Trace this path in:**
@@ -345,9 +344,10 @@ There are two distinct readiness states:
 - **Parent update:** commissioned and empirically useful. It reloads exact
   parent bytes with fresh Adam, uses a bounded short dose, and independently
   controls mature trunk/action learning rates.
-- **Fresh scratch:** not commissioned. It still needs a selected
-  LR/warmup/horizon, a representation contract matching the intended native
-  V8 input surface, and an authenticated coherent-public n128 corpus.
+- **Fresh scratch:** not commissioned. The native V8 route now receives exact
+  physical resource and initial-road inputs directly rather than replaying the
+  parent-compatibility rewrite, but it still needs a selected
+  LR/warmup/horizon and an authenticated coherent-public n128 corpus.
 
 Do not interpret optimizer steps as a stable dose after changing the active
 sampler. Report base rows, policy-active rows, objective-weighted mass,
@@ -360,6 +360,14 @@ reducing the shared action encoder and fresh action-local adapter learning
 rates improved held-out policy closure while leaving the value path at its
 measured rate. Reducing value-head LR alone was dominated and should not be
 silently folded into the production recipe.
+
+Raw value MSE must be interpreted against the optimal constant forecast for
+each phase. On the current held-out corpus, the value network has roughly 40%
+skill over that baseline on ordinary play, robber, and discard states.
+Opening-settlement skill is approximately zero (mostly irreducible terminal
+outcome variance), while initial-road value has a small calibration bias.
+This supports a narrow opening calibration experiment, not the claim that the
+system lacks a value network.
 
 ### Counterfactual and Reanalysis Path
 
@@ -389,10 +397,12 @@ The vertical path is:
 `tools/a1_stage_c_reanalysis_executor.py`, and
 `tools/a1_stage_c_learner_overlay.py` own this route. Historical
 `target_scores` are raw visited-action Q and must not be relabeled as completed
-Q. Completed-Q values and masks need their own legal-aligned materialization
-and opt-in objective; `afterstate_target` is also evidence until a learner
-explicitly consumes it. Keep the existing Q loss off rather than feeding it
-ambiguous semantics.
+Q. Stage-C overlays now materialize separate legal-aligned
+`completed_q_values` and `completed_q_mask` arrays with exact operator and
+reliability bindings. `train_bc.py --completed-q-loss-weight` is the
+default-off consumer; it trains the Q head on return-scale, root-actor targets
+and never falls back to `target_scores`. `afterstate_target` remains evidence
+until a learner explicitly consumes it.
 
 ---
 
