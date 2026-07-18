@@ -19,6 +19,153 @@ def _write_sealed(path: Path, value: dict, field: str) -> dict:
     return payload
 
 
+def _behavioral_competence_gate_contract() -> dict:
+    return {
+        "schema_version": "a1-maritime-behavioral-competence-gate-v1",
+        "required_streams": ["base", "aux"],
+        "stream_admission": {
+            "mode": "independent",
+            "pooling": False,
+            "all_required_streams_must_pass": True,
+        },
+        "required_axis": "teacher_argmax_action_type",
+        "required_action_type": "MARITIME_TRADE",
+        "minimum_rows": 64,
+        "confidence_interval": {
+            "method": "wilson_score",
+            "sided": "one",
+            "confidence_level": 0.95,
+            "z": 1.6448536269514722,
+        },
+        "minimum_teacher_top1_lower_bound": 0.15,
+        "maximum_end_turn_confusion_upper_bound": 0.40,
+        "maximum_teacher_top1_parent_regression": 0.05,
+        "maximum_end_turn_confusion_parent_regression": 0.05,
+        "objective_weighted_diagnostic": {
+            "required": True,
+            "axis": "objective_weighted_teacher_argmax_action_type",
+            "selection_authority": False,
+        },
+        "playing_strength": {
+            "candidate_prefilter_only": True,
+            "h2h_final_ranking_authority": True,
+        },
+    }
+
+
+def _behavioral_metrics(
+    *,
+    rows: int,
+    teacher_top1_successes: int,
+    end_turn_confusions: int,
+) -> dict:
+    return {
+        "teacher_top1_accuracy": teacher_top1_successes / rows,
+        "end_turn_confusion_rate": end_turn_confusions / rows,
+        "teacher_top1_successes": teacher_top1_successes,
+        "end_turn_confusions": end_turn_confusions,
+        "end_turn_confusion_teacher_probability_regret_per_row": 0.1,
+        "end_turn_confusion_teacher_probability_regret_conditional_mean": 0.2,
+    }
+
+
+def _behavioral_metric_deltas(candidate: dict, parent: dict) -> dict:
+    return {
+        key: float(candidate[key]) - float(parent[key])
+        for key in (
+            "teacher_top1_accuracy",
+            "end_turn_confusion_rate",
+            "end_turn_confusion_teacher_probability_regret_per_row",
+            "end_turn_confusion_teacher_probability_regret_conditional_mean",
+        )
+    }
+
+
+def _behavioral_competence_gate(
+    *,
+    rows: int,
+    teacher_top1_successes: int,
+    end_turn_confusions: int,
+) -> dict:
+    abi_unsigned = {
+        "version": "action-catalog-v1",
+        "size": 3,
+        "ordered_descriptors_sha256": "sha256:" + "1" * 64,
+        "action_types_by_id_sha256": "sha256:" + "2" * 64,
+    }
+    abi = {
+        **abi_unsigned,
+        "identity_sha256": final.value_sha256(abi_unsigned),
+    }
+    candidate = _behavioral_metrics(
+        rows=rows,
+        teacher_top1_successes=teacher_top1_successes,
+        end_turn_confusions=end_turn_confusions,
+    )
+    parent = copy.deepcopy(candidate)
+    weighted_candidate = {
+        key: candidate[key]
+        for key in (
+            "teacher_top1_accuracy",
+            "end_turn_confusion_rate",
+            "end_turn_confusion_teacher_probability_regret_per_row",
+            "end_turn_confusion_teacher_probability_regret_conditional_mean",
+        )
+    }
+    weighted_parent = copy.deepcopy(weighted_candidate)
+    stream = {
+        "axis": "teacher_argmax_action_type",
+        "action_type": "MARITIME_TRADE",
+        "action_catalog_abi": abi,
+        "rows": rows,
+        "candidate": candidate,
+        "parent": parent,
+        "candidate_minus_parent": _behavioral_metric_deltas(candidate, parent),
+        "objective_weighted_diagnostic": {
+            "axis": "objective_weighted_teacher_argmax_action_type",
+            "selection_authority": False,
+            "row_probability": float(rows),
+            "candidate": weighted_candidate,
+            "parent": weighted_parent,
+            "candidate_minus_parent": _behavioral_metric_deltas(
+                weighted_candidate,
+                weighted_parent,
+            ),
+        },
+    }
+    return (
+        final.stage_c_campaign._maritime_behavioral_competence_gate_from_evidence(  # noqa: SLF001
+            {
+                "streams": {
+                    "base": copy.deepcopy(stream),
+                    "aux": copy.deepcopy(stream),
+                }
+            },
+            contract=_behavioral_competence_gate_contract(),
+        )
+    )
+
+
+def _admitted_behavioral_competence_gate() -> dict:
+    gate = _behavioral_competence_gate(
+        rows=100,
+        teacher_top1_successes=30,
+        end_turn_confusions=20,
+    )
+    assert gate["selection_admitted"] is True
+    return gate
+
+
+def _failed_behavioral_competence_gate() -> dict:
+    gate = _behavioral_competence_gate(
+        rows=94,
+        teacher_top1_successes=6,
+        end_turn_confusions=74,
+    )
+    assert gate["selection_admitted"] is False
+    return gate
+
+
 def _campaign(tmp_path: Path, *, parent_sha: str) -> tuple[Path, dict]:
     value = {
         "schema_version": final.CAMPAIGN_SCHEMA,
@@ -60,6 +207,9 @@ def _campaign(tmp_path: Path, *, parent_sha: str) -> tuple[Path, dict]:
                 final.stage_c_campaign.TRAIN_DIAGNOSTIC_CADENCE_BATCHES
             ),
             "value_quality_gate": final._expected_value_gate_contract(),  # noqa: SLF001
+            "behavioral_competence_gate": (
+                _behavioral_competence_gate_contract()
+            ),
         },
         "feature_learning_signal_contract": (
             final._expected_feature_learning_contract()  # noqa: SLF001
@@ -152,6 +302,9 @@ def _fingerprint(
                 "feature_learning_signal_authenticated": feature_authenticated,
                 "feature_learning_signal": feature_signal,
                 "value_quality_gate": {"passed": True},
+                "behavioral_competence_gate": (
+                    _admitted_behavioral_competence_gate()
+                ),
                 "checkpoint": str(checkpoint),
                 "checkpoint_sha256": final.file_sha256(checkpoint),
                 "checkpoint_report_binding": {
@@ -195,6 +348,9 @@ def _fingerprint(
         "optimizer_batch_kl_used_as_trust_authority": False,
         "policy_teacher_gap_objective": policy_teacher_gap_objective,
         "value_quality_gate": final._expected_value_gate_contract(),  # noqa: SLF001
+        "behavioral_competence_gate": (
+            _behavioral_competence_gate_contract()
+        ),
         "separate_exact_parent_evidence": {"selection_authority": True},
     }
     path = tmp_path / "fingerprint.json"
@@ -557,7 +713,13 @@ def test_fingerprint_refuses_base_only_teacher_gap_for_aux_campaign(
 
 @pytest.mark.parametrize(
     "mutation",
-    ("schema", "feature_contract", "value_gate", "policy_aux_objective"),
+    (
+        "schema",
+        "feature_contract",
+        "value_gate",
+        "behavioral_gate",
+        "policy_aux_objective",
+    ),
 )
 def test_fingerprint_refuses_campaign_contract_drift(
     tmp_path: Path,
@@ -575,6 +737,10 @@ def test_fingerprint_refuses_campaign_contract_drift(
         campaign["feature_learning_signal_contract"].pop("required_modules")
     elif mutation == "policy_aux_objective":
         campaign["recipe"]["policy_aux_loss_weight"] = 0.0
+    elif mutation == "behavioral_gate":
+        campaign["selection_contract"]["behavioral_competence_gate"][
+            "minimum_rows"
+        ] = 63
     else:
         campaign["selection_contract"]["value_quality_gate"][
             "max_absolute_regression"
@@ -589,6 +755,117 @@ def test_fingerprint_refuses_campaign_contract_drift(
 
     with pytest.raises(
         final.FinalReplicationError, match="campaign semantics drifted"
+    ):
+        final._fingerprint(fingerprint_path)  # noqa: SLF001
+
+
+def test_behavioral_competence_gate_contract_is_exact() -> None:
+    assert (
+        final._expected_behavioral_competence_gate_contract()  # noqa: SLF001
+        == _behavioral_competence_gate_contract()
+    )
+
+
+def test_fingerprint_refuses_top_level_behavioral_contract_drift(
+    tmp_path: Path,
+) -> None:
+    fingerprint_path, fingerprint = _fingerprint(
+        tmp_path, parent_sha="sha256:" + "7" * 64, steps=(16,)
+    )
+    fingerprint["behavioral_competence_gate"]["required_streams"] = ["base"]
+    fingerprint.pop("fingerprint_sha256")
+    _write_sealed(fingerprint_path, fingerprint, "fingerprint_sha256")
+
+    with pytest.raises(
+        final.FinalReplicationError, match="campaign semantics drifted"
+    ):
+        final._fingerprint(fingerprint_path)  # noqa: SLF001
+
+
+def test_fingerprint_refuses_eligible_checkpoint_without_behavioral_admission(
+    tmp_path: Path,
+) -> None:
+    fingerprint_path, fingerprint = _fingerprint(
+        tmp_path, parent_sha="sha256:" + "7" * 64, steps=(16,)
+    )
+    record = fingerprint["checkpoints"][0]
+    record["eligible"] = True
+    record["behavioral_competence_gate"] = (
+        _failed_behavioral_competence_gate()
+    )
+    fingerprint.pop("fingerprint_sha256")
+    _write_sealed(fingerprint_path, fingerprint, "fingerprint_sha256")
+
+    with pytest.raises(
+        final.FinalReplicationError, match="fingerprint semantics drifted"
+    ):
+        final._fingerprint(fingerprint_path)  # noqa: SLF001
+
+
+def test_checkpoint_record_cannot_bypass_behavioral_admission(
+    tmp_path: Path,
+) -> None:
+    fingerprint_path, fingerprint = _fingerprint(
+        tmp_path, parent_sha="sha256:" + "7" * 64, steps=(16,)
+    )
+    record = fingerprint["checkpoints"][0]
+    assert record["eligible"] is False
+    record["behavioral_competence_gate"] = (
+        _failed_behavioral_competence_gate()
+    )
+    fingerprint.pop("fingerprint_sha256")
+    _write_sealed(fingerprint_path, fingerprint, "fingerprint_sha256")
+    _path, verified = final._fingerprint(fingerprint_path)  # noqa: SLF001
+
+    with pytest.raises(
+        final.FinalReplicationError, match="behavioral competence"
+    ):
+        final._checkpoint_record(  # noqa: SLF001
+            verified,
+            16,
+            require_fingerprint_eligible=False,
+        )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "stored_count",
+        "action_catalog_abi",
+        "confidence_bound",
+        "paired_delta",
+        "objective_weighted_diagnostic",
+        "missing_aux_stream",
+    ),
+)
+def test_fingerprint_recomputes_behavioral_competence_evidence(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    fingerprint_path, fingerprint = _fingerprint(
+        tmp_path, parent_sha="sha256:" + "7" * 64, steps=(16,)
+    )
+    gate = fingerprint["checkpoints"][0]["behavioral_competence_gate"]
+    base = gate["evidence"]["streams"]["base"]
+    if mutation == "stored_count":
+        base["candidate"]["teacher_top1_successes"] += 1
+    elif mutation == "action_catalog_abi":
+        base["action_catalog_abi"]["identity_sha256"] = "sha256:" + "f" * 64
+    elif mutation == "confidence_bound":
+        base["confidence_bounds"]["teacher_top1_lower"] += 0.01
+    elif mutation == "paired_delta":
+        base["candidate_minus_parent"]["teacher_top1_accuracy"] += 0.01
+    elif mutation == "objective_weighted_diagnostic":
+        base["objective_weighted_diagnostic"]["candidate"][
+            "teacher_top1_accuracy"
+        ] += 0.01
+    else:
+        gate["evidence"]["streams"].pop("aux")
+    fingerprint.pop("fingerprint_sha256")
+    _write_sealed(fingerprint_path, fingerprint, "fingerprint_sha256")
+
+    with pytest.raises(
+        final.FinalReplicationError, match="fingerprint semantics drifted"
     ):
         final._fingerprint(fingerprint_path)  # noqa: SLF001
 
@@ -892,7 +1169,7 @@ def test_one_dose_final_binder_reloads_current_v5_not_diagnostic_f7(
     base_recipe = dict(contract.EXPECTED_LEARNER_TRAINING_RECIPE)
     selected_recipe = {
         "epochs": 1,
-        "max_steps": 32,
+        "max_steps": 12,
         "lr": 6.0e-5,
         "lr_warmup_steps": 16,
         "policy_loss_weight": 1.0,
@@ -934,8 +1211,8 @@ def test_one_dose_final_binder_reloads_current_v5_not_diagnostic_f7(
                     "value_target": "terminal_outcome_only",
                 }
             },
-            "max_optimizer_steps": 32,
-            "checkpoint_steps": [8, 12, 16, 32],
+            "max_optimizer_steps": 12,
+            "checkpoint_steps": [8, 10],
         },
         "reviewed_code": {
             "lock": {
@@ -988,7 +1265,7 @@ def test_one_dose_final_binder_reloads_current_v5_not_diagnostic_f7(
         arm_name=final.FINAL_CONTROL_ARM,
         reviewed_code_tree_sha256="sha256:" + "d" * 64,
     )
-    assert bound["recipe"]["max_steps"] == 32
+    assert bound["recipe"]["max_steps"] == 12
     assert (
         bound["stage_c_final_replication_binding"][
             "initializer_checkpoint_sha256"

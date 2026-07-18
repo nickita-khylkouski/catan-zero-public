@@ -49,8 +49,8 @@ TIEBREAK_SCHEMA = "a1-stage-c-v5-dose-tiebreak-common-crn-v1"
 ROOT_MANIFEST_SCHEMA = "a1-stage-c-independent-root-manifest-v3"
 FINAL_CORPUS_ADMISSION_SCHEMA = "a1-stage-c-final-corpus-admission-v3"
 FINAL_AUTHORITY_SCHEMA = "a1-stage-c-final-matched-replication-authority-v4"
-FRESH_FINGERPRINT_SCHEMA = "a1-b200-stage-c-aligned-learner-fingerprint-v4"
-CAMPAIGN_SCHEMA = "a1-b200-stage-c-aligned-learner-campaign-v6"
+FRESH_FINGERPRINT_SCHEMA = "a1-b200-stage-c-aligned-learner-fingerprint-v5"
+CAMPAIGN_SCHEMA = "a1-b200-stage-c-aligned-learner-campaign-v7"
 EXPECTED_ARM = "STRATEGIC_BALANCED"
 EXPECTED_PAIRS = 128
 EXPECTED_GAMES = EXPECTED_PAIRS * 2
@@ -238,6 +238,59 @@ def _expected_value_gate_contract() -> dict[str, Any]:
     }
 
 
+def _expected_behavioral_competence_gate_contract() -> dict[str, Any]:
+    return {
+        "schema_version": "a1-maritime-behavioral-competence-gate-v1",
+        "required_streams": ["base", "aux"],
+        "stream_admission": {
+            "mode": "independent",
+            "pooling": False,
+            "all_required_streams_must_pass": True,
+        },
+        "required_axis": "teacher_argmax_action_type",
+        "required_action_type": "MARITIME_TRADE",
+        "minimum_rows": 64,
+        "confidence_interval": {
+            "method": "wilson_score",
+            "sided": "one",
+            "confidence_level": 0.95,
+            "z": 1.6448536269514722,
+        },
+        "minimum_teacher_top1_lower_bound": 0.15,
+        "maximum_end_turn_confusion_upper_bound": 0.40,
+        "maximum_teacher_top1_parent_regression": 0.05,
+        "maximum_end_turn_confusion_parent_regression": 0.05,
+        "objective_weighted_diagnostic": {
+            "required": True,
+            "axis": "objective_weighted_teacher_argmax_action_type",
+            "selection_authority": False,
+        },
+        "playing_strength": {
+            "candidate_prefilter_only": True,
+            "h2h_final_ranking_authority": True,
+        },
+    }
+
+
+def _require_checkpoint_behavioral_competence_gate(
+    record: Mapping[str, Any],
+    *,
+    where: str,
+) -> dict[str, Any]:
+    try:
+        return (
+            stage_c_campaign._require_maritime_behavioral_competence_gate_result(  # noqa: SLF001
+                record.get("behavioral_competence_gate"),
+                expected_contract=_expected_behavioral_competence_gate_contract(),
+                where=where,
+            )
+        )
+    except stage_c_campaign.CampaignError as error:
+        raise FinalReplicationError(
+            f"{where} behavioral competence gate drifted"
+        ) from error
+
+
 def _path_matches(value: object, expected: Path) -> bool:
     try:
         return Path(str(value)).resolve(strict=True) == expected
@@ -281,6 +334,20 @@ def _fingerprint(path: Path) -> tuple[Path, dict[str, Any]]:
         )
     ):
         raise FinalReplicationError("fresh-parent fingerprint semantics drifted")
+    for index, item in enumerate(payload.get("checkpoints", [])):
+        if not isinstance(item, dict):
+            raise FinalReplicationError("fresh-parent fingerprint semantics drifted")
+        try:
+            gate = _require_checkpoint_behavioral_competence_gate(
+                item,
+                where=f"fresh-parent checkpoint record {index}",
+            )
+        except FinalReplicationError as error:
+            raise FinalReplicationError(
+                "fresh-parent fingerprint semantics drifted"
+            ) from error
+        if item.get("eligible") is True and gate.get("selection_admitted") is not True:
+            raise FinalReplicationError("fresh-parent fingerprint semantics drifted")
     campaign_ref = payload.get("campaign")
     if not isinstance(campaign_ref, dict):
         raise FinalReplicationError("fresh-parent fingerprint lost campaign")
@@ -323,7 +390,11 @@ def _fingerprint(path: Path) -> tuple[Path, dict[str, Any]]:
         or selection.get("earliest_feature_signal_step")
         != stage_c_campaign.TRAIN_DIAGNOSTIC_CADENCE_BATCHES
         or selection.get("value_quality_gate") != _expected_value_gate_contract()
+        or selection.get("behavioral_competence_gate")
+        != _expected_behavioral_competence_gate_contract()
         or payload.get("value_quality_gate") != selection.get("value_quality_gate")
+        or payload.get("behavioral_competence_gate")
+        != selection.get("behavioral_competence_gate")
     ):
         raise FinalReplicationError("Stage-C strategic campaign semantics drifted")
     try:
@@ -468,6 +539,14 @@ def _checkpoint_record(
             f"selected step {step} is not one eligible fresh-parent checkpoint"
         )
     record = copy.deepcopy(matches[0])
+    gate = _require_checkpoint_behavioral_competence_gate(
+        record,
+        where=f"selected step {step}",
+    )
+    if gate.get("selection_admitted") is not True:
+        raise FinalReplicationError(
+            f"selected step {step} lacks admitted behavioral competence"
+        )
     if record.get("policy_teacher_gap_objective") != policy_teacher_gap_objective:
         raise FinalReplicationError(
             f"step {step} policy teacher-gap objective differs from campaign recipe"
