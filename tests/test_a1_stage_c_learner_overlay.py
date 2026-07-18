@@ -227,6 +227,33 @@ def test_post_wave_trace_population_uses_only_replayable_games() -> None:
     assert binding["excluded_trace_rows_value_state_evidence_retained"] is True
 
 
+def test_post_wave_trace_population_replays_pool_game_exclusion() -> None:
+    games = np.asarray([10, 10, 11, 11, 12, 12], dtype=np.int64)
+    decisions = np.asarray([0, 1, 0, 1, 0, 1], dtype=np.int64)
+    pool_rows = np.asarray([False, False, True, True, False, False], dtype=np.bool_)
+    validation = np.asarray([11, 12], dtype=np.int64)
+    _qualified, receipt = overlay.alignment._qualify_stage_c_game_traces(  # noqa: SLF001
+        game_seeds=games,
+        decision_indices=decisions,
+        pool_game_rows=pool_rows,
+    )
+
+    qualified, qualified_validation, replayed = (
+        overlay._trace_qualified_game_populations(  # noqa: SLF001
+            admission_schema=overlay.post_wave_admission.ADMISSION_SCHEMA,
+            game_seeds=games,
+            decision_indices=decisions,
+            pool_game_rows=pool_rows,
+            validation_game_seeds=validation,
+            expected_qualification=receipt,
+        )
+    )
+
+    assert qualified.tolist() == [10, 12]
+    assert qualified_validation.tolist() == [12]
+    assert replayed == receipt
+
+
 @pytest.mark.parametrize("mutation", ["missing", "digest", "corpus"])
 def test_post_wave_trace_population_fails_closed_on_drift(
     mutation: str,

@@ -580,6 +580,7 @@ def _trace_qualified_game_populations(
     admission_schema: str,
     game_seeds: np.ndarray,
     decision_indices: np.ndarray,
+    pool_game_rows: np.ndarray | None = None,
     validation_game_seeds: np.ndarray,
     expected_qualification: object,
 ) -> tuple[np.ndarray, np.ndarray, dict[str, Any] | None]:
@@ -618,6 +619,7 @@ def _trace_qualified_game_populations(
         qualified, replayed = alignment._qualify_stage_c_game_traces(  # noqa: SLF001
             game_seeds=games,
             decision_indices=decisions,
+            pool_game_rows=pool_game_rows,
         )
     except alignment.AlignmentError as error:
         raise OverlayError(
@@ -1016,6 +1018,11 @@ def _export_sampling_population(
         admission_schema=str(source_admission.get("schema_version", "")),
         game_seeds=population_game_seeds,
         decision_indices=population_decision_indices,
+        pool_game_rows=(
+            np.asarray(data["is_pool_game"], dtype=np.bool_)
+            if "is_pool_game" in data
+            else None
+        ),
         validation_game_seeds=np.asarray(validation["game_seeds"], dtype=np.int64),
         expected_qualification=plan.get("source_game_trace_qualification"),
     )
@@ -2020,6 +2027,11 @@ def _materialize(args: argparse.Namespace) -> dict[str, Any]:
             admission_schema=str(base_admission.get("schema_version", "")),
             game_seeds=base_game_seeds,
             decision_indices=np.asarray(base_data["decision_index"], dtype=np.int64),
+            pool_game_rows=(
+                np.asarray(base_data["is_pool_game"], dtype=np.bool_)
+                if "is_pool_game" in base_data
+                else None
+            ),
             validation_game_seeds=np.asarray(validation["game_seeds"], dtype=np.int64),
             expected_qualification=export.get("source_game_trace_qualification"),
         )
@@ -2586,6 +2598,11 @@ def verify_overlay_admission(path: Path) -> dict[str, Any]:
                 admission_schema=str(admission["schema_version"]),
                 game_seeds=corpus_games,
                 decision_indices=np.asarray(data["decision_index"], dtype=np.int64),
+                pool_game_rows=(
+                    np.asarray(data["is_pool_game"], dtype=np.bool_)
+                    if "is_pool_game" in data
+                    else None
+                ),
                 validation_game_seeds=np.asarray(
                     validation["game_seeds"], dtype=np.int64
                 ),
