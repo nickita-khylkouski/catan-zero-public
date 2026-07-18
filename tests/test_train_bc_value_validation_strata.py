@@ -77,6 +77,35 @@ def test_value_validation_strata_follow_exact_error_weight_and_eligibility() -> 
     assert report["phase"]["PLAY_TURN"]["mse"] == pytest.approx(7.0)
 
 
+def test_value_validation_strata_report_skill_over_constant_mean() -> None:
+    parts = {
+        "phase": {
+            "opening": {
+                "weighted_sum": 4.0,
+                "weight_sum": 4.0,
+                "rows": 4.0,
+                "weighted_residual_sum": 0.0,
+                "weighted_prediction_sum": 0.0,
+                "weighted_target_sum": 0.0,
+                "weighted_prediction_sq_sum": 0.0,
+                "weighted_target_sq_sum": 4.0,
+                "weighted_prediction_target_sum": 0.0,
+            }
+        }
+    }
+
+    opening = train_bc._finalize_value_validation_strata(parts)["phase"][
+        "opening"
+    ]
+
+    assert opening["mse"] == pytest.approx(1.0)
+    assert opening["constant_target_mean_mse"] == pytest.approx(1.0)
+    assert opening["mse_improvement_over_constant"] == pytest.approx(0.0)
+    assert opening["mse_skill_score_vs_constant"] == pytest.approx(0.0)
+    assert opening["brier_score"] == pytest.approx(0.25)
+    assert opening["constant_brier_score"] == pytest.approx(0.25)
+
+
 def test_objective_measure_combines_value_strata_from_density_not_game_means() -> None:
     reports = [
         {

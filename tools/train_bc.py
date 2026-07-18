@@ -25581,6 +25581,22 @@ def _finalize_value_validation_strata(
                 ),
                 "prediction_mean": prediction_mean if weight > 0.0 else 0.0,
                 "target_mean": target_mean if weight > 0.0 else 0.0,
+                # Raw outcome MSE is not comparable across game phases when
+                # their irreducible outcome variance differs.  In particular,
+                # an opening win/loss target is dominated by hundreds of
+                # future chance events, so MSE ~= 1 can be the optimal
+                # constant forecast rather than evidence of a broken value
+                # head.  Report the exact weighted constant-mean baseline and
+                # the model's skill above it from the same sufficient
+                # statistics.  For the [-1, 1] value convention, dividing by
+                # four is the equivalent probability-space Brier score.
+                "prediction_variance": prediction_variance,
+                "target_variance": target_variance,
+                "prediction_target_covariance": covariance,
+                "constant_target_mean_mse": target_variance,
+                "mse_improvement_over_constant": target_variance - mse,
+                "brier_score": mse * 0.25,
+                "constant_brier_score": target_variance * 0.25,
                 "pearson": (
                     covariance / correlation_denominator
                     if correlation_denominator > 0.0
@@ -25588,6 +25604,10 @@ def _finalize_value_validation_strata(
                 ),
             }
         )
+        if target_variance > 0.0:
+            result["mse_skill_score_vs_constant"] = (
+                target_variance - mse
+            ) / target_variance
         return result
 
     return {
