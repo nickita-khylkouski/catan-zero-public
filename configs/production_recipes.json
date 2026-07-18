@@ -36,6 +36,11 @@
         "path": "configs/training/a1_parent_update_shared_action25_35m_b200.schema1.json"
       },
       {
+        "canonical_sha256": "9ff18f2513e6369e1fcd0f6ee86b77054ac0436a50c713a58e69b2659fe3caba",
+        "name": "a1-parent-update-value25-35m-b200",
+        "path": "configs/training/a1_parent_update_value25_35m_b200.schema1.json"
+      },
+      {
         "canonical_sha256": "b484268b389cff7bc522849b84744cba286d915803467f266258aeba9876ab47",
         "name": "a1-parent-update-active-p10-35m-b200",
         "path": "configs/training/a1_parent_update_active_p10_35m_b200.schema1.json"
