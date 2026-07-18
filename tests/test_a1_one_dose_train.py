@@ -340,6 +340,13 @@ def _training_report(
         "resume_optimizer": False,
         "optimizer_restored": False,
         "fused_optimizer": False,
+        "fused_optimizer_requested": False,
+        "fused_optimizer_runtime": {
+            "requested": False,
+            "attempted": False,
+            "effective": False,
+            "fallback_after_type_error": False,
+        },
         "epochs": 1,
         "max_steps": recipe["max_steps"],
         "exact_max_steps": int(recipe["max_steps"]) > 0,
@@ -442,8 +449,14 @@ def _training_report(
                 ],
                 "policy_aux_loss_weight": recipe["policy_aux_loss_weight"],
                 "training_row_draws": base_draws,
+                "training_row_draws_semantics": (
+                    "base_sampler_draw_events; may repeat rows; excludes_policy_aux"
+                ),
                 "base_training_row_draws": base_draws,
                 "policy_aux_training_row_draws": aux_draws,
+                "policy_base_active_training_row_draws": policy_base,
+                "policy_active_training_row_draws": policy_base + aux_draws,
+                "value_active_training_row_draws": base_draws,
                 "total_training_row_draws": base_draws + aux_draws,
                 "policy_base_active_rows": policy_base,
                 "policy_aux_active_rows": aux_draws,
@@ -1582,7 +1595,6 @@ def test_canonical_parent_update_binds_12_step_8x64_recipe(tmp_path: Path) -> No
     )
     assert executor._training_report_runtime_contract(bound["recipe"]) == {  # noqa: SLF001
         "optimizer": "adamw",
-        "fused_optimizer": True,
         "epochs": 999,
         "symmetry_augment": True,
     }
@@ -1597,6 +1609,74 @@ def test_canonical_parent_update_binds_12_step_8x64_recipe(tmp_path: Path) -> No
     assert bound["promotion_block_reason"] == (
         "training_science_admission_unauthorized"
     )
+
+
+@pytest.mark.parametrize(
+    "runtime",
+    (
+        {
+            "requested": True,
+            "attempted": True,
+            "effective": True,
+            "fallback_after_type_error": False,
+        },
+        {
+            "requested": True,
+            "attempted": True,
+            "effective": False,
+            "fallback_after_type_error": True,
+        },
+    ),
+)
+def test_sealed_report_binds_fused_request_and_realized_runtime(
+    runtime: dict[str, bool],
+) -> None:
+    report = {
+        "fused_optimizer": runtime["effective"],
+        "fused_optimizer_requested": True,
+        "fused_optimizer_runtime": runtime,
+    }
+
+    assert executor._verify_training_report_fused_optimizer(  # noqa: SLF001
+        report,
+        requested=True,
+    ) == runtime
+
+
+@pytest.mark.parametrize(
+    "report",
+    (
+        {"fused_optimizer": True},
+        {
+            "fused_optimizer": True,
+            "fused_optimizer_requested": True,
+            "fused_optimizer_runtime": {
+                "requested": True,
+                "attempted": True,
+                "effective": False,
+                "fallback_after_type_error": True,
+            },
+        },
+        {
+            "fused_optimizer": False,
+            "fused_optimizer_requested": True,
+            "fused_optimizer_runtime": {
+                "requested": True,
+                "attempted": True,
+                "effective": False,
+                "fallback_after_type_error": False,
+            },
+        },
+    ),
+)
+def test_sealed_report_rejects_ambiguous_fused_runtime(
+    report: dict[str, object],
+) -> None:
+    with pytest.raises(executor.ExecutorError, match="fused-optimizer"):
+        executor._verify_training_report_fused_optimizer(  # noqa: SLF001
+            report,
+            requested=True,
+        )
 
 
 def test_v8_sealed_child_recipe_matches_canonical_parent_projection(
@@ -3416,8 +3496,14 @@ def test_report_binding_seals_exact_ordinary_production_objective_dose(
     payload.update(
         {
             "training_row_draws": 4_097,
+            "training_row_draws_semantics": (
+                "base_sampler_draw_events; may repeat rows; excludes_policy_aux"
+            ),
             "base_training_row_draws": 4_097,
             "policy_aux_training_row_draws": 0,
+            "policy_base_active_training_row_draws": 777,
+            "policy_active_training_row_draws": 777,
+            "value_active_training_row_draws": 4_097,
             "total_training_row_draws": 4_097,
             "policy_base_active_rows": 777,
             "policy_aux_active_rows": 0,

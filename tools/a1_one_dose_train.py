@@ -8913,45 +8913,12 @@ def _verify_central_live_allocation(
 def _exact_objective_exposure(report_payload: dict[str, Any]) -> dict[str, Any]:
     """Reconstruct exact current-dose objective exposure from trainer counters."""
 
-    integer_fields = (
-        "base_training_row_draws",
-        "policy_aux_training_row_draws",
-        "policy_base_active_rows",
-        "policy_aux_active_rows",
-        "policy_total_active_rows",
-        "value_active_rows",
-        "policy_kl_anchor_eligible_rows",
-    )
-    values: dict[str, int] = {}
-    for field in integer_fields:
-        value = report_payload.get(field)
-        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-            raise ExecutorError(
-                f"A1 training report has invalid exact-dose counter {field!r}"
-            )
-        values[field] = value
-    if (
-        values["policy_aux_training_row_draws"] != values["policy_aux_active_rows"]
-        or values["policy_total_active_rows"]
-        != values["policy_base_active_rows"] + values["policy_aux_active_rows"]
-        or report_payload.get("total_training_row_draws")
-        != values["base_training_row_draws"] + values["policy_aux_training_row_draws"]
-    ):
-        raise ExecutorError("A1 training report objective-dose arithmetic drift")
-    if values["value_active_rows"] > values["base_training_row_draws"]:
-        raise ExecutorError("A1 exact value-active dose exceeds the base draw dose")
-    if values["policy_kl_anchor_eligible_rows"] > values["base_training_row_draws"]:
-        raise ExecutorError("A1 exact anchor-eligible dose exceeds the base draw dose")
-    return {
-        "measurement_status": "bound_exactly",
-        "measurement_scope": "current_dose",
-        "base_sampled_rows": values["base_training_row_draws"],
-        "policy_base_active_sampled_rows": values["policy_base_active_rows"],
-        "policy_aux_active_sampled_rows": values["policy_aux_active_rows"],
-        "policy_active_sampled_rows": values["policy_total_active_rows"],
-        "value_active_sampled_rows": values["value_active_rows"],
-        "anchor_eligible_sampled_rows": values["policy_kl_anchor_eligible_rows"],
-    }
+    try:
+        return lineage.exact_objective_exposure_from_training_report(
+            report_payload
+        )
+    except lineage.LineageDoseError as error:
+        raise ExecutorError(f"A1 {error}") from error
 
 
 def _effective_global_batch_size(recipe: dict[str, Any]) -> int:
@@ -9953,10 +9920,58 @@ def _training_report_runtime_contract(
         raise ExecutorError("learner recipe symmetry_augment is invalid")
     return {
         "optimizer": optimizer,
-        "fused_optimizer": fused_optimizer,
         "epochs": epochs,
         "symmetry_augment": symmetry_augment,
     }
+
+
+def _verify_training_report_fused_optimizer(
+    report_payload: Mapping[str, Any],
+    *,
+    requested: bool,
+) -> dict[str, bool]:
+    """Bind the sealed request separately from the realized optimizer backend."""
+
+    if type(requested) is not bool:
+        raise ExecutorError("learner recipe fused_optimizer is invalid")
+    runtime = report_payload.get("fused_optimizer_runtime")
+    expected_fields = {
+        "requested",
+        "attempted",
+        "effective",
+        "fallback_after_type_error",
+    }
+    if (
+        not isinstance(runtime, Mapping)
+        or set(runtime) != expected_fields
+        or any(type(runtime[field]) is not bool for field in expected_fields)
+    ):
+        raise ExecutorError(
+            "A1 training report lacks typed fused-optimizer runtime provenance"
+        )
+    realized = dict(runtime)
+    if (
+        realized["requested"] is not requested
+        or report_payload.get("fused_optimizer_requested") is not requested
+        or report_payload.get("fused_optimizer") is not realized["effective"]
+        or realized["attempted"] is not requested
+        or (
+            requested
+            and realized["effective"]
+            is realized["fallback_after_type_error"]
+        )
+        or (
+            not requested
+            and (
+                realized["effective"]
+                or realized["fallback_after_type_error"]
+            )
+        )
+    ):
+        raise ExecutorError(
+            "A1 training report fused-optimizer request/runtime drift"
+        )
+    return realized
 
 
 def _verify_training_outputs(
@@ -9978,6 +9993,10 @@ def _verify_training_outputs(
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
         raise ExecutorError(f"cannot parse A1 training report: {error}") from error
     recipe = verified["recipe"]
+    _verify_training_report_fused_optimizer(
+        report_payload,
+        requested=recipe.get("fused_optimizer"),
+    )
     bound_recipe = verified.get("bound_recipe", recipe)
     central_binding = verified.get("central_learner_binding")
     learner_ablation = verified.get("learner_ablation")

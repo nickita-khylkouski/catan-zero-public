@@ -89,7 +89,21 @@ def test_parent_report_retains_canonical_launch_authority(tmp_path) -> None:
         json.dumps(
             {
                 "steps_completed": 12,
+                "training_row_draws": 6_144,
+                "training_row_draws_semantics": (
+                    "base_sampler_draw_events; may repeat rows; excludes_policy_aux"
+                ),
                 "base_training_row_draws": 6_144,
+                "policy_aux_training_row_draws": 0,
+                "policy_base_active_training_row_draws": 1_399,
+                "policy_active_training_row_draws": 1_399,
+                "value_active_training_row_draws": 6_144,
+                "total_training_row_draws": 6_144,
+                "policy_base_active_rows": 1_399,
+                "policy_aux_active_rows": 0,
+                "policy_total_active_rows": 1_399,
+                "value_active_rows": 6_144,
+                "policy_kl_anchor_eligible_rows": 0,
                 # train_bc cannot bind this for an ordinary diagnostic corpus,
                 # but the canonical wrapper still owns the recipe identity.
                 "a1_canonical_parent_update_authority": None,
@@ -123,6 +137,131 @@ def test_parent_report_retains_canonical_launch_authority(tmp_path) -> None:
     assert bound["a1_canonical_parent_update_authority"] == authority
     assert bound["a1_parent_update_initialization"] == initialization
     assert bound["promotion_eligible"] is False
+    assert bound["a1_lineage_dose"]["objective_exposure"] == {
+        "measurement_status": "bound_exactly",
+        "measurement_scope": "current_dose",
+        "base_sampled_rows": 6_144,
+        "policy_base_active_sampled_rows": 1_399,
+        "policy_aux_active_sampled_rows": 0,
+        "policy_active_sampled_rows": 1_399,
+        "value_active_sampled_rows": 6_144,
+        "anchor_eligible_sampled_rows": 0,
+    }
+
+
+def test_parent_report_refuses_inconsistent_objective_counters(
+    tmp_path,
+) -> None:
+    report = tmp_path / "train.report.json"
+    report.write_text(
+        json.dumps(
+            {
+                "steps_completed": 12,
+                "training_row_draws": 6_144,
+                "training_row_draws_semantics": (
+                    "base_sampler_draw_events; may repeat rows; excludes_policy_aux"
+                ),
+                "base_training_row_draws": 6_144,
+                "policy_aux_training_row_draws": 0,
+                "policy_base_active_training_row_draws": 1_399,
+                "policy_active_training_row_draws": 1_400,
+                "value_active_training_row_draws": 6_144,
+                "total_training_row_draws": 6_144,
+                "policy_base_active_rows": 1_399,
+                "policy_aux_active_rows": 0,
+                "policy_total_active_rows": 1_400,
+                "value_active_rows": 6_144,
+                "policy_kl_anchor_eligible_rows": 0,
+            }
+        ),
+        encoding="utf-8",
+    )
+    checkpoint_sha = "sha256:" + ("a" * 64)
+
+    with pytest.raises(SystemExit, match="canonical parent lineage refused"):
+        train._bind_parent_report(  # noqa: SLF001
+            report,
+            initialization={
+                "mode": "exact_parent",
+                "parent": {"sha256": checkpoint_sha},
+                "initializer": {"sha256": checkpoint_sha},
+                "information_contract_migration": None,
+            },
+            canonical_authority={"diagnostic_only": True},
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("a1_lineage_dose", {"forged": True}),
+        ("a1_parent_update_initialization", {"mode": "other"}),
+        ("a1_canonical_parent_update_authority", {"diagnostic_only": False}),
+        ("promotion_eligible", True),
+    ),
+)
+def test_parent_report_refuses_conflicting_child_provenance(
+    tmp_path,
+    field: str,
+    value: object,
+) -> None:
+    report = tmp_path / "train.report.json"
+    payload = {
+        "steps_completed": 12,
+        "training_row_draws": 6_144,
+        "training_row_draws_semantics": (
+            "base_sampler_draw_events; may repeat rows; excludes_policy_aux"
+        ),
+        "base_training_row_draws": 6_144,
+        "policy_aux_training_row_draws": 0,
+        "policy_base_active_training_row_draws": 1_399,
+        "policy_active_training_row_draws": 1_399,
+        "value_active_training_row_draws": 6_144,
+        "total_training_row_draws": 6_144,
+        "policy_base_active_rows": 1_399,
+        "policy_aux_active_rows": 0,
+        "policy_total_active_rows": 1_399,
+        "value_active_rows": 6_144,
+        "policy_kl_anchor_eligible_rows": 0,
+        field: value,
+    }
+    report.write_text(json.dumps(payload), encoding="utf-8")
+    checkpoint_sha = "sha256:" + ("a" * 64)
+
+    with pytest.raises(SystemExit, match="canonical parent report"):
+        train._bind_parent_report(  # noqa: SLF001
+            report,
+            initialization={
+                "mode": "exact_parent",
+                "parent": {"sha256": checkpoint_sha},
+                "initializer": {"sha256": checkpoint_sha},
+                "information_contract_migration": None,
+            },
+            canonical_authority={"diagnostic_only": True},
+        )
+
+
+def test_raw_validation_semantics_are_consistent_across_frontier_steps() -> None:
+    source = {"loss": 1.25}
+
+    bound = train_bc._bind_raw_validation_semantics(  # noqa: SLF001
+        source,
+        training_value_player_outcome_balance_mode="sampler_balanced_v1",
+    )
+
+    assert source == {"loss": 1.25}
+    assert bound == {
+        "loss": 1.25,
+        "measure": "raw_row_concat",
+        "objective_matched": False,
+        "training_value_player_outcome_balance_mode": "sampler_balanced_v1",
+        "validation_value_player_outcome_balance_mode": "none",
+        "warning": (
+            "compatibility metric: raw held-out rows do not follow the "
+            "authenticated component->game->row training measure, and validation "
+            "uses natural outcomes rather than fitting training-only outcome balance"
+        ),
+    }
 
 
 def test_canonical_memmap_binds_authenticated_validation_manifest(tmp_path) -> None:

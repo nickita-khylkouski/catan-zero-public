@@ -755,6 +755,9 @@ def _bind_parent_report(
             "canonical parent report lacks exact optimizer-step/base-draw counters"
         )
     try:
+        objective_exposure = (
+            lineage.exact_objective_exposure_from_training_report(payload)
+        )
         dose = lineage.direct_lineage_dose(
             declared_producer_sha256=initialization["parent"]["sha256"],
             init_checkpoint_sha256=initialization["initializer"]["sha256"],
@@ -763,9 +766,25 @@ def _bind_parent_report(
             information_contract_migration=initialization.get(
                 "information_contract_migration"
             ),
+            objective_exposure=objective_exposure,
         )
     except lineage.LineageDoseError as error:
         raise SystemExit(f"canonical parent lineage refused: {error}") from error
+    expected_provenance = {
+        "a1_lineage_dose": dose,
+        "a1_parent_update_initialization": dict(initialization),
+        "a1_canonical_parent_update_authority": dict(canonical_authority),
+    }
+    for field, expected in expected_provenance.items():
+        current = payload.get(field)
+        if current is not None and current != expected:
+            raise SystemExit(
+                f"canonical parent report has conflicting pre-populated {field}"
+            )
+    if payload.get("promotion_eligible") not in {None, False}:
+        raise SystemExit(
+            "canonical parent report cannot pre-claim promotion eligibility"
+        )
     payload["a1_lineage_dose"] = dose
     payload["a1_parent_update_initialization"] = dict(initialization)
     payload["a1_canonical_parent_update_authority"] = dict(canonical_authority)

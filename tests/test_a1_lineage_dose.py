@@ -210,6 +210,75 @@ def test_direct_dose_binds_exact_objective_exposure() -> None:
     assert dose["objective_exposure"] == exposure
 
 
+def test_training_report_reconstructs_exact_objective_exposure() -> None:
+    exposure = lineage.exact_objective_exposure_from_training_report(
+        {
+            "training_row_draws": 6_144,
+            "training_row_draws_semantics": (
+                "base_sampler_draw_events; may repeat rows; excludes_policy_aux"
+            ),
+            "base_training_row_draws": 6_144,
+            "policy_aux_training_row_draws": 128,
+            "policy_base_active_training_row_draws": 1_399,
+            "policy_active_training_row_draws": 1_527,
+            "value_active_training_row_draws": 6_144,
+            "total_training_row_draws": 6_272,
+            "policy_base_active_rows": 1_399,
+            "policy_aux_active_rows": 128,
+            "policy_total_active_rows": 1_527,
+            "value_active_rows": 6_144,
+            "policy_kl_anchor_eligible_rows": 0,
+        }
+    )
+
+    assert exposure == {
+        "measurement_status": "bound_exactly",
+        "measurement_scope": "current_dose",
+        "base_sampled_rows": 6_144,
+        "policy_base_active_sampled_rows": 1_399,
+        "policy_aux_active_sampled_rows": 128,
+        "policy_active_sampled_rows": 1_527,
+        "value_active_sampled_rows": 6_144,
+        "anchor_eligible_sampled_rows": 0,
+    }
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("training_row_draws", 6_143),
+        ("total_training_row_draws", 6_143),
+        ("policy_total_active_rows", 1_398),
+        ("policy_aux_training_row_draws", True),
+    ),
+)
+def test_training_report_rejects_invalid_objective_counters(
+    field: str,
+    value: object,
+) -> None:
+    report = {
+        "training_row_draws": 6_144,
+        "training_row_draws_semantics": (
+            "base_sampler_draw_events; may repeat rows; excludes_policy_aux"
+        ),
+        "base_training_row_draws": 6_144,
+        "policy_aux_training_row_draws": 0,
+        "policy_base_active_training_row_draws": 1_399,
+        "policy_active_training_row_draws": 1_399,
+        "value_active_training_row_draws": 6_144,
+        "total_training_row_draws": 6_144,
+        "policy_base_active_rows": 1_399,
+        "policy_aux_active_rows": 0,
+        "policy_total_active_rows": 1_399,
+        "value_active_rows": 6_144,
+        "policy_kl_anchor_eligible_rows": 0,
+    }
+    report[field] = value
+
+    with pytest.raises(lineage.LineageDoseError):
+        lineage.exact_objective_exposure_from_training_report(report)
+
+
 def test_exact_objective_exposure_rejects_policy_arithmetic_drift() -> None:
     exposure = {
         "measurement_status": "bound_exactly",

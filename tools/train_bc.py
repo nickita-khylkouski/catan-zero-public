@@ -14568,6 +14568,28 @@ def _bind_composite_validation_provenance(
     )
 
 
+def _bind_raw_validation_semantics(
+    metrics: Mapping[str, Any],
+    *,
+    training_value_player_outcome_balance_mode: str,
+) -> dict[str, Any]:
+    """Label raw held-out metrics with the measure they actually evaluate."""
+
+    result = dict(metrics)
+    result["measure"] = "raw_row_concat"
+    result["objective_matched"] = False
+    result["training_value_player_outcome_balance_mode"] = str(
+        training_value_player_outcome_balance_mode
+    )
+    result["validation_value_player_outcome_balance_mode"] = "none"
+    result["warning"] = (
+        "compatibility metric: raw held-out rows do not follow the "
+        "authenticated component->game->row training measure, and validation "
+        "uses natural outcomes rather than fitting training-only outcome balance"
+    )
+    return result
+
+
 def main(
     argv: Sequence[str] | argparse.Namespace | None = None,
 ) -> None:
@@ -18024,6 +18046,14 @@ def main(
             ),
         )
 
+    def _evaluate_raw_validation_indices(eval_indices: np.ndarray) -> dict:
+        return _bind_raw_validation_semantics(
+            _evaluate_validation_indices(eval_indices),
+            training_value_player_outcome_balance_mode=(
+                args.value_player_outcome_balance_mode
+            ),
+        )
+
     if initialization_reference_path is not None:
         if global_step != 0 or optimizer_restored:
             raise SystemExit(
@@ -18045,7 +18075,7 @@ def main(
             import torch.distributed as dist
 
             dist.barrier()
-        initialization_holdout = _evaluate_validation_indices(
+        initialization_holdout = _evaluate_raw_validation_indices(
             validation_indices
         )
         if int(ddp["rank"]) == 0:
@@ -19606,7 +19636,7 @@ def main(
                     import torch.distributed as dist
 
                     dist.barrier()
-                snapshot_holdout = _evaluate_validation_indices(
+                snapshot_holdout = _evaluate_raw_validation_indices(
                     validation_indices
                 )
                 if int(ddp["rank"]) == 0:
@@ -20551,20 +20581,7 @@ def main(
                 "teacher_accuracy": _finalize_phase_stats(teacher_stats),
             }
         )
-        validation_metrics = _evaluate_validation_indices(validation_indices)
-        validation_metrics["measure"] = "raw_row_concat"
-        validation_metrics["objective_matched"] = False
-        validation_metrics["training_value_player_outcome_balance_mode"] = str(
-            args.value_player_outcome_balance_mode
-        )
-        validation_metrics["validation_value_player_outcome_balance_mode"] = (
-            "none"
-        )
-        validation_metrics["warning"] = (
-            "compatibility metric: raw held-out rows do not follow the "
-            "authenticated component->game->row training measure, and validation "
-            "uses natural outcomes rather than fitting training-only outcome balance"
-        )
+        validation_metrics = _evaluate_raw_validation_indices(validation_indices)
         metrics[-1]["validation"] = validation_metrics
         if is_memmap_composite and tuple(
             getattr(data, "component_game_sampling_ratios", tuple())

@@ -18,6 +18,83 @@ class LineageDoseError(ValueError):
     """Invalid initialization or cumulative learner-dose provenance."""
 
 
+def exact_objective_exposure_from_training_report(
+    report_payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Bind the trainer's exact current-dose objective counters into lineage."""
+
+    integer_fields = (
+        "training_row_draws",
+        "base_training_row_draws",
+        "policy_aux_training_row_draws",
+        "policy_base_active_training_row_draws",
+        "policy_active_training_row_draws",
+        "value_active_training_row_draws",
+        "policy_base_active_rows",
+        "policy_aux_active_rows",
+        "policy_total_active_rows",
+        "value_active_rows",
+        "policy_kl_anchor_eligible_rows",
+    )
+    values: dict[str, int] = {}
+    for field in integer_fields:
+        value = report_payload.get(field)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise LineageDoseError(
+                f"training report has invalid exact-dose counter {field!r}"
+            )
+        values[field] = value
+    total_draws = report_payload.get("total_training_row_draws")
+    if (
+        isinstance(total_draws, bool)
+        or not isinstance(total_draws, int)
+        or total_draws < 0
+        or values["policy_aux_training_row_draws"]
+        != values["policy_aux_active_rows"]
+        or values["training_row_draws"]
+        != values["base_training_row_draws"]
+        or values["policy_base_active_training_row_draws"]
+        != values["policy_base_active_rows"]
+        or values["policy_active_training_row_draws"]
+        != values["policy_total_active_rows"]
+        or values["value_active_training_row_draws"]
+        != values["value_active_rows"]
+        or values["policy_total_active_rows"]
+        != values["policy_base_active_rows"] + values["policy_aux_active_rows"]
+        or total_draws
+        != values["base_training_row_draws"]
+        + values["policy_aux_training_row_draws"]
+    ):
+        raise LineageDoseError("training report objective-dose arithmetic drift")
+    if report_payload.get("training_row_draws_semantics") != (
+        "base_sampler_draw_events; may repeat rows; excludes_policy_aux"
+    ):
+        raise LineageDoseError("training report row-draw semantics drift")
+    if values["value_active_rows"] > values["base_training_row_draws"]:
+        raise LineageDoseError(
+            "exact value-active dose exceeds the base draw dose"
+        )
+    if (
+        values["policy_kl_anchor_eligible_rows"]
+        > values["base_training_row_draws"]
+    ):
+        raise LineageDoseError(
+            "exact anchor-eligible dose exceeds the base draw dose"
+        )
+    return {
+        "measurement_status": "bound_exactly",
+        "measurement_scope": "current_dose",
+        "base_sampled_rows": values["base_training_row_draws"],
+        "policy_base_active_sampled_rows": values["policy_base_active_rows"],
+        "policy_aux_active_sampled_rows": values["policy_aux_active_rows"],
+        "policy_active_sampled_rows": values["policy_total_active_rows"],
+        "value_active_sampled_rows": values["value_active_rows"],
+        "anchor_eligible_sampled_rows": values[
+            "policy_kl_anchor_eligible_rows"
+        ],
+    }
+
+
 def _positive_int(value: Any, field: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise LineageDoseError(f"{field} must be a positive integer")
