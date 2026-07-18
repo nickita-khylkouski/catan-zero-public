@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
 from pathlib import Path
@@ -11,7 +12,7 @@ import pytest
 from tools import a1_b200_lr_dose_campaign as campaign
 from tools import a1_build_post_wave_composite as composite_builder
 from tools import a1_one_dose_train as one_dose
-from tools import train_bc
+from tools import train, train_bc
 
 
 def _sha(path: Path) -> str:
@@ -738,8 +739,9 @@ def test_completed_campaign_report_requires_real_policy_and_module_dose(
     assert summary["module_observed_steps"] == 8
 
 
+@pytest.mark.parametrize("max_steps", [128, 256])
 def test_lr_dose_profile_is_carried_by_and_replayed_from_descriptor(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch, max_steps: int
 ) -> None:
     base = {
         "schema_version": "memmap_composite_v2",
@@ -763,7 +765,7 @@ def test_lr_dose_profile_is_carried_by_and_replayed_from_descriptor(
     effective = {
         **composite_builder.LEARNER_RECIPE_OVERRIDES,
         "epochs": 1,
-        "max_steps": 128,
+        "max_steps": max_steps,
         "lr": 6e-5,
         "lr_warmup_steps": 16,
         "lr_schedule": "flat",
@@ -806,7 +808,396 @@ def test_lr_dose_profile_is_carried_by_and_replayed_from_descriptor(
     )
     assert replayed is not None
     assert replayed["learner_recipe_overrides"]["lr"] == 6e-5
-    assert replayed["learner_recipe_overrides"]["max_steps"] == 128
+    assert replayed["learner_recipe_overrides"]["max_steps"] == max_steps
+
+
+def _p10_diagnostic_descriptor(
+    tmp_path: Path,
+) -> tuple[Path, Path, dict[str, object], dict[str, object]]:
+    base_overrides = dict(composite_builder.LEARNER_RECIPE_OVERRIDES)
+    base = {
+        "schema_version": "memmap_composite_v2",
+        "diagnostic_only": False,
+        "promotion_eligible": True,
+        "learner_recipe_overrides": base_overrides,
+        "learner_recipe_overrides_sha256": one_dose._value_sha256(base_overrides),
+        "policy_distillation_component_ids": list(
+            one_dose.FRESH_POLICY_DISTILLATION_COMPONENT_IDS
+        ),
+        "value_training_component_ids": list(
+            one_dose.FRESH_VALUE_TRAINING_COMPONENT_IDS
+        ),
+    }
+    base_path = tmp_path / "production.json"
+    base_path.write_text(json.dumps(base, indent=2, sort_keys=True) + "\n")
+    config_path = (
+        Path(__file__).resolve().parents[1]
+        / "configs/training/"
+        "a1_parent_update_active_p10_35m_b200.schema1.json"
+    )
+    binding = train_bc._canonical_p10_diagnostic_config_binding(config_path)
+    verified = {
+        "data_kind": "production_composite_v2",
+        "data_path": base_path.resolve(),
+        "corpus_meta_file_sha256": one_dose._file_sha256(base_path),
+        "descriptor_fingerprint": one_dose._value_sha256(base),
+        "recipe": copy.deepcopy(binding["normalized_effective_recipe"]),
+        "contract_sha256": "sha256:" + "1" * 64,
+        "function_preserving_upgrade": None,
+        "learner_ablation": {
+            "reporting_contract": {
+                "diagnostic_dose_curve": True,
+                "canonical_recipe": (
+                    train_bc.CANONICAL_P10_DIAGNOSTIC_RECIPE_NAME
+                ),
+            }
+        },
+    }
+    derived_path = tmp_path / "p10-diagnostic.json"
+    derived = one_dose.bind_diagnostic_training_descriptor(
+        verified,
+        descriptor_path=derived_path,
+    )
+    one_dose._materialize_diagnostic_training_descriptor(derived)
+    payload = json.loads(derived_path.read_text())
+    return base_path, derived_path, payload, binding
+
+
+def test_exact_p10_profile_is_admitted_as_diagnostic_only(
+    tmp_path: Path, monkeypatch
+) -> None:
+    base_path, derived_path, payload, binding = _p10_diagnostic_descriptor(tmp_path)
+    monkeypatch.setattr(
+        train_bc,
+        "_preflight_memmap_composite_descriptor",
+        lambda _path: {
+            "diagnostic_only": False,
+            "promotion_eligible": True,
+            "descriptor_file_sha256": one_dose._file_sha256(base_path),
+            "descriptor_fingerprint": one_dose._value_sha256(
+                json.loads(base_path.read_text())
+            ),
+        },
+    )
+
+    replayed = train_bc._preflight_flywheel_diagnostic_derivative(
+        derived_path.resolve(), payload
+    )
+
+    assert replayed is not None
+    assert replayed["diagnostic_only"] is True
+    assert replayed["promotion_eligible"] is False
+    assert (
+        payload["diagnostic_derivation_authority"][
+            "canonical_p10_config_binding"
+        ]
+        == binding
+    )
+    assert binding["training_topology"] == {
+        "schema_version": "a1-canonical-p10-diagnostic-topology-v1",
+        "name": "b200-8gpu-ddp",
+        "world_size": 8,
+        "local_batch_size": 64,
+        "grad_accum_steps": 1,
+        "global_batch_size": 512,
+    }
+    assert binding["runtime_effective_recipe"]["world_size"] == 8
+    assert binding["runtime_effective_recipe"]["batch_size"] == 64
+    assert binding["runtime_effective_recipe"]["global_batch_size"] == 512
+    assert binding["normalized_effective_recipe"]["world_size"] == 1
+    assert binding["normalized_effective_recipe"]["batch_size"] == 512
+    assert binding["normalized_effective_recipe"]["global_batch_size"] == 512
+    assert replayed["learner_recipe_overrides"] == (
+        train_bc._canonical_p10_diagnostic_descriptor_overrides(
+            composite_builder.LEARNER_RECIPE_OVERRIDES,
+            binding["normalized_effective_recipe"],
+        )
+    )
+
+
+def test_p10_descriptor_and_compact_launcher_cross_bind_exact_runtime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _base_path, derived_path, payload, binding = _p10_diagnostic_descriptor(
+        tmp_path
+    )
+    parent = tmp_path / "parent.pt"
+    initializer = tmp_path / "initializer.pt"
+    parent.write_bytes(b"same exact checkpoint")
+    initializer.write_bytes(parent.read_bytes())
+    captured: dict[str, argparse.Namespace] = {}
+
+    class _StopAfterCompactRender(RuntimeError):
+        pass
+
+    def _capture_engine(args: argparse.Namespace) -> None:
+        captured["args"] = args
+        raise _StopAfterCompactRender
+
+    monkeypatch.setattr(train_bc, "main", _capture_engine)
+    config_path = Path(str(binding["config"]))
+    with pytest.raises(_StopAfterCompactRender):
+        train.main(
+            [
+                "--config",
+                str(config_path),
+                "--data",
+                str(derived_path),
+                "--checkpoint",
+                str(tmp_path / "candidate.pt"),
+                "--report",
+                str(tmp_path / "train.report.json"),
+                "--parent-checkpoint",
+                str(parent),
+                "--init-checkpoint",
+                str(initializer),
+                "--device",
+                "cuda",
+            ]
+        )
+
+    args = captured["args"]
+    ddp = {"enabled": True, "world_size": 8, "rank": 0, "local_rank": 0}
+    assert train_bc._effective_a1_learner_training_recipe(args, ddp) == binding[
+        "runtime_effective_recipe"
+    ]
+    assert args.a1_canonical_parent_update_authority == {
+        "schema_version": "a1-canonical-parent-update-runtime-authority-v1",
+        "config": str(config_path.resolve()),
+        "config_file_sha256": binding["config_file_sha256"],
+        "diagnostic_only": True,
+        "promotion_eligible": False,
+    }
+    composite_meta = {
+        "diagnostic_derivation_authority": payload[
+            "diagnostic_derivation_authority"
+        ]
+    }
+    train_bc._validate_canonical_p10_diagnostic_runtime(  # noqa: SLF001
+        args, ddp, composite_meta
+    )
+    direct_args = copy.deepcopy(args)
+    del direct_args.a1_canonical_parent_update_authority
+    with pytest.raises(SystemExit, match="exact compact tools/train.py runtime"):
+        train_bc._validate_canonical_p10_diagnostic_runtime(  # noqa: SLF001
+            direct_args, ddp, composite_meta
+        )
+    missing_initialization_args = copy.deepcopy(args)
+    del missing_initialization_args.a1_parent_update_initialization
+    with pytest.raises(SystemExit, match="parent-initializer authorities"):
+        train_bc._validate_canonical_p10_diagnostic_runtime(  # noqa: SLF001
+            missing_initialization_args, ddp, composite_meta
+        )
+    contradictory_exact_parent_args = copy.deepcopy(args)
+    contradictory_exact_parent_args.a1_parent_update_initialization[
+        "information_contract_migration"
+    ] = {}
+    with pytest.raises(SystemExit, match="parent-initializer authorities"):
+        train_bc._validate_canonical_p10_diagnostic_runtime(  # noqa: SLF001
+            contradictory_exact_parent_args, ddp, composite_meta
+        )
+
+    historical_bound = {
+        "learner_training_recipe": copy.deepcopy(
+            composite_builder.LEARNER_RECIPE_OVERRIDES
+        )
+    }
+    historical_shape_effective = copy.deepcopy(binding["runtime_effective_recipe"])
+    historical_shape_effective.update(
+        {
+            "policy_kl_anchor_direction": "forward",
+            "value_player_outcome_balance_mode": "none",
+        }
+    )
+    assert train_bc._validate_a1_learner_training_recipe(  # noqa: SLF001
+        args, ddp, copy.deepcopy(historical_bound)
+    ) == historical_shape_effective
+
+    with pytest.raises(SystemExit):
+        train_bc._validate_a1_learner_training_recipe(  # noqa: SLF001
+            direct_args, ddp, copy.deepcopy(historical_bound)
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("base_sampler", "coverage_importance_v1"),
+        ("policy_aux_sampling_mode", "weighted_with_replacement_legacy_v1"),
+        ("optimizer", "adam"),
+        ("ddp_find_unused_parameters", True),
+        ("train_diagnostics_every_batches", 5),
+        ("require_feature_learning_signal_modules", "value_head"),
+        ("minimum_initial_road_policy_mass_fraction", 0.01),
+    ],
+)
+def test_p10_runtime_rejects_catalog_namespace_drift_before_checkpoint(
+    tmp_path: Path, field: str, value: object
+) -> None:
+    config_path = (
+        Path(__file__).resolve().parents[1]
+        / "configs/training/"
+        "a1_parent_update_active_p10_35m_b200.schema1.json"
+    )
+    binding = train_bc._canonical_p10_diagnostic_config_binding(config_path)
+    config, engine = train._load_recipe(config_path)  # noqa: SLF001
+    initializer = tmp_path / "initializer.pt"
+    initializer.write_bytes(b"initializer")
+    initializer_ref = {
+        "path": str(initializer.resolve()),
+        "sha256": one_dose._file_sha256(initializer),
+    }
+    args = train._engine_namespace(  # noqa: SLF001
+        config=config,
+        engine_settings=engine,
+        public_args=argparse.Namespace(
+            data="/tmp/production.json",
+            checkpoint="/tmp/candidate.pt",
+            report="/tmp/train.report.json",
+            init_checkpoint=str(initializer),
+            device="cuda",
+            host_lock_file="/tmp/train.lock",
+            allow_concurrent_bc=False,
+        ),
+    )
+    args.a1_canonical_parent_update_authority = {
+        "schema_version": "a1-canonical-parent-update-runtime-authority-v1",
+        "config": binding["config"],
+        "config_file_sha256": binding["config_file_sha256"],
+        "diagnostic_only": True,
+        "promotion_eligible": False,
+    }
+    args.a1_parent_update_initialization = {
+        "schema_version": "a1-canonical-parent-initializer-v1",
+        "mode": "exact_parent",
+        "parent": copy.deepcopy(initializer_ref),
+        "initializer": initializer_ref,
+        "information_contract_migration": None,
+    }
+    setattr(args, field, value)
+    composite_meta = {
+        "diagnostic_derivation_authority": {
+            "canonical_p10_config_binding": binding
+        }
+    }
+
+    with pytest.raises(SystemExit, match="catalog-bound runtime recipe"):
+        train_bc._validate_canonical_p10_diagnostic_runtime(  # noqa: SLF001
+            args,
+            {"enabled": True, "world_size": 8, "rank": 0, "local_rank": 0},
+            composite_meta,
+        )
+
+
+def test_p10_runtime_rejects_noncanonical_execution_topology(
+    tmp_path: Path,
+) -> None:
+    config_path = (
+        Path(__file__).resolve().parents[1]
+        / "configs/training/"
+        "a1_parent_update_active_p10_35m_b200.schema1.json"
+    )
+    binding = train_bc._canonical_p10_diagnostic_config_binding(config_path)
+    config, engine = train._load_recipe(config_path)  # noqa: SLF001
+    initializer = tmp_path / "initializer.pt"
+    initializer.write_bytes(b"initializer")
+    initializer_ref = {
+        "path": str(initializer.resolve()),
+        "sha256": one_dose._file_sha256(initializer),
+    }
+    args = train._engine_namespace(  # noqa: SLF001
+        config=config,
+        engine_settings=engine,
+        public_args=argparse.Namespace(
+            data="/tmp/production.json",
+            checkpoint="/tmp/candidate.pt",
+            report="/tmp/train.report.json",
+            init_checkpoint=str(initializer),
+            device="cuda",
+            host_lock_file="/tmp/train.lock",
+            allow_concurrent_bc=False,
+        ),
+    )
+    args.a1_canonical_parent_update_authority = {
+        "schema_version": "a1-canonical-parent-update-runtime-authority-v1",
+        "config": binding["config"],
+        "config_file_sha256": binding["config_file_sha256"],
+        "diagnostic_only": True,
+        "promotion_eligible": False,
+    }
+    args.a1_parent_update_initialization = {
+        "schema_version": "a1-canonical-parent-initializer-v1",
+        "mode": "exact_parent",
+        "parent": copy.deepcopy(initializer_ref),
+        "initializer": initializer_ref,
+        "information_contract_migration": None,
+    }
+
+    with pytest.raises(SystemExit, match="catalog-bound runtime recipe"):
+        train_bc._validate_canonical_p10_diagnostic_runtime(  # noqa: SLF001
+            args,
+            {"enabled": False, "world_size": 1, "rank": 0, "local_rank": 0},
+            {
+                "diagnostic_derivation_authority": {
+                    "canonical_p10_config_binding": binding
+                }
+            },
+        )
+
+
+@pytest.mark.parametrize(
+    ("section", "field", "value"),
+    [
+        ("train_config", "max_steps", 11),
+        ("train_config", "max_steps", 13),
+        ("train_config", "policy_aux_active_batch_size", 0),
+        ("train_config", "policy_aux_active_batch_size", 65),
+        ("train_config", "policy_aux_loss_weight", 0.2),
+        ("train_config", "epochs", 1),
+        (
+            "train_config",
+            "policy_aux_sampling_mode",
+            "weighted_with_replacement_legacy_v1",
+        ),
+        ("train_config", "optimizer", "adam"),
+        ("train_config", "weight_decay", 0.0),
+        ("train_config", "fused_optimizer", False),
+        ("train_config", "value_trunk_grad_scale", 1.0),
+        ("train_config", "phase_weights", "PLAY_TURN=4.0"),
+        ("engine_settings", "train_diagnostics_every_batches", 5),
+        ("engine_settings", "objective_gradient_interference_every_batches", 7),
+        ("engine_settings", "require_feature_learning_signal_modules", "value_head"),
+        ("engine_settings", "minimum_initial_road_policy_mass_fraction", 0.01),
+    ],
+)
+def test_p10_diagnostic_profile_rejects_one_field_drift(
+    tmp_path: Path,
+    monkeypatch,
+    section: str,
+    field: str,
+    value: object,
+) -> None:
+    base_path, derived_path, payload, _binding = _p10_diagnostic_descriptor(tmp_path)
+    payload["diagnostic_derivation_authority"]["canonical_p10_config_binding"][
+        section
+    ][field] = value
+    monkeypatch.setattr(
+        train_bc,
+        "_preflight_memmap_composite_descriptor",
+        lambda _path: {
+            "diagnostic_only": False,
+            "promotion_eligible": True,
+            "descriptor_file_sha256": one_dose._file_sha256(base_path),
+            "descriptor_fingerprint": one_dose._value_sha256(
+                json.loads(base_path.read_text())
+            ),
+        },
+    )
+
+    with pytest.raises(SystemExit):
+        train_bc._preflight_flywheel_diagnostic_derivative(
+            derived_path.resolve(), payload
+        )
 
 
 def test_diagnostic_parent_may_be_exact_sealed_recent_history(

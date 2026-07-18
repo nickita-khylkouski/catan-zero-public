@@ -5687,6 +5687,366 @@ def _validate_flywheel_component_provenance(
 FLYWHEEL_DIAGNOSTIC_DERIVATION_SCHEMA = (
     "flywheel-diagnostic-descriptor-derivation-v1"
 )
+CANONICAL_P10_DIAGNOSTIC_RECIPE_NAME = (
+    "a1-parent-update-active-p10-35m-b200"
+)
+CANONICAL_P10_DIAGNOSTIC_BINDING_SCHEMA = (
+    "a1-canonical-p10-diagnostic-config-binding-v1"
+)
+_CANONICAL_P10_DYNAMIC_RUNTIME_FIELDS = {
+    "data",
+    "data_fingerprint",
+    "grow_from_checkpoint",
+    "grow_from_checkpoint_sha256",
+    "init_checkpoint",
+    "init_checkpoint_sha256",
+    "meaningful_public_history_schema",
+    "public_card_count_feature_schema",
+    "training_excluded_game_seed_set_sha256",
+    "validation_contract_file_sha256",
+    "validation_game_seed_set_sha256",
+}
+
+
+def _canonical_p10_diagnostic_config_binding(
+    config_path: str | Path,
+) -> dict[str, object]:
+    """Replay the complete cataloged P10 recipe for a diagnostic derivative."""
+
+    try:
+        from tools import train as canonical_train
+
+        path = Path(config_path).expanduser().resolve(strict=True)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        config, engine = canonical_train._load_recipe(path)  # noqa: SLF001
+    except (OSError, UnicodeError, json.JSONDecodeError, SystemExit) as error:
+        raise SystemExit(f"canonical P10 diagnostic config refused: {error}") from error
+    if (
+        not isinstance(payload, dict)
+        or payload.get("name") != CANONICAL_P10_DIAGNOSTIC_RECIPE_NAME
+        or engine.get("initialization_mode") != "parent_fresh_optimizer"
+    ):
+        raise SystemExit("canonical P10 diagnostic config identity drift")
+    public_args = argparse.Namespace(
+        data="/canonical-p10-diagnostic/composite.json",
+        checkpoint="/canonical-p10-diagnostic/candidate.pt",
+        report="/canonical-p10-diagnostic/train.report.json",
+        init_checkpoint="/canonical-p10-diagnostic/initializer.pt",
+        device="cuda",
+        host_lock_file="/canonical-p10-diagnostic/train.lock",
+        allow_concurrent_bc=False,
+    )
+    namespace = canonical_train._engine_namespace(  # noqa: SLF001
+        config=config,
+        engine_settings=engine,
+        public_args=public_args,
+    )
+    runtime_topology = {
+        "schema_version": "a1-canonical-p10-diagnostic-topology-v1",
+        "name": "b200-8gpu-ddp",
+        "world_size": 8,
+        "local_batch_size": int(namespace.batch_size),
+        "grad_accum_steps": int(namespace.grad_accum_steps),
+        "global_batch_size": (
+            8 * int(namespace.batch_size) * int(namespace.grad_accum_steps)
+        ),
+    }
+    if runtime_topology != {
+        "schema_version": "a1-canonical-p10-diagnostic-topology-v1",
+        "name": "b200-8gpu-ddp",
+        "world_size": 8,
+        "local_batch_size": 64,
+        "grad_accum_steps": 1,
+        "global_batch_size": 512,
+    }:
+        raise SystemExit("canonical P10 diagnostic topology drift")
+    runtime_effective = _effective_a1_learner_training_recipe(
+        namespace,
+        {
+            "enabled": True,
+            "world_size": 8,
+            "rank": 0,
+            "local_rank": 0,
+        },
+    )
+    normalized_runtime_effective = copy.deepcopy(runtime_effective)
+    normalized_runtime_effective.update(
+        {
+            "world_size": 1,
+            "batch_size": 512,
+            "global_batch_size": 512,
+        }
+    )
+    train_config = dataclasses.asdict(config)
+    engine_settings = copy.deepcopy(engine)
+    runtime_semantic_settings = {
+        name: copy.deepcopy(getattr(namespace, name))
+        for name in sorted(
+            set(train_config)
+            | set(engine_settings)
+            | set(canonical_train._CANONICAL_RUNTIME_DEFAULTS)  # noqa: SLF001
+        )
+        if name not in _CANONICAL_P10_DYNAMIC_RUNTIME_FIELDS
+        and hasattr(namespace, name)
+    }
+    normalized_catalog_recipe = copy.deepcopy(train_config)
+    for key in (
+        "base_sampler",
+        "data_loader_prefetch",
+        "data_loader_workers",
+        "minimum_discard_policy_mass_fraction",
+        "minimum_initial_road_policy_mass_fraction",
+        "minimum_initial_settlement_policy_mass_fraction",
+        "minimum_move_robber_policy_mass_fraction",
+        "minimum_feature_learning_signal_observations",
+        "min_35m_params",
+        "max_35m_params",
+        "objective_gradient_interference_every_batches",
+        "require_feature_learning_signal_modules",
+        "scalar_value_loss_readout",
+        "scalar_value_loss_scale",
+        "scalar_value_objective",
+        "train_diagnostics_every_batches",
+    ):
+        normalized_catalog_recipe[key] = copy.deepcopy(engine[key])
+    # This is the single allowed identity normalization. The catalog describes
+    # the physical 8x64 B200 execution, while diagnostic descriptors retain the
+    # existing logical one-rank 512-row recipe convention. Runtime admission
+    # below still requires the physical topology byte-for-byte and never uses
+    # this normalized view to authorize execution.
+    normalized_catalog_recipe.update(
+        {
+            "world_size": 1,
+            "batch_size": 512,
+            "grad_accum_steps": 1,
+            "global_batch_size": 512,
+        }
+    )
+    result = {
+        "schema_version": CANONICAL_P10_DIAGNOSTIC_BINDING_SCHEMA,
+        "name": CANONICAL_P10_DIAGNOSTIC_RECIPE_NAME,
+        "config": str(path),
+        "config_file_sha256": _sha256_existing_file(path),
+        "config_canonical_sha256": _canonical_json_sha256(payload),
+        "train_config": train_config,
+        "train_config_sha256": _canonical_json_sha256(train_config),
+        "engine_settings": engine_settings,
+        "engine_settings_sha256": _canonical_json_sha256(engine_settings),
+        "canonical_runtime_defaults_sha256": _canonical_json_sha256(
+            canonical_train._CANONICAL_RUNTIME_DEFAULTS  # noqa: SLF001
+        ),
+        "runtime_semantic_settings": runtime_semantic_settings,
+        "runtime_semantic_settings_sha256": _canonical_json_sha256(
+            runtime_semantic_settings
+        ),
+        "runtime_effective_recipe": runtime_effective,
+        "runtime_effective_recipe_sha256": _canonical_json_sha256(
+            runtime_effective
+        ),
+        "normalized_effective_recipe": normalized_catalog_recipe,
+        "normalized_effective_recipe_sha256": _canonical_json_sha256(
+            normalized_catalog_recipe
+        ),
+        "normalized_runtime_effective_recipe": normalized_runtime_effective,
+        "normalized_runtime_effective_recipe_sha256": _canonical_json_sha256(
+            normalized_runtime_effective
+        ),
+        "training_topology": runtime_topology,
+        "launcher_sha256": _sha256_existing_file(Path(canonical_train.__file__)),
+        "trainer_sha256": _sha256_existing_file(Path(__file__)),
+    }
+    return result
+
+
+def _canonical_p10_diagnostic_descriptor_overrides(
+    base_overrides: Mapping[str, object],
+    normalized_effective_recipe: Mapping[str, object],
+) -> dict[str, object]:
+    """Project only descriptor-owned fields from the complete P10 authority."""
+
+    required_additions = (
+        "forced_row_value_action_type_weights",
+        "trunk_lr_mult",
+        "epochs",
+        "max_steps",
+        "lr",
+        "lr_warmup_steps",
+        "lr_schedule",
+        "policy_aux_active_batch_size",
+        "policy_aux_loss_weight",
+        "policy_aux_sampling_mode",
+    )
+    required = (*base_overrides.keys(), *required_additions)
+    missing = [key for key in required if key not in normalized_effective_recipe]
+    if missing:
+        raise SystemExit(
+            "canonical P10 effective recipe lost descriptor fields: "
+            f"{sorted(missing)}"
+        )
+    return {
+        key: copy.deepcopy(normalized_effective_recipe[key])
+        for key in required
+    }
+
+
+def _validate_canonical_p10_diagnostic_runtime(
+    args: argparse.Namespace,
+    ddp: Mapping[str, int | bool],
+    composite_meta: Mapping[str, object] | None,
+) -> None:
+    """Cross-bind live argv/DDP semantics to the authenticated P10 derivative."""
+
+    derivation = (
+        composite_meta.get("diagnostic_derivation_authority")
+        if isinstance(composite_meta, Mapping)
+        else None
+    )
+    binding = (
+        derivation.get("canonical_p10_config_binding")
+        if isinstance(derivation, Mapping)
+        else None
+    )
+    if binding is None:
+        return
+    if not isinstance(binding, dict):
+        raise SystemExit("canonical P10 diagnostic runtime binding is malformed")
+    expected_binding = _canonical_p10_diagnostic_config_binding(
+        binding.get("config", "")
+    )
+    expected_runtime_authority = {
+        "schema_version": "a1-canonical-parent-update-runtime-authority-v1",
+        "config": expected_binding["config"],
+        "config_file_sha256": expected_binding["config_file_sha256"],
+        "diagnostic_only": True,
+        "promotion_eligible": False,
+    }
+    runtime_authority = getattr(
+        args, "a1_canonical_parent_update_authority", None
+    )
+    initialization = getattr(args, "a1_parent_update_initialization", None)
+    parent_ref = (
+        initialization.get("parent")
+        if isinstance(initialization, Mapping)
+        else None
+    )
+    initializer_ref = (
+        initialization.get("initializer")
+        if isinstance(initialization, Mapping)
+        else None
+    )
+    if (
+        runtime_authority != expected_runtime_authority
+        or not isinstance(initialization, dict)
+        or set(initialization)
+        != {
+            "schema_version",
+            "mode",
+            "parent",
+            "initializer",
+            "information_contract_migration",
+        }
+        or initialization.get("schema_version")
+        != "a1-canonical-parent-initializer-v1"
+        or initialization.get("mode")
+        not in {"exact_parent", "information_contract_migration"}
+        or not isinstance(parent_ref, dict)
+        or set(parent_ref) != {"path", "sha256"}
+        or not isinstance(initializer_ref, dict)
+        or set(initializer_ref) != {"path", "sha256"}
+    ):
+        raise SystemExit(
+            "canonical P10 diagnostic execution requires the exact compact "
+            "tools/train.py runtime and parent-initializer authorities"
+        )
+    try:
+        live_initializer_path = Path(str(args.init_checkpoint)).expanduser().resolve(
+            strict=True
+        )
+    except OSError as error:
+        raise SystemExit(
+            f"canonical P10 diagnostic initializer cannot be resolved: {error}"
+        ) from error
+    try:
+        live_parent_path = Path(
+            str(parent_ref.get("path", ""))
+            if isinstance(parent_ref, Mapping)
+            else ""
+        ).expanduser().resolve(strict=True)
+    except OSError as error:
+        raise SystemExit(
+            f"canonical P10 diagnostic parent cannot be resolved: {error}"
+        ) from error
+    migration = initialization["information_contract_migration"]
+    migration_receipt = (
+        str(migration.get("receipt", ""))
+        if isinstance(migration, Mapping)
+        else ""
+    )
+    try:
+        from tools import train as canonical_train
+
+        replayed_initialization = canonical_train._parent_initializer_binding(  # noqa: SLF001
+            argparse.Namespace(
+                parent_checkpoint=str(live_parent_path),
+                init_checkpoint=str(live_initializer_path),
+                information_contract_migration_receipt=migration_receipt,
+            )
+        )
+    except (OSError, SystemExit) as error:
+        raise SystemExit(
+            f"canonical P10 diagnostic parent-initializer replay refused: {error}"
+        ) from error
+    if (
+        replayed_initialization != initialization
+        or parent_ref.get("sha256") != _sha256_existing_file(live_parent_path)
+        or Path(str(initializer_ref["path"])).expanduser().resolve(strict=False)
+        != live_initializer_path
+        or initializer_ref.get("sha256")
+        != _sha256_existing_file(live_initializer_path)
+    ):
+        raise SystemExit(
+            "canonical P10 diagnostic execution requires the exact compact "
+            "tools/train.py runtime and parent-initializer authorities"
+        )
+    expected_runtime_settings = binding["runtime_semantic_settings"]
+    missing_runtime_settings = [
+        name for name in expected_runtime_settings if not hasattr(args, name)
+    ]
+    if missing_runtime_settings:
+        raise SystemExit(
+            "live P10 diagnostic runtime is missing catalog settings: "
+            f"{missing_runtime_settings}"
+        )
+    observed_runtime_settings = {
+        name: copy.deepcopy(getattr(args, name))
+        for name in expected_runtime_settings
+    }
+    runtime_effective = _effective_a1_learner_training_recipe(
+        args, dict(ddp)
+    )
+    expected_topology = binding["training_topology"]
+    observed_topology = {
+        "schema_version": "a1-canonical-p10-diagnostic-topology-v1",
+        "name": "b200-8gpu-ddp",
+        "world_size": int(ddp["world_size"]),
+        "local_batch_size": int(args.batch_size),
+        "grad_accum_steps": int(args.grad_accum_steps),
+        "global_batch_size": (
+            int(ddp["world_size"])
+            * int(args.batch_size)
+            * int(args.grad_accum_steps)
+        ),
+    }
+    if (
+        binding != expected_binding
+        or observed_runtime_settings != expected_runtime_settings
+        or runtime_effective != binding["runtime_effective_recipe"]
+        or observed_topology != expected_topology
+    ):
+        raise SystemExit(
+            "live P10 diagnostic argv/DDP semantics differ from the complete "
+            "catalog-bound runtime recipe"
+        )
 
 
 def _preflight_flywheel_diagnostic_derivative(
@@ -5715,6 +6075,13 @@ def _preflight_flywheel_diagnostic_derivative(
         "diagnostic_only",
         "promotion_eligible",
     }
+    p10_config_binding = (
+        authority.get("canonical_p10_config_binding")
+        if isinstance(authority, dict)
+        else None
+    )
+    if p10_config_binding is not None:
+        expected_authority_keys.add("canonical_p10_config_binding")
     base_ref = authority.get("base_descriptor") if isinstance(authority, dict) else None
     semantic_delta = authority.get("semantic_delta") if isinstance(authority, dict) else None
     if (
@@ -5795,6 +6162,10 @@ def _preflight_flywheel_diagnostic_derivative(
         typed_key = "forced_row_value_action_type_weights"
         public_card_key = "public_card_lr_mult"
         surprise_key = "per_game_policy_surprise_weighting"
+        p10_extra_override_keys = {
+            "trunk_lr_mult",
+            "policy_aux_sampling_mode",
+        }
         lr_dose_keys = {
             "epochs",
             "max_steps",
@@ -5812,6 +6183,7 @@ def _preflight_flywheel_diagnostic_derivative(
             *science_profile_keys,
             *lr_dose_keys,
             *optional_lr_dose_keys,
+            *(p10_extra_override_keys if p10_config_binding is not None else set()),
         }
         science_profile_present = bool(changed & science_profile_keys)
         science_profile_valid = True
@@ -5832,8 +6204,9 @@ def _preflight_flywheel_diagnostic_derivative(
             # A campaign descriptor carries the complete optimizer profile so
             # LR/warmup/dose can never be authenticated piecemeal.  Values are
             # the preregistered four short arms plus the selected 256-step
-            # replay; this is not a generic recipe-override escape hatch.
-            lr_dose_valid = (
+            # replay. P10 is admitted only through the complete catalog/code
+            # binding below, never from an argv-inspired tuple.
+            campaign_lr_dose_valid = (
                 lr_dose_keys.issubset(effective_overrides)
                 and not (lr_dose_keys | optional_lr_dose_keys).intersection(
                     base_overrides
@@ -5852,21 +6225,41 @@ def _preflight_flywheel_diagnostic_derivative(
                     or effective_overrides.get("lr_warmup_steps") == 16
                 )
             )
-            if "policy_aux_active_batch_size" in effective_overrides:
+            if (
+                campaign_lr_dose_valid
+                and "policy_aux_active_batch_size" in effective_overrides
+            ):
                 policy_aux = effective_overrides["policy_aux_active_batch_size"]
-                lr_dose_valid = (
-                    lr_dose_valid
+                campaign_lr_dose_valid = (
+                    campaign_lr_dose_valid
                     and type(policy_aux) is int
                     and 1 <= policy_aux <= 512
                 )
                 policy_aux_loss_weight = effective_overrides.get(
                     "policy_aux_loss_weight"
                 )
-                lr_dose_valid = (
-                    lr_dose_valid
+                campaign_lr_dose_valid = (
+                    campaign_lr_dose_valid
                     and type(policy_aux_loss_weight) is float
                     and 0.0 < policy_aux_loss_weight <= 4.0
                 )
+            p10_lr_dose_valid = False
+            if isinstance(p10_config_binding, dict):
+                expected_p10_binding = _canonical_p10_diagnostic_config_binding(
+                    p10_config_binding.get("config", "")
+                )
+                normalized = expected_p10_binding[
+                    "normalized_effective_recipe"
+                ]
+                p10_lr_dose_valid = (
+                    p10_config_binding == expected_p10_binding
+                    and effective_overrides
+                    == _canonical_p10_diagnostic_descriptor_overrides(
+                        base_overrides,
+                        normalized,
+                    )
+                )
+            lr_dose_valid = campaign_lr_dose_valid or p10_lr_dose_valid
         if (
             set(base_overrides) - set(effective_overrides)
             or set(effective_overrides) - set(base_overrides) - allowed_additions
@@ -5878,6 +6271,7 @@ def _preflight_flywheel_diagnostic_derivative(
                 *science_profile_keys,
                 *lr_dose_keys,
                 *optional_lr_dose_keys,
+                *p10_extra_override_keys,
             }
             or (
                 "per_game_policy_weight" in changed
@@ -12473,6 +12867,14 @@ def _validate_a1_learner_training_recipe(
         _bind_late_a1_recipe_fields(
             projected_effective, projected_args, immutable_expected
         )
+        if "policy_kl_anchor_direction" in immutable_expected:
+            # Mirror the historical-shape normalization applied to ``effective``
+            # above. Omitting this from the catalog projection made every
+            # canonical parent launcher reject itself whenever the immutable
+            # composite explicitly bound the otherwise-default KL direction.
+            projected_effective["policy_kl_anchor_direction"] = str(
+                getattr(projected_args, "policy_kl_anchor_direction", "forward")
+            )
         if (
             not isinstance(canonical_parent_authority, dict)
             or set(canonical_parent_authority) != expected_authority_fields
@@ -14867,6 +15269,12 @@ def main(
         a1_preflight_meta,
     )
     _require_production_composite_execution_authority(args, a1_preflight_meta)
+    # This descriptor-side check happens before checkpoint deserialization, but
+    # it is not execution authority. _validate_a1_learner_training_recipe later
+    # requires tools/train.py's structured canonical runtime authority and
+    # independently catalog-replays that config against the live argv/DDP
+    # projection. Calling train_bc directly therefore remains fail-closed.
+    _validate_canonical_p10_diagnostic_runtime(args, ddp, a1_preflight_meta)
     checkpoint_load_path, _authenticated_initializer_snapshot = (
         _snapshot_authenticated_production_initializer(args, a1_preflight_meta)
     )
