@@ -3475,15 +3475,34 @@ def _optimizer_lr_dose_attestation(
     if updates < 0 or len(lr_area_by_group) != len(optimizer.param_groups):
         raise ValueError("invalid optimizer LR-dose accounting")
     groups = []
+    semantic_identities: set[tuple[str, str]] = set()
     for index, (area, group) in enumerate(
         zip(lr_area_by_group, optimizer.param_groups, strict=True)
     ):
         area = float(area)
         if not math.isfinite(area) or area < 0.0:
             raise ValueError("optimizer LR area must be finite and non-negative")
+        group_name = group.get("group_name")
+        decay_role = group.get("weight_decay_role")
+        if (
+            not isinstance(group_name, str)
+            or not group_name
+            or decay_role not in {"decay", "no_decay"}
+        ):
+            raise ValueError(
+                "optimizer LR-dose groups require stable semantic identity"
+            )
+        semantic_identity = (group_name, decay_role)
+        if semantic_identity in semantic_identities:
+            raise ValueError(
+                "optimizer LR-dose semantic group identities must be unique"
+            )
+        semantic_identities.add(semantic_identity)
         groups.append(
             {
                 "group_index": int(index),
+                "group_name": group_name,
+                "weight_decay_role": decay_role,
                 "base_lr": float(group.get("base_lr", group["lr"])),
                 "integrated_lr_area": area,
                 "mean_applied_lr": area / updates if updates > 0 else None,
@@ -3493,7 +3512,7 @@ def _optimizer_lr_dose_attestation(
     if not math.isfinite(multiplier_sum) or multiplier_sum < 0.0:
         raise ValueError("schedule multiplier area must be finite and non-negative")
     return {
-        "schema_version": "optimizer-lr-dose-v1",
+        "schema_version": "optimizer-lr-dose-v2",
         "scope": "updates_applied_in_this_process_invocation",
         "applied_updates": updates,
         "integrated_schedule_multiplier_area": multiplier_sum,
@@ -38825,8 +38844,8 @@ SHARED_ACTION_MODULE_ATTRS: tuple[str, ...] = ("action_encoder",)
 def _optimizer_param_group_report(params, *, base_lr: float) -> list[dict[str, object]]:
     """Describe optimizer groups without mutating the objects passed to torch.
 
-    ``_group_name`` is private construction metadata and is stripped by
-    ``_make_optimizer`` before optimizer/checkpoint state is created.
+    ``_group_name`` is private construction metadata. ``_make_optimizer``
+    converts it to the durable ``group_name`` used by dose attestations.
     """
     param_groups = list(params)
     if not param_groups or not isinstance(param_groups[0], dict):
@@ -38908,6 +38927,7 @@ def _split_adamw_weight_decay_groups(
                     **metadata,
                     "params": decay_params,
                     "weight_decay": float(weight_decay),
+                    "weight_decay_role": "decay",
                 }
             )
             assigned.extend(id(parameter) for parameter in decay_params)
@@ -38917,6 +38937,7 @@ def _split_adamw_weight_decay_groups(
                     **metadata,
                     "params": no_decay_params,
                     "weight_decay": 0.0,
+                    "weight_decay_role": "no_decay",
                 }
             )
             assigned.extend(id(parameter) for parameter in no_decay_params)
@@ -39193,6 +39214,8 @@ def _make_optimizer(params, args, device):
         trainable_params = [
             {
                 **{key: value for key, value in group.items() if key != "_group_name"},
+                "group_name": str(group.get("_group_name", "unnamed")),
+                "weight_decay_role": "no_decay",
                 "params": [p for p in group["params"] if p.requires_grad],
             }
             for group in param_groups
@@ -39228,7 +39251,13 @@ def _make_optimizer(params, args, device):
             normalized_groups = (
                 trainable_params
                 if grouped_input
-                else [{"params": trainable_params}]
+                else [
+                    {
+                        "params": trainable_params,
+                        "group_name": "historical_flat",
+                        "weight_decay_role": "no_decay",
+                    }
+                ]
             )
             trainable_params = _split_adamw_weight_decay_groups(
                 normalized_groups,
@@ -39237,12 +39266,16 @@ def _make_optimizer(params, args, device):
     if bool(args.fused_optimizer) and str(device).startswith("cuda"):
         kwargs["fused"] = True
     try:
-        return cls(trainable_params, **kwargs)
+        optimizer = cls(trainable_params, **kwargs)
     except TypeError:
         if "fused" not in kwargs:
             raise
         kwargs.pop("fused", None)
-        return cls(trainable_params, **kwargs)
+        optimizer = cls(trainable_params, **kwargs)
+    for group in optimizer.param_groups:
+        group.setdefault("group_name", "historical_flat")
+        group.setdefault("weight_decay_role", "no_decay")
+    return optimizer
 
 
 def _preflight_required_feature_signal_modules(

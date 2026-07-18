@@ -137,7 +137,7 @@
       ]
     },
     "a1-parent-update-shared-action25-35m-b200": {
-      "recipe_canonical_sha256": "7547f81410dc55a63c49d5e45308a3b1527e11d805af8f6f378aaa3698f5bad3",
+      "recipe_canonical_sha256": "9a5cf21fd628ca9ffd96b193bc610b7e09477c4ae34e5a74c0a877d16cb431ec",
       "authorized": false,
       "reason": "shared_action_trust_region_requires_fresh_commissioning",
       "unresolved_requirements": [

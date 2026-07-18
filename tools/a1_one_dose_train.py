@@ -5820,6 +5820,7 @@ def _append_current_parent_topology_cli(
         architecture_upgrade.MODULE_CURRENT_V5_TOPOLOGY_VALUE_TOWER_SPLIT_1,
         architecture_upgrade.MODULE_CURRENT_V5_SPLIT1_TOPOLOGY_ONLY,
         information_migration.MIGRATION_CURRENT_V2_TO_V6_TOPOLOGY_SPLIT1,
+        information_migration.MIGRATION_CURRENT_V2_TO_V6_TOPOLOGY_SPLIT1_PUBLIC_RESOURCE_V8,
     }:
         return
     command.extend(
@@ -5841,7 +5842,10 @@ def _append_current_parent_topology_cli(
             (
                 "rust_entity_adapter_v6_exact_actor_resources_initial_road_two_hop"
                 if initializer_identity
-                == information_migration.MIGRATION_CURRENT_V2_TO_V6_TOPOLOGY_SPLIT1
+                in {
+                    information_migration.MIGRATION_CURRENT_V2_TO_V6_TOPOLOGY_SPLIT1,
+                    information_migration.MIGRATION_CURRENT_V2_TO_V6_TOPOLOGY_SPLIT1_PUBLIC_RESOURCE_V8,
+                }
                 else "rust_entity_adapter_v5_meaningful_history_v2"
             ),
             "--value-tower-split-layers",
@@ -5853,6 +5857,7 @@ def _append_current_parent_topology_cli(
             architecture_upgrade.MODULE_CURRENT_V5_TOPOLOGY_VALUE_TOWER_SPLIT_1,
             architecture_upgrade.MODULE_CURRENT_V5_SPLIT1_TOPOLOGY_ONLY,
             information_migration.MIGRATION_CURRENT_V2_TO_V6_TOPOLOGY_SPLIT1,
+            information_migration.MIGRATION_CURRENT_V2_TO_V6_TOPOLOGY_SPLIT1_PUBLIC_RESOURCE_V8,
         }
     ):
         command.append("--topology-residual-adapter")
@@ -5948,6 +5953,7 @@ def _build_direct_train_command(
         architecture_upgrade.MODULE_CURRENT_V5_TOPOLOGY_VALUE_TOWER_SPLIT_1,
         architecture_upgrade.MODULE_CURRENT_V5_SPLIT1_TOPOLOGY_ONLY,
         information_migration.MIGRATION_CURRENT_V2_TO_V6_TOPOLOGY_SPLIT1,
+        information_migration.MIGRATION_CURRENT_V2_TO_V6_TOPOLOGY_SPLIT1_PUBLIC_RESOURCE_V8,
     }:
         # Keep every checkpoint-owned switch visible in the
         # sealed trainer argv as well as in the replayed receipt.  In

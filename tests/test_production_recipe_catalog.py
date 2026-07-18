@@ -114,6 +114,12 @@ def test_checked_in_shared_action_parent_update_recipe_is_authenticated() -> Non
     )
     fields = payload["train_config"]["fields"]
     assert fields["shared_action_lr_mult"] == pytest.approx(0.25)
+    required_signal_modules = set(
+        payload["engine_settings"]["require_feature_learning_signal_modules"].split(
+            ","
+        )
+    )
+    assert "action_encoder" in required_signal_modules
 
 
 def test_checked_in_value_head_parent_update_recipe_is_authenticated() -> None:

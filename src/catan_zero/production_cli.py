@@ -25,6 +25,7 @@ from catan_zero.production_contracts import (
     canonical_json_sha256,
     pipeline_readiness,
     production_status,
+    training_initialization_mode,
     validate_pipeline_contract,
 )
 
@@ -50,7 +51,7 @@ _PIPELINE_KEYS = {
         "recipe",
         "init_checkpoint",
         "parent_checkpoint",
-        "architecture_upgrade_receipt",
+        "information_contract_migration_receipt",
         "lock",
         "composite_build_receipt",
         "plan_receipt",
@@ -177,7 +178,14 @@ def load_job(path: Path) -> dict[str, Any]:
     elif pipeline == "train":
         job["data"] = str(_absolute_path(job.get("data"), field="data"))
         recipe = job.get("recipe")
-        if recipe == "a1-current-35m-b200":
+        try:
+            initialization_mode = training_initialization_mode(
+                repo_root(), str(recipe) if recipe is not None else None
+            )
+        except ProductionContractError as error:
+            raise ProductionCLIError(str(error)) from error
+        job["_initialization_mode"] = initialization_mode
+        if initialization_mode == "scratch_fresh_optimizer":
             required = {"lock", "composite_build_receipt", "plan_receipt"}
             missing = sorted(key for key in required if key not in job)
             forbidden = sorted(
@@ -185,7 +193,7 @@ def load_job(path: Path) -> dict[str, Any]:
                 for key in (
                     "init_checkpoint",
                     "parent_checkpoint",
-                    "architecture_upgrade_receipt",
+                    "information_contract_migration_receipt",
                 )
                 if key in job
             )
@@ -204,7 +212,7 @@ def load_job(path: Path) -> dict[str, Any]:
             job["plan_receipt"] = str(
                 _absolute_path(job.get("plan_receipt"), field="plan_receipt")
             )
-        elif recipe == "a1-parent-update-35m-b200":
+        elif initialization_mode == "parent_fresh_optimizer":
             forbidden = sorted(
                 key
                 for key in ("lock", "composite_build_receipt", "plan_receipt")
@@ -229,17 +237,17 @@ def load_job(path: Path) -> dict[str, Any]:
                     job.get("parent_checkpoint"), field="parent_checkpoint"
                 )
             )
-            if "architecture_upgrade_receipt" in job:
-                job["architecture_upgrade_receipt"] = str(
+            if "information_contract_migration_receipt" in job:
+                job["information_contract_migration_receipt"] = str(
                     _absolute_path(
-                        job.get("architecture_upgrade_receipt"),
-                        field="architecture_upgrade_receipt",
+                        job.get("information_contract_migration_receipt"),
+                        field="information_contract_migration_receipt",
                     )
                 )
         else:
             raise ProductionCLIError(
-                "training recipe must be 'a1-current-35m-b200' or "
-                "'a1-parent-update-35m-b200'"
+                f"training recipe {recipe!r} has unsupported initialization mode "
+                f"{initialization_mode!r}"
             )
     else:
         for field in ("candidate", "champion"):
@@ -308,12 +316,12 @@ def _input_paths(job: dict[str, Any]) -> dict[str, Path]:
         return {"checkpoint": Path(job["checkpoint"])}
     if pipeline == "train":
         paths = {"data": Path(job["data"])}
-        if job["recipe"] == "a1-parent-update-35m-b200":
+        if job["_initialization_mode"] == "parent_fresh_optimizer":
             paths["init_checkpoint"] = Path(job["init_checkpoint"])
             paths["parent_checkpoint"] = Path(job["parent_checkpoint"])
-            if "architecture_upgrade_receipt" in job:
-                paths["architecture_upgrade_receipt"] = Path(
-                    job["architecture_upgrade_receipt"]
+            if "information_contract_migration_receipt" in job:
+                paths["information_contract_migration_receipt"] = Path(
+                    job["information_contract_migration_receipt"]
                 )
             return paths
         paths.update(
@@ -361,7 +369,7 @@ def _command(job: dict[str, Any], contract: dict[str, Any]) -> list[str]:
             command.append("--resume")
         return command
     if pipeline == "train":
-        if job["recipe"] == "a1-parent-update-35m-b200":
+        if job["_initialization_mode"] == "parent_fresh_optimizer":
             command = [
                 sys.executable,
                 "-m",
@@ -382,11 +390,11 @@ def _command(job: dict[str, Any], contract: dict[str, Any]) -> list[str]:
                 "--report",
                 str(run_dir / "train.report.json"),
             ]
-            if "architecture_upgrade_receipt" in job:
+            if "information_contract_migration_receipt" in job:
                 command.extend(
                     [
-                        "--architecture-upgrade-receipt",
-                        str(job["architecture_upgrade_receipt"]),
+                        "--information-contract-migration-receipt",
+                        str(job["information_contract_migration_receipt"]),
                     ]
                 )
             return command
@@ -445,7 +453,10 @@ def _command_environment(job: dict[str, Any]) -> dict[str, str]:
 
 
 def _prepare_command(job: dict[str, Any], contract: dict[str, Any]) -> list[str] | None:
-    if job["pipeline"] != "train" or job["recipe"] != "a1-current-35m-b200":
+    if (
+        job["pipeline"] != "train"
+        or job["_initialization_mode"] != "scratch_fresh_optimizer"
+    ):
         return None
     return _command(job, contract)[:-1]
 
@@ -488,18 +499,22 @@ def build_plan(job_path: Path) -> dict[str, Any]:
         name: {"path": str(path), "sha256": _file_sha256(path)}
         for name, path in _input_paths(job).items()
     }
-    if pipeline == "train" and recipe == "a1-parent-update-35m-b200":
+    if (
+        pipeline == "train"
+        and job["_initialization_mode"] == "parent_fresh_optimizer"
+    ):
         parent_sha = inputs["parent_checkpoint"]["sha256"]
         initializer_sha = inputs["init_checkpoint"]["sha256"]
-        has_receipt = "architecture_upgrade_receipt" in inputs
+        has_receipt = "information_contract_migration_receipt" in inputs
         if parent_sha != initializer_sha and not has_receipt:
             raise ProductionCLIError(
                 "parent-update initializer differs from the exact incumbent; "
-                "architecture_upgrade_receipt is required"
+                "information_contract_migration_receipt is required"
             )
         if parent_sha == initializer_sha and has_receipt:
             raise ProductionCLIError(
-                "exact-parent update must not claim architecture_upgrade_receipt"
+                "exact-parent update must not claim "
+                "information_contract_migration_receipt"
             )
     public_job = {key: value for key, value in job.items() if not key.startswith("_")}
     value: dict[str, Any] = {

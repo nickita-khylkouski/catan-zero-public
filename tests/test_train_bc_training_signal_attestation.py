@@ -93,7 +93,15 @@ def test_optimizer_lr_dose_attests_integrated_area_per_group() -> None:
 
     parameter = torch.nn.Parameter(torch.tensor(1.0))
     optimizer = torch.optim.Adam(
-        [{"params": [parameter], "lr": 2.0e-4, "base_lr": 2.0e-4}]
+        [
+            {
+                "params": [parameter],
+                "lr": 2.0e-4,
+                "base_lr": 2.0e-4,
+                "group_name": "base",
+                "weight_decay_role": "no_decay",
+            }
+        ]
     )
     multipliers = [0.25, 0.5, 0.75, 1.0]
     dose = train_bc._optimizer_lr_dose_attestation(
@@ -109,11 +117,43 @@ def test_optimizer_lr_dose_attests_integrated_area_per_group() -> None:
     assert dose["parameter_groups"] == [
         {
             "group_index": 0,
+            "group_name": "base",
+            "weight_decay_role": "no_decay",
             "base_lr": pytest.approx(2.0e-4),
             "integrated_lr_area": pytest.approx(5.0e-4),
             "mean_applied_lr": pytest.approx(1.25e-4),
         }
     ]
+
+
+def test_optimizer_lr_dose_rejects_ambiguous_semantic_groups() -> None:
+    import torch
+
+    left = torch.nn.Parameter(torch.tensor(1.0))
+    right = torch.nn.Parameter(torch.tensor(2.0))
+    optimizer = torch.optim.Adam(
+        [
+            {
+                "params": [left],
+                "group_name": "value",
+                "weight_decay_role": "no_decay",
+            },
+            {
+                "params": [right],
+                "group_name": "value",
+                "weight_decay_role": "no_decay",
+            },
+        ],
+        lr=1.0e-4,
+    )
+
+    with pytest.raises(ValueError, match="identities must be unique"):
+        train_bc._optimizer_lr_dose_attestation(
+            applied_updates=1,
+            schedule_multiplier_sum=1.0,
+            lr_area_by_group=[1.0e-4, 1.0e-4],
+            optimizer=optimizer,
+        )
 
 
 def test_policy_signal_attestation_is_wired_to_report_and_final_checkpoint() -> None:

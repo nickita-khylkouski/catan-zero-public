@@ -60,18 +60,18 @@ the exact eight-rank DDP topology. Evaluation accepts a typed `devices` list.
   but blocked until the scratch optimizer schedule is commissioned in the
   current science contract. Its typed job binds the reviewed lock, composite
   descriptor, composite build receipt, and authenticated plan receipt.
-- Parent-update training: the exact `a1-parent-update-35m-b200` execution recipe
-  is reproducible but scientifically blocked by
+- Parent-update training: the cataloged baseline and bounded treatment recipes
+  are reproducible but individually fail closed pending fresh commissioning in
   `configs/production/training_science_admission.json`. It requires the exact incumbent as
   `parent_checkpoint` and the final `init_checkpoint`. When those bytes differ,
-  as they do for legacy f7 to current-v5+split1, it also requires the reviewed
-  zero-diff receipt connecting them directly. It launches the
+  as they do for the current V8 information migration, it also requires the
+  reviewed non-forward-identical information-contract migration receipt
+  connecting them directly. It launches the
   cataloged compact trainer with eight DDP ranks and a fresh optimizer. Its
   report is explicitly non-promotable; a real flywheel turn must execute the
   same receipt through `tools/a1_one_dose_train.py`, whose sealed execution
   receipt is the promotion authority. Scientific admission remains blocked
-  until the topology-blind value surface, opening policy-loss allocation,
-  adapter-v5 composite, and opening-slice promotion gate are resolved.
+  until the exact recipe's listed commissioning requirement is resolved.
 - PPO: represented but blocked. The retained exact-initializer canary was
   harmful and no canonical PPO recipe exists. The local H100 path now has a
   strict hashed v2 manifest, manifest-stamped shards, and per-update exact

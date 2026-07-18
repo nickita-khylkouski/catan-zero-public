@@ -6,7 +6,7 @@ recipe. Fresh-scratch execution requires the stronger authority in
 build receipt, topology, and planning receipt. The independently commissioned
 parent-update recipe may use the compact adapter with an exact parent.
 
-The public entrypoint exposes eight options:
+The public entrypoint exposes ten options:
 
 ```text
 --config
@@ -14,13 +14,16 @@ The public entrypoint exposes eight options:
 --checkpoint
 --report
 --init-checkpoint
+--parent-checkpoint
+--information-contract-migration-receipt
 --device
 --host-lock-file
 --allow-concurrent-bc
 ```
 
 Architecture, optimization, masking, sampling, value objectives, diagnostics,
-and model-admission settings live in one of two exact checked-in recipes:
+and model-admission settings live in exact checked-in recipes authenticated by
+`configs/production_recipes.json`. The two baseline identities are:
 
 ```text
 configs/training/a1_current_35m_b200.schema1.json         # fresh scratch
@@ -66,10 +69,16 @@ separate parent recipe and an exact parent checkpoint:
 torchrun --standalone --nproc-per-node=8 tools/train.py \
   --config configs/training/a1_parent_update_35m_b200.schema1.json \
   --data /path/to/authenticated_single_corpus.json \
-  --init-checkpoint /path/to/exact-f7-parent.pt \
+  --parent-checkpoint /path/to/exact-f7-parent.pt \
+  --init-checkpoint /path/to/reviewed-v8-initializer.pt \
+  --information-contract-migration-receipt /path/to/v8-migration.receipt.json \
   --checkpoint /path/to/candidate.pt \
   --report /path/to/report.json
 ```
+
+If the initializer bytes are identical to the parent, omit the migration
+receipt. If they differ, the receipt is mandatory and must connect those exact
+checkpoint identities.
 
 That recipe reproduces the commissioned 8×64 global batch, fresh AdamW,
 12-step exact dose, flat `6e-5` learning rate with 16 warmup steps, full value

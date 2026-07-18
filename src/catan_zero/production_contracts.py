@@ -204,8 +204,8 @@ def _recipe_entry(pipeline: str, recipe: str | None) -> dict[str, str]:
     return matches[0]
 
 
-def _train_launcher(config_path: Path, *, recipe: str) -> str:
-    """Resolve one authenticated training recipe without a second name registry."""
+def _train_initialization_mode(config_path: Path, *, recipe: str) -> str:
+    """Resolve one authenticated recipe without a second name registry."""
 
     payload = _read_json_object(config_path, label="training recipe")
     engine = payload.get("engine_settings")
@@ -214,13 +214,35 @@ def _train_launcher(config_path: Path, *, recipe: str) -> str:
             f"production training recipe {recipe!r} has malformed runtime bindings"
         )
     initialization_mode = engine.get("initialization_mode")
-    launcher = TRAIN_LAUNCHERS_BY_INITIALIZATION_MODE.get(initialization_mode)
-    if launcher is None:
+    if initialization_mode not in TRAIN_LAUNCHERS_BY_INITIALIZATION_MODE:
         raise ProductionContractError(
             f"production training recipe {recipe!r} has unsupported "
             f"initialization mode {initialization_mode!r}"
         )
-    return launcher
+    return str(initialization_mode)
+
+
+def _train_launcher(config_path: Path, *, recipe: str) -> str:
+    initialization_mode = _train_initialization_mode(
+        config_path, recipe=recipe
+    )
+    return TRAIN_LAUNCHERS_BY_INITIALIZATION_MODE[initialization_mode]
+
+
+def training_initialization_mode(
+    repo: Path, recipe: str | None = None
+) -> str:
+    """Return the cataloged recipe's authenticated initializer contract."""
+
+    entry = _recipe_entry("train", recipe)
+    config_path = Path(entry["path"])
+    try:
+        config_path.relative_to(repo.resolve())
+    except ValueError as error:
+        raise ProductionContractError(
+            f"cataloged train config escapes repository: {config_path}"
+        ) from error
+    return _train_initialization_mode(config_path, recipe=entry["name"])
 
 
 def validate_pipeline_contract(

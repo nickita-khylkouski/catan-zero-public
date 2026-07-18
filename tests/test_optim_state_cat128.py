@@ -68,6 +68,52 @@ def test_save_load_roundtrip_restores_adam_moments(tmp_path):
     assert torch.allclose(fresh.state[model.weight]["exp_avg"], exp_avg)
 
 
+def test_legacy_sidecar_cannot_erase_current_optimizer_group_identity(tmp_path):
+    ckpt = tmp_path / "legacy.pt"
+    model, legacy = _stepped_adam()
+    assert "group_name" not in legacy.param_groups[0]
+    assert save_optimizer_state(ckpt, model, legacy, _DDP_SINGLE) is not None
+
+    fresh = torch.optim.Adam(
+        [
+            {
+                "params": list(model.parameters()),
+                "group_name": "historical_flat",
+                "weight_decay_role": "no_decay",
+            }
+        ],
+        lr=1e-3,
+    )
+    assert load_optimizer_state(ckpt, model, fresh, _DDP_SINGLE) is True
+    assert fresh.param_groups[0]["group_name"] == "historical_flat"
+    assert fresh.param_groups[0]["weight_decay_role"] == "no_decay"
+
+
+def test_modern_sidecar_rejects_semantic_group_identity_drift(tmp_path):
+    ckpt = tmp_path / "modern.pt"
+    model, saved = _stepped_adam()
+    saved.param_groups[0].update(
+        group_name="value",
+        weight_decay_role="no_decay",
+    )
+    assert save_optimizer_state(ckpt, model, saved, _DDP_SINGLE) is not None
+
+    fresh = torch.optim.Adam(
+        [
+            {
+                "params": list(model.parameters()),
+                "group_name": "trunk",
+                "weight_decay_role": "no_decay",
+            }
+        ],
+        lr=1e-3,
+    )
+
+    assert load_optimizer_state(ckpt, model, fresh, _DDP_SINGLE) is False
+    assert len(fresh.state) == 0
+    assert fresh.param_groups[0]["group_name"] == "trunk"
+
+
 def test_load_missing_sidecar_is_failsafe(tmp_path):
     model, opt = _stepped_adam()
     assert load_optimizer_state(tmp_path / "absent.pt", model, opt, _DDP_SINGLE) is False

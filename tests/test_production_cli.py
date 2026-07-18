@@ -45,15 +45,15 @@ def _write_job(tmp_path: Path, pipeline: str = "generate", **updates: object) ->
         data = tmp_path / "composite.json"
         data.write_text("{}", encoding="utf-8")
         payload.update(data=str(data), recipe=recipe)
-        if recipe == "a1-parent-update-35m-b200":
+        if recipe != "a1-current-35m-b200":
             parent = tmp_path / "parent.pt"
             parent.write_bytes(b"parent-v1")
-            upgrade = tmp_path / "architecture-upgrade.receipt.json"
-            upgrade.write_text("{}", encoding="utf-8")
+            migration = tmp_path / "information-contract-migration.receipt.json"
+            migration.write_text("{}", encoding="utf-8")
             payload.update(
                 init_checkpoint=str(checkpoint),
                 parent_checkpoint=str(parent),
-                architecture_upgrade_receipt=str(upgrade),
+                information_contract_migration_receipt=str(migration),
             )
         else:
             lock = tmp_path / "reviewed-lock.json"
@@ -311,6 +311,13 @@ def test_status_exposes_v7_parent_and_scratch_as_fail_closed() -> None:
         "active_policy_parent_treatment_requires_fresh_commissioning"
     )
     assert len(p10["unresolved_requirements"]) == 1
+    assert set(train["recipes"]) == {
+        entry["name"] for entry in contracts.production_recipes("train")
+    }
+    assert all(
+        readiness["authorized"] is False
+        for readiness in train["recipes"].values()
+    )
     assert status["pipelines"]["ppo"]["authorized"] is False
 
 
@@ -339,17 +346,10 @@ def test_all_canonical_config_and_guard_identities_are_exact() -> None:
     identities = [
         validate_pipeline_contract(ROOT, "generate"),
         validate_pipeline_contract(ROOT, "evaluate"),
-        validate_pipeline_contract(ROOT, "train", "a1-current-35m-b200"),
-        validate_pipeline_contract(ROOT, "train", "a1-parent-update-35m-b200"),
-        validate_pipeline_contract(
-            ROOT, "train", "a1-parent-update-shared-action25-35m-b200"
-        ),
-        validate_pipeline_contract(
-            ROOT, "train", "a1-parent-update-value25-35m-b200"
-        ),
-        validate_pipeline_contract(
-            ROOT, "train", "a1-parent-update-active-p10-35m-b200"
-        ),
+        *[
+            validate_pipeline_contract(ROOT, "train", entry["name"])
+            for entry in contracts.production_recipes("train")
+        ],
     ]
     for identity in identities:
         payload = json.loads(Path(identity["config"]).read_text(encoding="utf-8"))
@@ -359,11 +359,10 @@ def test_all_canonical_config_and_guard_identities_are_exact() -> None:
     assert identities[0]["guard_sha256"] == generation_entry["guard_sha256"]
     assert identities[0]["required_accelerator_model"] == "NVIDIA H100"
     assert identities[1]["required_accelerator_model"] == "NVIDIA H100"
-    assert identities[2]["required_accelerator_model"] == "NVIDIA B200"
-    assert identities[3]["required_accelerator_model"] == "NVIDIA B200"
-    assert identities[4]["required_accelerator_model"] == "NVIDIA B200"
-    assert identities[5]["required_accelerator_model"] == "NVIDIA B200"
-    assert identities[6]["required_accelerator_model"] == "NVIDIA B200"
+    assert all(
+        identity["required_accelerator_model"] == "NVIDIA B200"
+        for identity in identities[2:]
+    )
 
 
 def test_generate_plan_has_one_canonical_command_and_bound_inputs(
@@ -406,25 +405,28 @@ def test_other_pipelines_resolve_through_compact_launchers(
         assert "--lock" in plan["command"]
 
 
-def test_cataloged_parent_update_uses_exact_blocked_v7_recipe_and_parent(
-    tmp_path: Path,
+@pytest.mark.parametrize(
+    "recipe",
+    [
+        entry["name"]
+        for entry in contracts.production_recipes("train")
+        if entry["name"] != "a1-current-35m-b200"
+    ],
+)
+def test_cataloged_parent_update_uses_exact_blocked_recipe_and_parent(
+    tmp_path: Path, recipe: str
 ) -> None:
     plan = cli.build_plan(
-        _write_job(tmp_path, "train", recipe="a1-parent-update-35m-b200")
+        _write_job(tmp_path, "train", recipe=recipe)
     )
 
     assert plan["readiness"]["authorized"] is False
-    assert plan["readiness"]["reason"] == (
-        "v8_parent_update_requires_fresh_commissioning"
-    )
-    assert plan["contract"]["recipe"] == "a1-parent-update-35m-b200"
-    assert plan["contract"]["config_sha256"] == (
-        "0979e6c73a13c3a0af2e5427528b03dab9c1a240f9f808c0b933be168c561aca"
-    )
+    assert plan["contract"]["recipe"] == recipe
     assert str((ROOT / "tools/train.py").resolve()) in plan["command"]
     assert "--init-checkpoint" in plan["command"]
     assert "--parent-checkpoint" in plan["command"]
-    assert "--architecture-upgrade-receipt" in plan["command"]
+    assert "--information-contract-migration-receipt" in plan["command"]
+    assert "--architecture-upgrade-receipt" not in plan["command"]
     assert "--nproc-per-node=8" in plan["command"]
     assert plan["prepare_command"] is None
 
@@ -489,7 +491,7 @@ def test_parent_update_requires_receipt_only_for_changed_initializer(
 ) -> None:
     changed = _write_job(tmp_path, "train", recipe="a1-parent-update-35m-b200")
     payload = json.loads(changed.read_text(encoding="utf-8"))
-    payload.pop("architecture_upgrade_receipt")
+    payload.pop("information_contract_migration_receipt")
     changed.write_text(json.dumps(payload), encoding="utf-8")
     with pytest.raises(cli.ProductionCLIError, match="receipt is required"):
         cli.build_plan(changed)
@@ -497,7 +499,21 @@ def test_parent_update_requires_receipt_only_for_changed_initializer(
     payload["init_checkpoint"] = payload["parent_checkpoint"]
     changed.write_text(json.dumps(payload), encoding="utf-8")
     plan = cli.build_plan(changed)
-    assert "--architecture-upgrade-receipt" not in plan["command"]
+    assert "--information-contract-migration-receipt" not in plan["command"]
+
+
+def test_parent_update_rejects_obsolete_architecture_upgrade_receipt(
+    tmp_path: Path,
+) -> None:
+    job = _write_job(tmp_path, "train", recipe="a1-parent-update-35m-b200")
+    payload = json.loads(job.read_text(encoding="utf-8"))
+    payload["architecture_upgrade_receipt"] = payload.pop(
+        "information_contract_migration_receipt"
+    )
+    job.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(cli.ProductionCLIError, match="architecture_upgrade_receipt"):
+        cli.load_job(job)
 
 
 def test_production_job_rejects_unknown_keys_and_relative_paths(tmp_path: Path) -> None:

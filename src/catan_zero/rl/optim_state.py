@@ -547,12 +547,52 @@ def load_optimizer_state(
         _log(f"no optimizer sidecar at {sidecar}; using fresh optimizer state", ddp)
         return False
     try:
+        # PyTorch replaces parameter-group dictionaries from the sidecar.
+        # Preserve current-code semantic identities so a historical optimizer
+        # checkpoint cannot erase the durable LR-dose attribution added later.
+        semantic_group_metadata = [
+            {
+                key: group[key]
+                for key in ("group_name", "weight_decay_role")
+                if key in group
+            }
+            for group in optimizer.param_groups
+        ]
         blob = torch.load(sidecar, map_location="cpu", weights_only=False)
         full_osd = blob["optimizer"] if isinstance(blob, dict) and "optimizer" in blob else blob
         if not _nested_numeric_state_is_finite(full_osd):
             raise FloatingPointError(
                 "optimizer sidecar contains non-finite numeric state"
             )
+        saved_groups = (
+            full_osd.get("param_groups")
+            if isinstance(full_osd, dict)
+            else None
+        )
+        if isinstance(saved_groups, list):
+            semantic_keys = ("group_name", "weight_decay_role")
+            saved_has_semantics = any(
+                any(key in group for key in semantic_keys)
+                for group in saved_groups
+                if isinstance(group, dict)
+            )
+            if saved_has_semantics:
+                if any(
+                    not isinstance(group, dict)
+                    or any(key not in group for key in semantic_keys)
+                    for group in saved_groups
+                ):
+                    raise ValueError(
+                        "optimizer sidecar has partial semantic group identity"
+                    )
+                saved_semantics = [
+                    {key: group[key] for key in semantic_keys}
+                    for group in saved_groups
+                ]
+                if saved_semantics != semantic_group_metadata:
+                    raise ValueError(
+                        "optimizer sidecar semantic group identity drifted"
+                    )
         if is_fsdp(model):
             from torch.distributed.fsdp import (
                 FullOptimStateDictConfig,
@@ -575,6 +615,14 @@ def load_optimizer_state(
             optimizer.load_state_dict(sharded)
         else:
             optimizer.load_state_dict(full_osd)
+        if len(optimizer.param_groups) != len(semantic_group_metadata):
+            raise ValueError(
+                "restored optimizer parameter-group count drifted"
+            )
+        for group, metadata in zip(
+            optimizer.param_groups, semantic_group_metadata, strict=True
+        ):
+            group.update(metadata)
         assert_finite_optimizer_generation(model, optimizer)
         _log(f"restored optimizer state from {sidecar}", ddp)
         return True

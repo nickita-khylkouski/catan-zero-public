@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import copy
 import hashlib
 import json
@@ -1121,10 +1122,13 @@ def test_coherent_one_dose_renders_deployed_scalar_value_objective(
     assert _option(command, "--data-loader-workers") == "2"
     assert _option(command, "--data-loader-prefetch") == "2"
     assert _option(command, "--base-sampler") == "coverage_importance_v1"
-    assert "--minimum-initial-settlement-policy-mass-fraction" not in command
-    assert "--minimum-initial-road-policy-mass-fraction" not in command
-    assert "--minimum-discard-policy-mass-fraction" not in command
-    assert "--minimum-move-robber-policy-mass-fraction" not in command
+    for flag in (
+        "--minimum-initial-settlement-policy-mass-fraction",
+        "--minimum-initial-road-policy-mass-fraction",
+        "--minimum-discard-policy-mass-fraction",
+        "--minimum-move-robber-policy-mass-fraction",
+    ):
+        assert _option(command, flag) == "0.02"
     assert _option(command, "--train-diagnostics-every-batches") == "16"
     assert (
         _option(command, "--objective-gradient-interference-every-batches")
@@ -1593,6 +1597,130 @@ def test_canonical_parent_update_binds_12_step_8x64_recipe(tmp_path: Path) -> No
     assert bound["promotion_block_reason"] == (
         "training_science_admission_unauthorized"
     )
+
+
+def test_v8_sealed_child_recipe_matches_canonical_parent_projection(
+    tmp_path: Path,
+) -> None:
+    producer = {"path": "/checkpoint/f7.pt", "sha256": "sha256:" + "1" * 64}
+    verified = {
+        "contract_sha256": "sha256:" + "2" * 64,
+        "data_kind": "production_composite_v2",
+        "producer": producer,
+        "corpus_meta_file_sha256": "sha256:" + "3" * 64,
+        "composite_build_receipt": {"file_sha256": "sha256:" + "4" * 64},
+        "information_contract_migration": {
+            "migration": executor.information_migration.MIGRATION_CURRENT_V2_TO_V6_TOPOLOGY_SPLIT1_PUBLIC_RESOURCE_V8,
+            "source": producer,
+            "receipt": {"sha256": "sha256:" + "5" * 64},
+            "receipt_sha256": "sha256:" + "6" * 64,
+            "forward_identical": False,
+            "promotion_eligible": False,
+        },
+    }
+    bound = executor.bind_canonical_parent_update_recipe(
+        verified, executor.CANONICAL_PARENT_UPDATE_CONFIG
+    )
+    bound = executor.bind_training_topology(
+        bound, topology=executor.B200_8GPU_DDP_TOPOLOGY, gpu=0
+    )
+    initializer = tmp_path / "v8-initializer.pt"
+    initializer.write_bytes(b"v8-initializer")
+    bound.update(
+        {
+            "data_path": str(tmp_path / "corpus"),
+            "trainer_authority": executor._current_production_trainer_authority(),  # noqa: SLF001
+            "architecture_initializer": {
+                "path": str(initializer),
+                "sha256": executor._file_sha256(initializer),  # noqa: SLF001
+            },
+            "event_history_training_contract": {
+                "training_event_history_trainable": False,
+                "event_history_end_to_end_usable": False,
+                "empty_payload_inventory_acknowledgements": [
+                    "sha256:" + f"{index:x}" * 64 for index in range(6, 10)
+                ],
+            },
+        }
+    )
+    checkpoint = tmp_path / "candidate.pt"
+    report = tmp_path / "train.report.json"
+    command = executor._build_direct_train_command(  # noqa: SLF001
+        bound,
+        python=Path(sys.executable),
+        checkpoint=checkpoint,
+        report=report,
+    )
+    direct_args = executor.train_bc.build_parser().parse_args(command[2:])
+    assert {
+        "action_target_gather": direct_args.action_target_gather,
+        "static_action_residual": direct_args.static_action_residual,
+        "legal_action_value_residual": direct_args.legal_action_value_residual,
+        "legal_action_value_set_statistics": (
+            direct_args.legal_action_value_set_statistics
+        ),
+        "public_card_count_features": direct_args.public_card_count_features,
+        "public_card_count_residual_bias": (
+            direct_args.public_card_count_residual_bias
+        ),
+        "meaningful_public_history": direct_args.meaningful_public_history,
+        "event_history_limit": direct_args.event_history_limit,
+        "meaningful_public_history_pooling": (
+            direct_args.meaningful_public_history_pooling
+        ),
+        "meaningful_public_history_target_gather": (
+            direct_args.meaningful_public_history_target_gather
+        ),
+        "public_rule_state_features": direct_args.public_rule_state_features,
+        "entity_feature_adapter_version": (
+            direct_args.entity_feature_adapter_version
+        ),
+        "value_tower_split_layers": direct_args.value_tower_split_layers,
+        "topology_residual_adapter": direct_args.topology_residual_adapter,
+    } == {
+        "action_target_gather": True,
+        "static_action_residual": True,
+        "legal_action_value_residual": True,
+        "legal_action_value_set_statistics": True,
+        "public_card_count_features": True,
+        "public_card_count_residual_bias": False,
+        "meaningful_public_history": True,
+        "event_history_limit": 64,
+        "meaningful_public_history_pooling": "ordered_attention_v2",
+        "meaningful_public_history_target_gather": True,
+        "public_rule_state_features": True,
+        "entity_feature_adapter_version": (
+            "rust_entity_adapter_v6_exact_actor_resources_initial_road_two_hop"
+        ),
+        "value_tower_split_layers": 1,
+        "topology_residual_adapter": True,
+    }
+    ddp = {"enabled": True, "world_size": 8, "rank": 0, "local_rank": 0}
+    direct = executor.train_bc._effective_a1_learner_training_recipe(  # noqa: SLF001
+        direct_args, ddp
+    )
+
+    config, engine = executor.canonical_train._load_recipe(  # noqa: SLF001
+        executor.CANONICAL_PARENT_UPDATE_CONFIG
+    )
+    canonical_args = executor.canonical_train._engine_namespace(  # noqa: SLF001
+        config=config,
+        engine_settings=engine,
+        public_args=argparse.Namespace(
+            data=str(tmp_path / "corpus"),
+            checkpoint=str(checkpoint),
+            report=str(report),
+            init_checkpoint=str(initializer),
+            device="cuda",
+            host_lock_file="",
+            allow_concurrent_bc=False,
+        ),
+    )
+    canonical = executor.train_bc._effective_a1_learner_training_recipe(  # noqa: SLF001
+        canonical_args, ddp
+    )
+
+    assert direct == canonical
 
     initializer = tmp_path / "initializer.pt"
     initializer.write_bytes(b"initializer")
@@ -3109,7 +3237,7 @@ def _published_authority(tmp_path: Path, authority: dict) -> dict:
     }
 
 
-def test_central_p1_binds_exact_current_parent_sampler_and_mixed_transition(
+def test_retired_central_p1_historical_anchor_is_rejected(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     verified = _production_trainer_verified(tmp_path)
@@ -3163,57 +3291,16 @@ def test_central_p1_binds_exact_current_parent_sampler_and_mixed_transition(
         "_current_ablation_code_binding",
         lambda _lock: code_binding,
     )
-    bound = executor.bind_p1_arm(
-        verified,
-        authority=authority,
-        published_executor_authority=published,
-        reviewed_code_tree_sha256=code_sha,
-    )
-    assert bound["recipe"]["sampler_seed"] == 424242
-    assert bound["data_path"].name == "p1-05-k3-training-descriptor.json"
-    assert bound["p1_training_descriptor_authority"][
-        "policy_kl_anchor_component_ids"
-    ] == ["historical_replay"]
-    assert bound["learner_ablation"]["diagnostic_only"] is True
-    assert bound["learner_ablation"]["promotion_eligible"] is False
-    assert (
-        bound["learner_ablation"]["promotion_block_reason"]
-        == "requires_independent_final_replication"
-    )
-    command = executor._build_direct_train_command(
-        bound,
-        python=Path(sys.executable),
-        checkpoint=tmp_path / "p1.pt",
-        report=tmp_path / "p1.json",
-    )
-    assert _option(command, "--sampler-seed") == "424242"
-    assert _option(command, "--data") == str(bound["data_path"])
-    assert _option(command, "--public-award-feature-contract") == "authoritative_v1"
-    assert command.count("--allow-mixed-public-award-feature-contracts") == 1
-    assert command.count("--no-resume-optimizer") == 1
-    assert command.count("--a1-central-learner-binding-json") == 1
-    assert "--a1-learner-ablation-id" not in command
-    args = executor.train_bc.build_parser().parse_args(command[2:])
-    args.init_checkpoint_sha256 = executor._file_sha256(
-        Path(args.init_checkpoint)
-    )
-    immutable_recipe = bound["central_learner_binding"][
-        "immutable_contract_recipe"
-    ]
-    train_bound = {
-        "learner_training_recipe": dict(immutable_recipe),
-        "learner_training_recipe_sha256": executor._value_sha256(
-            immutable_recipe
-        ),
-    }
-    effective = executor.train_bc._validate_a1_learner_training_recipe(
-        args,
-        {"world_size": 8, "rank": 0, "local_rank": 0, "enabled": True},
-        train_bound,
-    )
-    assert effective == bound["recipe"]
-    assert train_bound["central_learner_binding"]["stage"] == "P1"
-    assert train_bound["learner_ablation"] is None
+    with pytest.raises(
+        executor.ExecutorError,
+        match="P1 K3 training descriptor authority drift",
+    ):
+        executor.bind_p1_arm(
+            verified,
+            authority=authority,
+            published_executor_authority=published,
+            reviewed_code_tree_sha256=code_sha,
+        )
 
 
 def test_central_p1_rejects_candidate_chaining_and_sampler_drift(

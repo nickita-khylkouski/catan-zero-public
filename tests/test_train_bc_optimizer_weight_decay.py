@@ -143,3 +143,18 @@ def test_adamw_decay_split_preserves_each_lr_group_and_has_no_overlap() -> None:
         assert group["weight_decay"] == pytest.approx(
             0.1 if parameter.ndim >= 2 else 0.0
         )
+        assert group["group_name"] == (
+            "value" if id(parameter) in value_ids else "base"
+        )
+        assert group["weight_decay_role"] == (
+            "decay" if parameter.ndim >= 2 else "no_decay"
+        )
+    assert {
+        (group["group_name"], group["weight_decay_role"])
+        for group in optimizer.param_groups
+    } == {
+        ("base", "decay"),
+        ("base", "no_decay"),
+        ("value", "decay"),
+        ("value", "no_decay"),
+    }

@@ -44,13 +44,13 @@
       "properties": {
         "schema_version": {"const": "catan-zero-production-job-v1"},
         "pipeline": {"const": "train"},
-        "recipe": {"const": "a1-parent-update-35m-b200"},
+        "recipe": {"type": "string", "minLength": 1},
         "run_id": {"$ref": "#/$defs/run_id"},
         "run_dir": {"$ref": "#/$defs/absolute_path"},
         "data": {"$ref": "#/$defs/absolute_path"},
         "parent_checkpoint": {"$ref": "#/$defs/absolute_path"},
         "init_checkpoint": {"$ref": "#/$defs/absolute_path"},
-        "architecture_upgrade_receipt": {"$ref": "#/$defs/absolute_path"}
+        "information_contract_migration_receipt": {"$ref": "#/$defs/absolute_path"}
       }
     },
     {
