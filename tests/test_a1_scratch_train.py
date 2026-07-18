@@ -289,6 +289,35 @@ def test_scratch_command_is_native_bias_free_8gpu_and_fresh(tmp_path: Path) -> N
     assert marker == authority
 
 
+def test_exact_scratch_command_survives_early_runtime_projection(
+    tmp_path: Path,
+) -> None:
+    verified, _, _ = _authority_fixture(tmp_path)
+    command = scratch.build_train_command(
+        verified,
+        python=Path("/usr/bin/python3"),
+        checkpoint=tmp_path / "model.pt",
+        report=tmp_path / "report.json",
+    )
+    train_script_index = next(
+        index
+        for index, value in enumerate(command)
+        if value.endswith("/tools/train_bc.py")
+    )
+    args = train_bc.build_parser().parse_args(command[train_script_index + 1 :])
+
+    # This projection executes before checkpoint-owned fields are resolved.
+    # The exact-resource residual has no public CLI switch, so an ordinary
+    # scratch Namespace legitimately does not contain that attribute yet.
+    assert not hasattr(args, "public_card_exact_resource_residual")
+    train_bc._validate_a1_scratch_runtime_projection(  # noqa: SLF001
+        args,
+        {"enabled": True, "world_size": 8, "rank": 0, "local_rank": 0},
+        current_science.learner_model_construction(),
+        current_science.learner_execution_topology(),
+    )
+
+
 def test_current_scratch_hard_decision_starvation_fails_before_training() -> None:
     recipe = current_science.learner_training_recipe()
     minima = {

@@ -10717,7 +10717,7 @@ def _validate_a1_scratch_runtime_projection(
         "public_card_count_features": bool(args.public_card_count_features)
         != model["public_card_count_features"],
         "public_card_exact_resource_residual": bool(
-            args.public_card_exact_resource_residual
+            getattr(args, "public_card_exact_resource_residual", False)
         ) != model["public_card_exact_resource_residual"],
         "public_card_count_residual_bias": bool(
             args.public_card_count_residual_bias
