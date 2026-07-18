@@ -288,6 +288,13 @@ def test_status_exposes_v7_parent_and_scratch_as_fail_closed() -> None:
     assert parent["status"] == "blocked"
     assert parent["reason"] == ("v8_parent_update_requires_fresh_commissioning")
     assert len(parent["unresolved_requirements"]) == 1
+    p10 = train["recipes"]["a1-parent-update-active-p10-35m-b200"]
+    assert p10["authorized"] is False
+    assert p10["status"] == "blocked"
+    assert p10["reason"] == (
+        "active_policy_parent_treatment_requires_fresh_commissioning"
+    )
+    assert len(p10["unresolved_requirements"]) == 1
     assert status["pipelines"]["ppo"]["authorized"] is False
 
 
@@ -297,6 +304,9 @@ def test_all_canonical_config_and_guard_identities_are_exact() -> None:
         validate_pipeline_contract(ROOT, "evaluate"),
         validate_pipeline_contract(ROOT, "train", "a1-current-35m-b200"),
         validate_pipeline_contract(ROOT, "train", "a1-parent-update-35m-b200"),
+        validate_pipeline_contract(
+            ROOT, "train", "a1-parent-update-active-p10-35m-b200"
+        ),
     ]
     for identity in identities:
         payload = json.loads(Path(identity["config"]).read_text(encoding="utf-8"))
@@ -308,6 +318,7 @@ def test_all_canonical_config_and_guard_identities_are_exact() -> None:
     assert identities[1]["required_accelerator_model"] == "NVIDIA H100"
     assert identities[2]["required_accelerator_model"] == "NVIDIA B200"
     assert identities[3]["required_accelerator_model"] == "NVIDIA B200"
+    assert identities[4]["required_accelerator_model"] == "NVIDIA B200"
 
 
 def test_generate_plan_has_one_canonical_command_and_bound_inputs(
