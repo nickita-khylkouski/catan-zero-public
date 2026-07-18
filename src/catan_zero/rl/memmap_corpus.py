@@ -366,7 +366,17 @@ class MemmapRaggedColumn:
         return np.full((rows, self._width), self._fill, dtype=self.dtype)
 
     def __getitem__(self, idx):
-        return self._reconstruct(normalize_index(idx, self._n))
+        indices = normalize_index(idx, self._n)
+        if indices.ndim == 0:
+            row = int(indices)
+            if not -self._n <= row < self._n:
+                raise IndexError(
+                    f"index {row} is out of bounds for axis 0 with size {self._n}"
+                )
+            if row < 0:
+                row += self._n
+            return self._reconstruct(np.asarray([row], dtype=np.int64))[0]
+        return self._reconstruct(indices)
 
     def __array__(self, dtype=None):
         arr = self._reconstruct(None)

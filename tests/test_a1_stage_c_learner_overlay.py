@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import numpy as np
@@ -323,13 +324,51 @@ def test_policy_projection_disables_old_targets_and_maps_action_ids(
     assert evidence["completed_q_rows"] == 1
     assert evidence["completed_q_legal_actions"] == 3
     assert evidence["completed_q_target_scores_separate"] is True
-    assert meta["columns"][overlay.COMPLETED_Q_VALUE_COLUMN] == {
-        "kind": "ragged2d",
-        "dtype": "float32",
-    }
+    completed_q_schema = meta["columns"][overlay.COMPLETED_Q_VALUE_COLUMN]
+    assert set(completed_q_schema) == {"kind", "dtype", "fill"}
+    assert completed_q_schema["kind"] == "ragged2d"
+    assert np.dtype(completed_q_schema["dtype"]) == np.dtype(np.float32)
+    assert np.isnan(completed_q_schema["fill"])
     assert meta["columns"]["teacher_name"]["categories"] == [
         "historical",
         overlay.POLICY_TEACHER,
+    ]
+
+
+def test_completed_q_column_schema_loads_through_production_memmap(
+    tmp_path: Path,
+) -> None:
+    meta = {
+        "schema": "memmap_corpus_v1",
+        "row_count": 1,
+        "flat_count": 2,
+        "legal_width": 2,
+        "implicit_zero_columns": [],
+        "columns": {},
+    }
+    overlay._ensure_completed_q_columns(meta)  # noqa: SLF001
+    overlay._ensure_completed_q_columns(meta)  # noqa: SLF001
+    _write(tmp_path / "row_offsets.dat", np.asarray([0, 2], dtype=np.int64))
+    _write(
+        tmp_path / f"{overlay.COMPLETED_Q_VALUE_COLUMN}.dat",
+        np.asarray([0.25, -0.5], dtype=np.float32),
+    )
+    _write(
+        tmp_path / f"{overlay.COMPLETED_Q_MASK_COLUMN}.dat",
+        np.asarray([True, True], dtype=np.bool_),
+    )
+    (tmp_path / "corpus_meta.json").write_text(
+        json.dumps(meta, allow_nan=True), encoding="utf-8"
+    )
+
+    corpus = train_bc.MemmapCorpus(tmp_path)
+
+    assert np.asarray(corpus[overlay.COMPLETED_Q_VALUE_COLUMN][0]).tolist() == (
+        pytest.approx([0.25, -0.5])
+    )
+    assert np.asarray(corpus[overlay.COMPLETED_Q_MASK_COLUMN][0]).tolist() == [
+        True,
+        True,
     ]
 
 

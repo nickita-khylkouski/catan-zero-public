@@ -97,8 +97,16 @@ RAGGED_PATCH_COLUMNS = {
     **COMPLETED_Q_RAGGED_COLUMNS,
 }
 COMPLETED_Q_COLUMN_SCHEMAS = {
-    COMPLETED_Q_VALUE_COLUMN: {"kind": "ragged2d", "dtype": "float32"},
-    COMPLETED_Q_MASK_COLUMN: {"kind": "ragged2d", "dtype": "bool"},
+    COMPLETED_Q_VALUE_COLUMN: {
+        "kind": "ragged2d",
+        "dtype": "float32",
+        "fill": float("nan"),
+    },
+    COMPLETED_Q_MASK_COLUMN: {
+        "kind": "ragged2d",
+        "dtype": "bool",
+        "fill": False,
+    },
 }
 OPTIONAL_FIXED_PATCH_COLUMNS = {
     "simulations_used": "simulations_used",
@@ -587,7 +595,33 @@ def _ensure_completed_q_columns(meta: dict[str, Any]) -> None:
         raise OverlayError("base corpus column schema is malformed")
     for name, expected in COMPLETED_Q_COLUMN_SCHEMAS.items():
         current = columns.get(name)
-        if current is not None and current != expected:
+        if current is not None:
+            expected_fill = expected["fill"]
+            current_fill = current.get("fill") if isinstance(current, Mapping) else None
+            try:
+                dtype_matches = (
+                    isinstance(current, Mapping)
+                    and np.dtype(current.get("dtype")) == np.dtype(expected["dtype"])
+                )
+            except TypeError:
+                dtype_matches = False
+            fill_matches = (
+                isinstance(current_fill, (int, float))
+                and not isinstance(current_fill, bool)
+                and math.isnan(float(current_fill))
+                if isinstance(expected_fill, float) and math.isnan(expected_fill)
+                else current_fill == expected_fill
+            )
+            compatible = (
+                isinstance(current, Mapping)
+                and set(current) == set(expected)
+                and current.get("kind") == expected["kind"]
+                and dtype_matches
+                and fill_matches
+            )
+        else:
+            compatible = True
+        if not compatible:
             raise OverlayError(
                 f"existing {name} column does not match Stage-C completed-Q ABI"
             )
