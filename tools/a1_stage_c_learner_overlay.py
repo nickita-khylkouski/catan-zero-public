@@ -575,6 +575,106 @@ def _load_plan_source_admission(
     return path, admission, semantics
 
 
+def _trace_qualified_game_populations(
+    *,
+    admission_schema: str,
+    game_seeds: np.ndarray,
+    decision_indices: np.ndarray,
+    validation_game_seeds: np.ndarray,
+    expected_qualification: object,
+) -> tuple[np.ndarray, np.ndarray, dict[str, Any] | None]:
+    """Replay the exact game population authorized for policy reanalysis.
+
+    Post-wave corpora retain incomplete traces as useful state/value evidence,
+    but those games cannot be replayed from the canonical seeded initial state.
+    They remain in the materialized corpus while being excluded from the policy
+    selector and its breadth denominator.
+    """
+
+    games = np.asarray(game_seeds, dtype=np.int64)
+    decisions = np.asarray(decision_indices, dtype=np.int64)
+    validation = np.unique(np.asarray(validation_game_seeds, dtype=np.int64))
+    if games.ndim != 1 or decisions.shape != games.shape or not len(games):
+        raise OverlayError("Stage-C game-trace population arrays are malformed")
+    all_games = np.unique(games)
+    if np.setdiff1d(validation, all_games).size:
+        raise OverlayError(
+            "Stage-C validation manifest names a game outside the corpus"
+        )
+
+    if admission_schema == LEGACY_ADMISSION_SCHEMA:
+        if expected_qualification is not None:
+            raise OverlayError(
+                "legacy Stage-C authority unexpectedly carries trace qualification"
+            )
+        return all_games, validation, None
+    if admission_schema != post_wave_admission.ADMISSION_SCHEMA:
+        raise OverlayError(
+            f"unsupported Stage-C trace authority schema: {admission_schema!r}"
+        )
+    if not isinstance(expected_qualification, Mapping):
+        raise OverlayError("post-wave Stage-C authority lost game-trace qualification")
+    try:
+        qualified, replayed = alignment._qualify_stage_c_game_traces(  # noqa: SLF001
+            game_seeds=games,
+            decision_indices=decisions,
+        )
+    except alignment.AlignmentError as error:
+        raise OverlayError(
+            f"Stage-C game-trace qualification replay failed: {error}"
+        ) from error
+    if replayed != dict(expected_qualification):
+        raise OverlayError("Stage-C source game-trace qualification drifted")
+    qualified_validation = np.intersect1d(
+        validation,
+        qualified,
+        assume_unique=True,
+    )
+    qualified_training = np.setdiff1d(qualified, qualified_validation)
+    if not len(qualified_training) or not len(qualified_validation):
+        raise OverlayError(
+            "Stage-C trace-qualified train/validation population is empty"
+        )
+    return qualified, qualified_validation, replayed
+
+
+def _trace_population_binding(
+    *,
+    game_seeds: np.ndarray,
+    qualified_game_seeds: np.ndarray,
+    qualified_validation_game_seeds: np.ndarray,
+    qualification: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Describe retained-but-policy-ineligible rows without removing them."""
+
+    if qualification is None:
+        return None
+    games = np.asarray(game_seeds, dtype=np.int64)
+    qualified = np.asarray(qualified_game_seeds, dtype=np.int64)
+    qualified_validation = np.asarray(qualified_validation_game_seeds, dtype=np.int64)
+    binding: dict[str, Any] = {
+        "schema_version": alignment.GAME_TRACE_QUALIFICATION_SCHEMA,
+        "qualification_sha256": qualification["qualification_sha256"],
+        "total_games": int(qualification["total_games"]),
+        "qualified_games": int(qualification["qualified_games"]),
+        "excluded_games": int(qualification["excluded_games"]),
+        "qualified_game_seed_set_sha256": qualification[
+            "qualified_game_seed_set_sha256"
+        ],
+        "excluded_game_seed_set_sha256": qualification["excluded_game_seed_set_sha256"],
+        "qualified_validation_games": int(len(qualified_validation)),
+        "qualified_validation_game_seed_set_sha256": _value_sha256(
+            qualified_validation.astype(int).tolist()
+        ),
+        "excluded_corpus_rows": int(np.count_nonzero(~np.isin(games, qualified))),
+        "excluded_trace_rows_retained_in_corpus": True,
+        "excluded_trace_rows_policy_reanalysis_eligible": False,
+        "excluded_trace_rows_value_state_evidence_retained": True,
+    }
+    binding["binding_sha256"] = _value_sha256(binding)
+    return binding
+
+
 def _completed_q_binding(
     *,
     merge: Mapping[str, Any],
@@ -906,6 +1006,33 @@ def _export_sampling_population(
         raise OverlayError(
             f"Stage-C selector validation split refused: {error}"
         ) from error
+    population_game_seeds = np.asarray(data["game_seed"], dtype=np.int64)
+    population_decision_indices = np.asarray(data["decision_index"], dtype=np.int64)
+    (
+        qualified_game_seeds,
+        qualified_validation_game_seeds,
+        trace_qualification,
+    ) = _trace_qualified_game_populations(
+        admission_schema=str(source_admission.get("schema_version", "")),
+        game_seeds=population_game_seeds,
+        decision_indices=population_decision_indices,
+        validation_game_seeds=np.asarray(validation["game_seeds"], dtype=np.int64),
+        expected_qualification=plan.get("source_game_trace_qualification"),
+    )
+    if (
+        np.setdiff1d(np.unique(game_seeds), qualified_game_seeds).size
+        or np.setdiff1d(
+            np.unique(np.asarray(patch["game_seed"], dtype=np.int64)),
+            qualified_game_seeds,
+        ).size
+    ):
+        raise OverlayError("Stage-C candidate or patch contains a trace-excluded game")
+    trace_population = _trace_population_binding(
+        game_seeds=population_game_seeds,
+        qualified_game_seeds=qualified_game_seeds,
+        qualified_validation_game_seeds=qualified_validation_game_seeds,
+        qualification=trace_qualification,
+    )
     replay_kwargs = {
         "rows": candidate_rows,
         "game_seeds": game_seeds,
@@ -915,8 +1042,8 @@ def _export_sampling_population(
         "surprise": surprise,
         "reliability_class": reliability_classes[candidate_rows],
         "policy_status": policy_status[candidate_rows],
-        "population_game_seeds": np.asarray(data["game_seed"], dtype=np.int64),
-        "validation_game_seeds": np.asarray(validation["game_seeds"], dtype=np.int64),
+        "population_game_seeds": qualified_game_seeds,
+        "validation_game_seeds": qualified_validation_game_seeds,
         "selection_seed": int(plan["subset"]["selection_seed"]),
         "max_rows_per_game": int(plan["subset"]["max_rows_per_game"]),
     }
@@ -960,7 +1087,7 @@ def _export_sampling_population(
         for key, count in materialized_selected.items()
     ):
         raise OverlayError("Stage-C selected count exceeds admitted population")
-    return {
+    report = {
         "schema_version": SAMPLING_SCHEMA,
         "selected_subset": _artifact(subset_path),
         "population_definition": "selected_game_candidate_population",
@@ -975,6 +1102,9 @@ def _export_sampling_population(
         "selected_counts_by_stratum": dict(sorted(materialized_selected.items())),
         "inverse_inclusion_formula": "candidate_count / selected_count",
     }
+    if trace_population is not None:
+        report["trace_population"] = trace_population
+    return report
 
 
 def _export(args: argparse.Namespace) -> dict[str, Any]:
@@ -1098,6 +1228,8 @@ def _export(args: argparse.Namespace) -> dict[str, Any]:
             "nonselected_policy_weight": 0.0,
             "selected_policy_weight": 1.0,
             "base_value_rows_retained": True,
+            "trace_excluded_games_retained_for_value_state_evidence": True,
+            "trace_excluded_games_policy_reanalysis_eligible": False,
             "root_value_patch_consumed": {
                 "root_value",
                 "root_value_mask",
@@ -1124,6 +1256,17 @@ def _export(args: argparse.Namespace) -> dict[str, Any]:
             "rewritten_columns": sorted(REWRITTEN_COLUMNS),
         },
     }
+    trace_qualification = plan.get("source_game_trace_qualification")
+    if source_admission["schema_version"] == post_wave_admission.ADMISSION_SCHEMA:
+        if not isinstance(trace_qualification, Mapping):
+            raise OverlayError("post-wave Stage-C export lost game-trace qualification")
+        manifest["source_game_trace_qualification"] = copy.deepcopy(
+            dict(trace_qualification)
+        )
+    elif trace_qualification is not None:
+        raise OverlayError(
+            "legacy Stage-C export unexpectedly carries trace qualification"
+        )
     manifest["export_sha256"] = _value_sha256(manifest)
     _write_json_immutable(output / "manifest.json", manifest)
     return manifest
@@ -1184,6 +1327,42 @@ def _load_export(
         or semantics_stated != _value_sha256(semantics_unsigned)
     ):
         raise OverlayError("Stage-C exported source-policy authority drifted")
+    trace_qualification = manifest.get("source_game_trace_qualification")
+    trace_population = manifest.get("sampling_population", {}).get("trace_population")
+    if source_admission.get("schema_version") == post_wave_admission.ADMISSION_SCHEMA:
+        trace_unsigned = (
+            dict(trace_qualification)
+            if isinstance(trace_qualification, Mapping)
+            else {}
+        )
+        trace_stated = trace_unsigned.pop("qualification_sha256", None)
+        binding_unsigned = (
+            dict(trace_population) if isinstance(trace_population, Mapping) else {}
+        )
+        binding_stated = binding_unsigned.pop("binding_sha256", None)
+        if (
+            not isinstance(trace_qualification, Mapping)
+            or trace_qualification.get("schema_version")
+            != alignment.GAME_TRACE_QUALIFICATION_SCHEMA
+            or trace_stated != _value_sha256(trace_unsigned)
+            or int(trace_qualification.get("qualified_games", 0)) <= 0
+            or int(trace_qualification.get("excluded_games", -1)) < 0
+            or int(trace_qualification.get("qualified_games", 0))
+            + int(trace_qualification.get("excluded_games", 0))
+            != int(trace_qualification.get("total_games", -1))
+            or not isinstance(trace_population, Mapping)
+            or trace_population.get("qualification_sha256") != trace_stated
+            or binding_stated != _value_sha256(binding_unsigned)
+            or trace_population.get("excluded_trace_rows_policy_reanalysis_eligible")
+            is not False
+            or trace_population.get("excluded_trace_rows_value_state_evidence_retained")
+            is not True
+        ):
+            raise OverlayError("Stage-C exported game-trace qualification drifted")
+    elif trace_qualification is not None or trace_population is not None:
+        raise OverlayError(
+            "legacy Stage-C export unexpectedly carries trace qualification"
+        )
 
     patch_ref = manifest.get("patch")
     merge_ref = manifest.get("source_merge_receipt")
@@ -1831,9 +2010,40 @@ def _materialize(args: argparse.Namespace) -> dict[str, Any]:
             raise OverlayError(
                 f"base coherent validation manifest refused: {error}"
             ) from error
+        base_data = train_bc.MemmapCorpus(base_root)
+        base_game_seeds = np.asarray(base_data["game_seed"], dtype=np.int64)
+        (
+            qualified_game_seeds,
+            qualified_validation_game_seeds,
+            trace_qualification,
+        ) = _trace_qualified_game_populations(
+            admission_schema=str(base_admission.get("schema_version", "")),
+            game_seeds=base_game_seeds,
+            decision_indices=np.asarray(base_data["decision_index"], dtype=np.int64),
+            validation_game_seeds=np.asarray(validation["game_seeds"], dtype=np.int64),
+            expected_qualification=export.get("source_game_trace_qualification"),
+        )
+        trace_population = _trace_population_binding(
+            game_seeds=base_game_seeds,
+            qualified_game_seeds=qualified_game_seeds,
+            qualified_validation_game_seeds=qualified_validation_game_seeds,
+            qualification=trace_qualification,
+        )
+        if (
+            export.get("sampling_population", {}).get("trace_population")
+            != trace_population
+        ):
+            raise OverlayError(
+                "portable Stage-C export trace population differs from base corpus"
+            )
+        if np.setdiff1d(
+            np.unique(np.asarray(patch["game_seed"], dtype=np.int64)),
+            qualified_game_seeds,
+        ).size:
+            raise OverlayError("Stage-C patch contains a trace-excluded game")
         selected_validation = np.isin(
             np.asarray(patch["game_seed"], dtype=np.int64),
-            np.asarray(validation["game_seeds"], dtype=np.int64),
+            qualified_validation_game_seeds,
         )
         subset_rows = np.asarray(subset["row_index"], dtype=np.int64)
         subset_phases = np.asarray(subset["phase"]).astype(str, copy=False)
@@ -1857,10 +2067,9 @@ def _materialize(args: argparse.Namespace) -> dict[str, Any]:
             raise OverlayError(
                 "Stage-C materialized patch row is absent from the selected subset"
             ) from error
-        base_data = train_bc.MemmapCorpus(base_root)
         root_breadth = _stage_c_root_breadth_inventory(
-            corpus_game_seeds=np.asarray(base_data["game_seed"], dtype=np.int64),
-            validation_game_seeds=np.asarray(validation["game_seeds"], dtype=np.int64),
+            corpus_game_seeds=qualified_game_seeds,
+            validation_game_seeds=qualified_validation_game_seeds,
             selected_game_seeds=np.asarray(patch["game_seed"], dtype=np.int64),
             selected_decision_indices=np.asarray(
                 patch["decision_index"], dtype=np.int64
@@ -1919,6 +2128,23 @@ def _materialize(args: argparse.Namespace) -> dict[str, Any]:
             patch=patch,
             selected_sampling_weights=selected_sampling_weights,
         )
+        if trace_population is not None:
+            excluded_trace_rows = ~np.isin(base_game_seeds, qualified_game_seeds)
+            materialized_policy_weight = _fixed_memmap(
+                temporary,
+                "policy_weight_multiplier",
+                columns["policy_weight_multiplier"],
+                int(meta["row_count"]),
+                mode="r",
+            )
+            if np.any(np.asarray(materialized_policy_weight)[excluded_trace_rows] > 0):
+                raise OverlayError(
+                    "trace-excluded row received materialized policy weight"
+                )
+            projection["trace_excluded_rows_retained"] = int(
+                np.count_nonzero(excluded_trace_rows)
+            )
+            projection["trace_excluded_rows_policy_weight_zero"] = True
         projection["selected_validation_policy_rows"] = int(
             np.count_nonzero(selected_validation)
         )
@@ -1971,6 +2197,13 @@ def _materialize(args: argparse.Namespace) -> dict[str, Any]:
             "sampling_distribution": sampling_report,
             "root_breadth": root_breadth,
         }
+        if trace_qualification is not None:
+            meta["stage_c_policy_overlay"]["source_game_trace_qualification"] = (
+                copy.deepcopy(trace_qualification)
+            )
+            meta["stage_c_policy_overlay"]["trace_population"] = copy.deepcopy(
+                trace_population
+            )
         meta_path = temporary / "corpus_meta.json"
         meta_path.write_text(
             json.dumps(meta, indent=2, sort_keys=True) + "\n", encoding="utf-8"
@@ -2025,6 +2258,11 @@ def _materialize(args: argparse.Namespace) -> dict[str, Any]:
             "completed_q_patch_consumed": True,
             "completed_q_binding": copy.deepcopy(completed_q_binding),
         }
+        if trace_qualification is not None:
+            receipt["source_game_trace_qualification"] = copy.deepcopy(
+                trace_qualification
+            )
+            receipt["trace_population"] = copy.deepcopy(trace_population)
         receipt["receipt_sha256"] = _value_sha256(receipt)
         _write_json_immutable(temporary / final_receipt.name, receipt)
 
@@ -2097,6 +2335,13 @@ def _materialize(args: argparse.Namespace) -> dict[str, Any]:
             "sampling_distribution": sampling_report,
             "root_breadth": root_breadth,
         }
+        if trace_qualification is not None:
+            admission["stage_c_policy_overlay"]["source_game_trace_qualification"] = (
+                copy.deepcopy(trace_qualification)
+            )
+            admission["stage_c_policy_overlay"]["trace_population"] = copy.deepcopy(
+                trace_population
+            )
         admission["admission_sha256"] = _value_sha256(admission)
         _write_json_immutable(temporary / "overlay.admission.json", admission)
         os.replace(temporary, output)
@@ -2296,6 +2541,108 @@ def verify_overlay_admission(path: Path) -> dict[str, Any]:
             )
     ):
         raise OverlayError("Stage-C overlay admission differs from corpus bytes")
+    overlay_trace = overlay.get("source_game_trace_qualification")
+    receipt_trace = receipt.get("source_game_trace_qualification")
+    meta_overlay = meta.get("stage_c_policy_overlay", {})
+    meta_trace = (
+        meta_overlay.get("source_game_trace_qualification")
+        if isinstance(meta_overlay, Mapping)
+        else None
+    )
+    overlay_trace_population = overlay.get("trace_population")
+    receipt_trace_population = receipt.get("trace_population")
+    meta_trace_population = (
+        meta_overlay.get("trace_population")
+        if isinstance(meta_overlay, Mapping)
+        else None
+    )
+    if admission.get("schema_version") == post_wave_admission.ADMISSION_SCHEMA:
+        if (
+            not isinstance(overlay_trace, Mapping)
+            or overlay_trace != receipt_trace
+            or overlay_trace != meta_trace
+            or not isinstance(overlay_trace_population, Mapping)
+            or overlay_trace_population != receipt_trace_population
+            or overlay_trace_population != meta_trace_population
+        ):
+            raise OverlayError("Stage-C overlay game-trace authorities differ")
+        validation_ref = admission["corpus"]["validation_manifest"]
+        try:
+            validation = train_bc._load_validation_game_seed_manifest_for_training(  # noqa: SLF001
+                Path(str(validation_ref["path"])),
+                validation_fraction=0.05,
+                validation_seed=17,
+                validation_max_samples=0,
+                validation_game_seed_ranges=[],
+            )
+        except SystemExit as error:
+            raise OverlayError(
+                f"Stage-C overlay validation manifest refused: {error}"
+            ) from error
+        data = train_bc.MemmapCorpus(corpus_root)
+        corpus_games = np.asarray(data["game_seed"], dtype=np.int64)
+        qualified_games, qualified_validation, replayed_trace = (
+            _trace_qualified_game_populations(
+                admission_schema=str(admission["schema_version"]),
+                game_seeds=corpus_games,
+                decision_indices=np.asarray(data["decision_index"], dtype=np.int64),
+                validation_game_seeds=np.asarray(
+                    validation["game_seeds"], dtype=np.int64
+                ),
+                expected_qualification=overlay_trace,
+            )
+        )
+        replayed_population = _trace_population_binding(
+            game_seeds=corpus_games,
+            qualified_game_seeds=qualified_games,
+            qualified_validation_game_seeds=qualified_validation,
+            qualification=replayed_trace,
+        )
+        policy_active = (
+            np.asarray(data["policy_weight_multiplier"], dtype=np.float32) > 0
+        )
+        if (
+            replayed_population != overlay_trace_population
+            or np.setdiff1d(
+                np.unique(corpus_games[policy_active]), qualified_games
+            ).size
+            or int(np.count_nonzero(policy_active)) != selected_rows
+        ):
+            raise OverlayError(
+                "Stage-C overlay policy population violates trace quarantine"
+            )
+        replayed_breadth = _stage_c_root_breadth_inventory(
+            corpus_game_seeds=qualified_games,
+            validation_game_seeds=qualified_validation,
+            selected_game_seeds=corpus_games[policy_active],
+            selected_decision_indices=np.asarray(
+                data["decision_index"], dtype=np.int64
+            )[policy_active],
+            selected_phases=np.asarray(data["phase"]).astype(str, copy=False)[
+                policy_active
+            ],
+        )
+        _verify_stage_c_root_breadth_inventory(
+            replayed_breadth, selected_rows=selected_rows
+        )
+        if replayed_breadth != root_breadth:
+            raise OverlayError(
+                "Stage-C overlay root breadth differs from trace-qualified corpus"
+            )
+    elif any(
+        value is not None
+        for value in (
+            overlay_trace,
+            receipt_trace,
+            meta_trace,
+            overlay_trace_population,
+            receipt_trace_population,
+            meta_trace_population,
+        )
+    ):
+        raise OverlayError(
+            "legacy Stage-C overlay unexpectedly carries trace qualification"
+        )
     return {
         "path": str(admission_path),
         "admission": admission,

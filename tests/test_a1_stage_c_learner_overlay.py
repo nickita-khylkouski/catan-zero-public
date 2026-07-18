@@ -73,6 +73,7 @@ def _completed_q_binding_fixture() -> tuple[dict, dict[str, np.ndarray], str]:
 def _broad_root_inventory(
     *,
     omitted_games: set[int] | None = None,
+    population_omitted_games: set[int] | None = None,
     short_game: int | None = None,
     omit_phase: str | None = None,
     omit_decision_bin: str | None = None,
@@ -112,7 +113,14 @@ def _broad_root_inventory(
             selected_decisions.append(decision)
             selected_phases.append(phase)
     return overlay._stage_c_root_breadth_inventory(  # noqa: SLF001
-        corpus_game_seeds=all_games,
+        corpus_game_seeds=np.asarray(
+            [
+                game
+                for game in all_games.tolist()
+                if not population_omitted_games or game not in population_omitted_games
+            ],
+            dtype=np.int64,
+        ),
         validation_game_seeds=validation_games,
         selected_game_seeds=np.asarray(selected_games, dtype=np.int64),
         selected_decision_indices=np.asarray(selected_decisions, dtype=np.int64),
@@ -176,6 +184,117 @@ def test_stage_c_root_breadth_verifier_recomputes_semantic_failures() -> None:
             inventory,
             selected_rows=_inventory_selected_rows(inventory),
         )
+
+
+def _trace_fixture() -> tuple[np.ndarray, np.ndarray, np.ndarray, dict]:
+    games = np.asarray([10, 10, 11, 11, 12, 12, 13, 13], dtype=np.int64)
+    decisions = np.asarray([0, 1, 2, 3, 0, 1, 2, 3], dtype=np.int64)
+    validation = np.asarray([12, 13], dtype=np.int64)
+    _qualified, receipt = overlay.alignment._qualify_stage_c_game_traces(  # noqa: SLF001
+        game_seeds=games,
+        decision_indices=decisions,
+    )
+    return games, decisions, validation, receipt
+
+
+def test_post_wave_trace_population_uses_only_replayable_games() -> None:
+    games, decisions, validation, receipt = _trace_fixture()
+
+    qualified, qualified_validation, replayed = (
+        overlay._trace_qualified_game_populations(  # noqa: SLF001
+            admission_schema=overlay.post_wave_admission.ADMISSION_SCHEMA,
+            game_seeds=games,
+            decision_indices=decisions,
+            validation_game_seeds=validation,
+            expected_qualification=receipt,
+        )
+    )
+    binding = overlay._trace_population_binding(  # noqa: SLF001
+        game_seeds=games,
+        qualified_game_seeds=qualified,
+        qualified_validation_game_seeds=qualified_validation,
+        qualification=replayed,
+    )
+
+    assert qualified.tolist() == [10, 12]
+    assert qualified_validation.tolist() == [12]
+    assert replayed == receipt
+    assert binding is not None
+    assert binding["qualified_games"] == 2
+    assert binding["excluded_games"] == 2
+    assert binding["excluded_corpus_rows"] == 4
+    assert binding["excluded_trace_rows_policy_reanalysis_eligible"] is False
+    assert binding["excluded_trace_rows_value_state_evidence_retained"] is True
+
+
+@pytest.mark.parametrize("mutation", ["missing", "digest", "corpus"])
+def test_post_wave_trace_population_fails_closed_on_drift(
+    mutation: str,
+) -> None:
+    games, decisions, validation, receipt = _trace_fixture()
+    expected: object = receipt
+    if mutation == "missing":
+        expected = None
+    elif mutation == "digest":
+        expected = {**receipt, "qualified_games": 3}
+    else:
+        decisions = decisions.copy()
+        decisions[0] = 2
+
+    with pytest.raises(
+        overlay.OverlayError,
+        match="lost game-trace qualification|qualification drifted",
+    ):
+        overlay._trace_qualified_game_populations(  # noqa: SLF001
+            admission_schema=overlay.post_wave_admission.ADMISSION_SCHEMA,
+            game_seeds=games,
+            decision_indices=decisions,
+            validation_game_seeds=validation,
+            expected_qualification=expected,
+        )
+
+
+def test_legacy_trace_population_preserves_full_population_only() -> None:
+    games, decisions, validation, receipt = _trace_fixture()
+
+    qualified, qualified_validation, replayed = (
+        overlay._trace_qualified_game_populations(  # noqa: SLF001
+            admission_schema=overlay.LEGACY_ADMISSION_SCHEMA,
+            game_seeds=games,
+            decision_indices=decisions,
+            validation_game_seeds=validation,
+            expected_qualification=None,
+        )
+    )
+
+    assert qualified.tolist() == [10, 11, 12, 13]
+    assert qualified_validation.tolist() == [12, 13]
+    assert replayed is None
+    with pytest.raises(
+        overlay.OverlayError,
+        match="legacy Stage-C authority unexpectedly carries",
+    ):
+        overlay._trace_qualified_game_populations(  # noqa: SLF001
+            admission_schema=overlay.LEGACY_ADMISSION_SCHEMA,
+            game_seeds=games,
+            decision_indices=decisions,
+            validation_game_seeds=validation,
+            expected_qualification=receipt,
+        )
+
+
+def test_trace_qualified_population_is_the_root_breadth_denominator() -> None:
+    excluded = {100, 101}
+    full_population = _broad_root_inventory(omitted_games=excluded)
+    qualified_population = _broad_root_inventory(
+        omitted_games=excluded,
+        population_omitted_games=excluded,
+    )
+
+    assert full_population["passed"] is False
+    assert "training:unique_game_fraction" in full_population["failures"]
+    assert qualified_population["passed"] is True
+    assert qualified_population["scopes"]["training"]["unique_game_fraction"] == 1.0
 
 
 def test_policy_projection_disables_old_targets_and_maps_action_ids(

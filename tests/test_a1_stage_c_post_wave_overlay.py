@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 from tools import a1_stage_c_learner_overlay as overlay
@@ -171,6 +172,21 @@ def test_overlay_verifier_accepts_bound_post_wave_derived_admission(
         "operator_identity": {"legacy_or_unbound_q_allowed": False},
     }
     root_breadth = {"inventory_sha256": "sha256:" + "f" * 64}
+    game_seeds = np.arange(100, 116, dtype=np.int64)
+    decision_indices = np.zeros(16, dtype=np.int64)
+    validation_game_seeds = np.arange(112, 116, dtype=np.int64)
+    qualified_games, trace_qualification = (
+        overlay.alignment._qualify_stage_c_game_traces(  # noqa: SLF001
+            game_seeds=game_seeds,
+            decision_indices=decision_indices,
+        )
+    )
+    trace_population = overlay._trace_population_binding(  # noqa: SLF001
+        game_seeds=game_seeds,
+        qualified_game_seeds=qualified_games,
+        qualified_validation_game_seeds=validation_game_seeds,
+        qualification=trace_qualification,
+    )
     corpus = tmp_path / "corpus"
     corpus.mkdir()
     meta = {
@@ -180,6 +196,8 @@ def test_overlay_verifier_accepts_bound_post_wave_derived_admission(
             "paired_root_value_patch_consumed": True,
             "completed_q_patch_consumed": True,
             "completed_q_binding": completed_q,
+            "source_game_trace_qualification": trace_qualification,
+            "trace_population": trace_population,
         },
         "columns": dict(overlay.COMPLETED_Q_COLUMN_SCHEMAS),
     }
@@ -192,6 +210,8 @@ def test_overlay_verifier_accepts_bound_post_wave_derived_admission(
         "paired_root_value_patch_consumed": True,
         "completed_q_patch_consumed": True,
         "completed_q_binding": completed_q,
+        "source_game_trace_qualification": trace_qualification,
+        "trace_population": trace_population,
         "overlay_corpus": {
             "payload_inventory_sha256": meta["payload_inventory_sha256"]
         },
@@ -216,6 +236,7 @@ def test_overlay_verifier_accepts_bound_post_wave_derived_admission(
             "payload_inventory_sha256": meta["payload_inventory_sha256"],
             "stored_policy_target_distillation_eligible": True,
             "incompatible_policy_active_rows": 0,
+            "validation_manifest": {"path": "/sealed/validation.json"},
         },
         "policy_distillation_contract": {
             "coherent_public_n128_only": True,
@@ -257,6 +278,8 @@ def test_overlay_verifier_accepts_bound_post_wave_derived_admission(
             },
             "source_admission": source_ref,
             "source_policy_semantics": semantics,
+            "source_game_trace_qualification": trace_qualification,
+            "trace_population": trace_population,
         },
     }
     admission["admission_sha256"] = overlay._value_sha256(admission)  # noqa: SLF001
@@ -271,6 +294,26 @@ def test_overlay_verifier_accepts_bound_post_wave_derived_admission(
         overlay,
         "_verify_stage_c_root_breadth_inventory",
         lambda value, *, selected_rows: value,
+    )
+    monkeypatch.setattr(
+        overlay,
+        "_stage_c_root_breadth_inventory",
+        lambda **_kwargs: root_breadth,
+    )
+    monkeypatch.setattr(
+        overlay.train_bc,
+        "_load_validation_game_seed_manifest_for_training",
+        lambda *_args, **_kwargs: {"game_seeds": validation_game_seeds},
+    )
+    monkeypatch.setattr(
+        overlay.train_bc,
+        "MemmapCorpus",
+        lambda _path: {
+            "game_seed": game_seeds,
+            "decision_index": decision_indices,
+            "policy_weight_multiplier": np.ones(16, dtype=np.float32),
+            "phase": np.asarray(["PLAY_TURN"] * 16),
+        },
     )
 
     verified = overlay.verify_overlay_admission(admission_path)
