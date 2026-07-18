@@ -3211,6 +3211,37 @@ def _policy_objective_fraction(
     return min(1.0, fraction)
 
 
+def _policy_objective_equivalent_active_rows(
+    *,
+    base_active_rows: float,
+    aux_active_rows: float,
+    policy_aux_loss_weight: float,
+    policy_objective_fraction: float,
+) -> float:
+    """Return coefficient- and boundary-aware policy row exposure.
+
+    Base and AUX are independently normalized objective means:
+    ``base_mean + policy_aux_loss_weight * aux_mean``. Raw active-row telemetry
+    counts every presented row, while full-dose-equivalent telemetry must scale
+    AUX rows by that coefficient. Otherwise P10 and P25 falsely report the same
+    equivalent exposure.
+    """
+
+    values = (
+        float(base_active_rows),
+        float(aux_active_rows),
+        float(policy_aux_loss_weight),
+        float(policy_objective_fraction),
+    )
+    if not all(math.isfinite(value) for value in values):
+        raise ValueError("policy equivalent-row inputs must be finite")
+    if min(values) < 0.0:
+        raise ValueError("policy equivalent-row inputs must be non-negative")
+    if values[3] > 1.0 + 1.0e-12:
+        raise ValueError("policy objective fraction exceeds full dose")
+    return (values[0] + values[2] * values[1]) * min(1.0, values[3])
+
+
 def _global_policy_objective_presence(
     *,
     local_base_active_rows: int,
@@ -19808,6 +19839,11 @@ def main(
                     (base_policy_rows, "base"),
                     (auxiliary_policy_rows, "aux"),
                 ):
+                    stream_coefficient = (
+                        float(args.policy_aux_loss_weight)
+                        if suffix == "aux"
+                        else 1.0
+                    )
                     component_dose, component_phase_dose = (
                         _policy_component_dose_for_batch(
                             data,
@@ -19820,14 +19856,22 @@ def main(
                         epoch_policy_component_dose[key] += count
                         epoch_policy_component_dose[
                             f"{key}_equivalent"
-                        ] += count * batch_policy_objective_fraction
+                        ] += (
+                            count
+                            * stream_coefficient
+                            * batch_policy_objective_fraction
+                        )
                     for key, count in component_phase_dose.items():
                         epoch_policy_component_phase_dose[key] += count
                         component_id, phase, stream = key.split("\0", 2)
                         epoch_policy_component_phase_dose[
                             f"{component_id}\0{phase}\0"
                             f"{stream}_equivalent"
-                        ] += count * batch_policy_objective_fraction
+                        ] += (
+                            count
+                            * stream_coefficient
+                            * batch_policy_objective_fraction
+                        )
             batch_value_component_dose = (
                 _value_component_active_dose_for_batch(
                     data, source_global_rows, value_active_row_mask
@@ -19875,6 +19919,9 @@ def main(
                                 len(aux_source_rows), dtype=np.bool_
                             ),
                             draw_stream="policy_aux",
+                            policy_stream_coefficient=float(
+                                args.policy_aux_loss_weight
+                            ),
                             policy_objective_fraction=(
                                 batch_policy_objective_fraction
                             ),
@@ -20102,6 +20149,16 @@ def main(
             batch_policy_active_rows = active_count + float(
                 batch_metrics.get("policy_aux_active_count", 0)
             )
+            batch_policy_equivalent_active_rows = (
+                _policy_objective_equivalent_active_rows(
+                    base_active_rows=active_count,
+                    aux_active_rows=float(
+                        batch_metrics.get("policy_aux_active_count", 0)
+                    ),
+                    policy_aux_loss_weight=float(args.policy_aux_loss_weight),
+                    policy_objective_fraction=batch_policy_objective_fraction,
+                )
+            )
             batch_policy_effective_weight = float(
                 batch_metrics.get("policy_base_loss_weight_sum", 0.0)
             ) + float(args.policy_aux_loss_weight) * float(
@@ -20110,7 +20167,7 @@ def main(
             if batch_policy_objective_fraction > 0.0:
                 epoch_policy_objective_active_rows += batch_policy_active_rows
                 epoch_policy_objective_equivalent_active_rows += (
-                    batch_policy_active_rows * batch_policy_objective_fraction
+                    batch_policy_equivalent_active_rows
                 )
                 epoch_policy_objective_effective_weight += float(
                     batch_policy_loss_weight
@@ -37308,6 +37365,7 @@ def _training_strata_dose_for_batch(
     value_weights: np.ndarray,
     value_active_mask: np.ndarray,
     draw_stream: str = "base",
+    policy_stream_coefficient: float = 1.0,
     policy_objective_fraction: float = 1.0,
 ) -> dict[str, dict[str, dict[str, float]]]:
     """Attribute one realized training draw to science-relevant strata.
@@ -37323,6 +37381,7 @@ def _training_strata_dose_for_batch(
     policy = np.asarray(policy_weights, dtype=np.float64)
     value = np.asarray(value_weights, dtype=np.float64)
     value_active = np.asarray(value_active_mask, dtype=np.bool_)
+    stream_coefficient = float(policy_stream_coefficient)
     objective_fraction = float(policy_objective_fraction)
     expected = (len(rows),)
     if (
@@ -37333,6 +37392,8 @@ def _training_strata_dose_for_batch(
         or np.any(rows < 0)
         or not np.isfinite(policy).all()
         or not np.isfinite(value).all()
+        or not math.isfinite(stream_coefficient)
+        or stream_coefficient < 0.0
         or not math.isfinite(objective_fraction)
         or objective_fraction < 0.0
         or objective_fraction > 1.0
@@ -37402,10 +37463,13 @@ def _training_strata_dose_for_batch(
                 ),
                 "policy_objective_equivalent_rows": (
                     float(np.count_nonzero(mask & policy_active))
+                    * stream_coefficient
                     * objective_fraction
                 ),
                 "policy_objective_equivalent_weight_sum": (
-                    float(policy[mask].sum()) * objective_fraction
+                    float(policy[mask].sum())
+                    * stream_coefficient
+                    * objective_fraction
                 ),
                 "value_active_rows": float(np.count_nonzero(active_value)),
                 "value_weight_sum": float(value[active_value].sum()),

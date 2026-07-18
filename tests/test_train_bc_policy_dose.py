@@ -201,6 +201,33 @@ def test_policy_objective_fraction_preserves_fractional_boundary() -> None:
         train_bc._policy_objective_fraction(1.01, 1.0)  # noqa: SLF001
 
 
+def test_policy_equivalent_active_rows_scale_auxiliary_treatment() -> None:
+    p10 = train_bc._policy_objective_equivalent_active_rows(  # noqa: SLF001
+        base_active_rows=223,
+        aux_active_rows=6144,
+        policy_aux_loss_weight=0.10,
+        policy_objective_fraction=1.0,
+    )
+    p25 = train_bc._policy_objective_equivalent_active_rows(  # noqa: SLF001
+        base_active_rows=223,
+        aux_active_rows=6144,
+        policy_aux_loss_weight=0.25,
+        policy_objective_fraction=1.0,
+    )
+    assert p10 == pytest.approx(837.4)
+    assert p25 == pytest.approx(1759.0)
+
+
+def test_policy_equivalent_active_rows_apply_partial_dose_boundary() -> None:
+    equivalent = train_bc._policy_objective_equivalent_active_rows(  # noqa: SLF001
+        base_active_rows=8,
+        aux_active_rows=4,
+        policy_aux_loss_weight=0.25,
+        policy_objective_fraction=0.5,
+    )
+    assert equivalent == pytest.approx(4.5)
+
+
 @pytest.mark.parametrize(
     (
         "base_presence",
@@ -541,6 +568,34 @@ def test_fractional_policy_strata_report_full_dose_equivalent_rows() -> None:
     assert report["dimensions"]["phase"]["opening"][
         "policy_objective_equivalent_rows"
     ] == pytest.approx(0.25)
+
+
+def test_aux_policy_strata_report_coefficient_weighted_equivalent_rows() -> None:
+    data = {
+        "legal_action_ids": np.asarray([[1, 2], [1, 2]], dtype=np.int16),
+        "phase": np.asarray(["opening", "main"]),
+    }
+    dose = train_bc._training_strata_dose_for_batch(  # noqa: SLF001
+        data,
+        np.arange(2, dtype=np.int64),
+        policy_weights=np.ones(2, dtype=np.float32),
+        value_weights=np.zeros(2, dtype=np.float32),
+        value_active_mask=np.zeros(2, dtype=np.bool_),
+        draw_stream="policy_aux",
+        policy_stream_coefficient=0.25,
+        policy_objective_fraction=1.0,
+    )
+    report = train_bc._nest_training_strata_dose(  # noqa: SLF001
+        train_bc._flatten_training_strata_dose(dose)  # noqa: SLF001
+    )
+
+    assert report["policy_objective_active_row_draws"] == 2
+    assert report["policy_objective_equivalent_row_draws"] == pytest.approx(
+        0.5
+    )
+    assert report["dimensions"]["draw_stream"]["policy_aux"][
+        "policy_objective_equivalent_weight_sum"
+    ] == pytest.approx(0.5)
 
 
 def test_component_dose_counts_only_rows_passed_to_objective() -> None:
