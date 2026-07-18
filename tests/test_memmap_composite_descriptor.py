@@ -861,6 +861,64 @@ def test_stage_c_policy_aux_accepts_current_and_historical_sampling_schema(
     assert label == "stage_c_strategic_balanced"
 
 
+def test_direct_stage_c_sampling_refuses_disabled_policy_aux() -> None:
+    class _StageCCorpus:
+        meta = {
+            "stage_c_policy_overlay": {
+                "sampling_distribution": {
+                    "schema_version": "a1-stage-c-policy-sampling-distribution-v2",
+                    "column": "stage_c_policy_sampling_weight",
+                    "arm": "PRODUCTION_WEIGHTED",
+                }
+            }
+        }
+
+        def __contains__(self, key: str) -> bool:
+            return key in {
+                "stage_c_policy_sampling_weight",
+                "policy_weight_multiplier",
+            }
+
+        def __getitem__(self, key: str) -> np.ndarray:
+            return {
+                "stage_c_policy_sampling_weight": np.asarray(
+                    [1.0, 0.0, 1.0], dtype=np.float64
+                ),
+                "policy_weight_multiplier": np.asarray(
+                    [1.0, 0.0, 1.0], dtype=np.float32
+                ),
+            }[key]
+
+    with pytest.raises(
+        SystemExit,
+        match="direct Stage-C policy sampling requires",
+    ):
+        train_bc._require_stage_c_policy_aux_stream(  # noqa: SLF001
+            _StageCCorpus(),
+            np.arange(3, dtype=np.int64),
+            active_batch_size=0,
+        )
+    accepted = train_bc._require_stage_c_policy_aux_stream(  # noqa: SLF001
+        _StageCCorpus(),
+        np.arange(3, dtype=np.int64),
+        active_batch_size=64,
+    )
+    assert accepted is not None
+    assert accepted[0].tolist() == [1.0, 0.0, 1.0]
+
+    class _OrdinaryCorpus:
+        meta = {}
+
+    assert (
+        train_bc._require_stage_c_policy_aux_stream(  # noqa: SLF001
+            _OrdinaryCorpus(),
+            np.arange(3, dtype=np.int64),
+            active_batch_size=0,
+        )
+        is None
+    )
+
+
 def test_policy_aux_phase_allocation_sets_exact_phase_shares() -> None:
     active = np.asarray([0.10, 0.20, 0.30, 0.40, 0.0], dtype=np.float64)
     phases = np.asarray(["PLAY", "PLAY", "ROBBER", "DISCARD", "PLAY"])

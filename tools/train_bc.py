@@ -18022,6 +18022,11 @@ def main(
         data, "policy_aux_phase_sampling_weights", None
     )
     policy_aux_phase_loss_weights = None
+    direct_stage_c_base = _require_stage_c_policy_aux_stream(
+        data,
+        train_indices,
+        active_batch_size=int(args.policy_aux_active_batch_size),
+    )
     if bool(getattr(data, "policy_aux_phase_scope_authenticated", False)):
         policy_aux_phase_loss_weights = dict(policy_phase_weight_map)
         invalid_phase_loss_weights = {
@@ -18065,7 +18070,7 @@ def main(
                 "weights or an authenticated direct-corpus authority"
             )
         stage_c_base = (
-            _stage_c_policy_aux_base_measure(data, train_indices)
+            direct_stage_c_base
             if coherent_direct_policy_aux
             else None
         )
@@ -44810,6 +44815,24 @@ def _stage_c_policy_aux_base_measure(
             f"{active_mean}"
         )
     return weights, f"stage_c_{str(sampling['arm']).lower()}"
+
+
+def _require_stage_c_policy_aux_stream(
+    data,
+    train_indices: np.ndarray,
+    *,
+    active_batch_size: int,
+) -> tuple[np.ndarray, str] | None:
+    """Reject a Stage-C arm whose only consumer was silently disabled."""
+
+    stage_c_base = _stage_c_policy_aux_base_measure(data, train_indices)
+    if stage_c_base is not None and int(active_batch_size) <= 0:
+        raise SystemExit(
+            "direct Stage-C policy sampling requires "
+            "--policy-aux-active-batch-size > 0; otherwise the authenticated "
+            "Stage-C sampling arm is silently ignored by the shared base sampler"
+        )
+    return stage_c_base
 
 
 def _apply_authenticated_policy_aux_phase_allocation(
