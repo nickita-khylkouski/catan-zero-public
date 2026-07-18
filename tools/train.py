@@ -63,6 +63,7 @@ _ENGINE_SETTING_KEYS = frozenset(
         "minimum_initial_settlement_policy_mass_fraction",
         "minimum_move_robber_policy_mass_fraction",
         "objective_gradient_interference_every_batches",
+        "policy_aux_opening_value_mix_fraction",
         "public_rule_state_features",
         "require_35m_model",
         "require_feature_learning_signal_modules",
@@ -363,6 +364,19 @@ def _load_recipe(path: str | Path) -> tuple[TrainConfig, dict[str, Any]]:
         if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
             raise SystemExit(
                 f"canonical engine setting {name} must be an integer >= {minimum}"
+            )
+    if "policy_aux_opening_value_mix_fraction" in engine:
+        opening_value_mix = engine["policy_aux_opening_value_mix_fraction"]
+        if (
+            isinstance(opening_value_mix, bool)
+            or not isinstance(opening_value_mix, (int, float))
+            or not math.isfinite(float(opening_value_mix))
+            or not 0.0 <= float(opening_value_mix) <= 1.0
+        ):
+            raise SystemExit(
+                "canonical engine setting "
+                "policy_aux_opening_value_mix_fraction must be a finite "
+                "fraction in [0, 1]"
             )
     return config, dict(engine)
 
