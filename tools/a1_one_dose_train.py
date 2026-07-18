@@ -177,9 +177,9 @@ TRAINING_TOPOLOGIES: dict[str, dict[str, Any]] = {
     },
     H100_8GPU_DDP_TOPOLOGY: {
         "world_size": 8,
-        "local_batch_size": 512,
+        "local_batch_size": 64,
         "grad_accum_steps": 1,
-        "global_batch_size": 4096,
+        "global_batch_size": 512,
     },
 }
 EVENT_HISTORY_ACK_FLAG = "--acknowledge-empty-event-history-payload-inventory-sha256"
@@ -3326,6 +3326,12 @@ def bind_training_topology(
     canonical_parent_update = isinstance(
         verified.get("canonical_parent_update"), dict
     )
+    direct_parent_diagnostic = (
+        topology == H100_8GPU_DDP_TOPOLOGY
+        and isinstance(verified.get("independent_parent_authority"), dict)
+        and verified["independent_parent_authority"].get("schema_version")
+        == DIRECT_INDEPENDENT_PARENT_AUTHORITY_SCHEMA
+    )
     if canonical_parent_update and topology == B200_8GPU_DDP_TOPOLOGY:
         spec = {
             "world_size": 8,
@@ -3333,10 +3339,13 @@ def bind_training_topology(
             "grad_accum_steps": 1,
             "global_batch_size": 512,
         }
+    logical_global_batch_size = (
+        512 if canonical_parent_update or direct_parent_diagnostic else 4096
+    )
     if (
-        int(bound["global_batch_size"]) != (512 if canonical_parent_update else 4096)
+        int(bound["global_batch_size"]) != logical_global_batch_size
         or int(bound["world_size"]) != 1
-        or int(bound["batch_size"]) != (512 if canonical_parent_update else 4096)
+        or int(bound["batch_size"]) != logical_global_batch_size
         or int(bound["grad_accum_steps"]) != 1
     ):
         raise ExecutorError("sealed recipe does not match its logical global dose")

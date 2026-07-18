@@ -1319,7 +1319,10 @@ def _ddp_canary_payload(
     created_unix_ns: int,
     model: str = "B200",
     topology: str = executor.B200_8GPU_DDP_TOPOLOGY,
+    local_batch_size: int = 512,
 ) -> dict:
+    global_batch_size = 8 * local_batch_size
+    local_draws_per_rank = 3 * local_batch_size
     identities = [
         {
             "physical_index": rank,
@@ -1341,8 +1344,8 @@ def _ddp_canary_payload(
         "hostname": executor.socket.gethostname(),
         "created_unix_ns": created_unix_ns,
         "world_size": 8,
-        "local_batch_size": 512,
-        "global_batch_size": 4096,
+        "local_batch_size": local_batch_size,
+        "global_batch_size": global_batch_size,
         "ddp_shard_data": False,
         "training_rng_rank_offset": True,
         "training_rng_contracts": [
@@ -1362,8 +1365,8 @@ def _ddp_canary_payload(
             "actual_by_rank": [36.0] * 8,
             "passed": True,
         },
-        "padded_global_draws": 12_288,
-        "local_draws_per_rank": 1_536,
+        "padded_global_draws": local_draws_per_rank * 8,
+        "local_draws_per_rank": local_draws_per_rank,
         "gpu_names": [f"NVIDIA {model}"] * 8,
         "gpu_identities": identities,
         "runtime_identity": {
@@ -1442,6 +1445,13 @@ def test_h100_8gpu_topology_preserves_dose_and_accepts_only_h100_canary(
     tmp_path: Path,
 ) -> None:
     verified = _production_trainer_verified(tmp_path)
+    verified["recipe"].update(
+        {
+            "batch_size": 512,
+            "world_size": 1,
+            "global_batch_size": 512,
+        }
+    )
     verified["independent_parent_authority"] = {
         "schema_version": executor.DIRECT_INDEPENDENT_PARENT_AUTHORITY_SCHEMA,
         "authority_sha256": _SHA,
@@ -1464,18 +1474,19 @@ def test_h100_8gpu_topology_preserves_dose_and_accepts_only_h100_canary(
         "name": executor.H100_8GPU_DDP_TOPOLOGY,
         "world_size": 8,
         "physical_gpus": list(range(8)),
-        "local_batch_size": 512,
+        "local_batch_size": 64,
         "grad_accum_steps": 1,
-        "global_batch_size": 4096,
+        "global_batch_size": 512,
         "dose_preserving": True,
     }
-    assert executor._effective_global_batch_size(bound["recipe"]) == 4096
-    assert executor._expected_optimizer_steps(bound) == 2
+    assert executor._effective_global_batch_size(bound["recipe"]) == 512
+    assert executor._expected_optimizer_steps(bound) == 9
 
     h100_payload = _ddp_canary_payload(
         created_unix_ns=executor.time.time_ns(),
         model="H100",
         topology=executor.H100_8GPU_DDP_TOPOLOGY,
+        local_batch_size=64,
     )
     h100_receipt = tmp_path / "h100-ddp-canary.json"
     h100_receipt.write_text(json.dumps(h100_payload), encoding="utf-8")
