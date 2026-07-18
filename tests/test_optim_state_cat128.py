@@ -80,6 +80,7 @@ def test_legacy_sidecar_cannot_erase_current_optimizer_group_identity(tmp_path):
                 "params": list(model.parameters()),
                 "group_name": "historical_flat",
                 "weight_decay_role": "no_decay",
+                "base_lr": 1e-3,
             }
         ],
         lr=1e-3,
@@ -87,6 +88,25 @@ def test_legacy_sidecar_cannot_erase_current_optimizer_group_identity(tmp_path):
     assert load_optimizer_state(ckpt, model, fresh, _DDP_SINGLE) is True
     assert fresh.param_groups[0]["group_name"] == "historical_flat"
     assert fresh.param_groups[0]["weight_decay_role"] == "no_decay"
+    assert fresh.param_groups[0]["base_lr"] == pytest.approx(1e-3)
+    tb = _load_train_bc()
+    multiplier = tb._apply_lr_schedule(
+        fresh,
+        base_lr=1e-3,
+        step=11,
+        warmup_steps=16,
+        total_steps=12,
+        schedule="flat",
+    )
+    dose = tb._optimizer_lr_dose_attestation(
+        applied_updates=12,
+        schedule_multiplier_sum=4.875,
+        lr_area_by_group=[4.875e-3],
+        optimizer=fresh,
+    )
+    assert multiplier == pytest.approx(0.75)
+    assert fresh.param_groups[0]["lr"] == pytest.approx(7.5e-4)
+    assert dose["parameter_groups"][0]["base_lr"] == pytest.approx(1e-3)
 
 
 def test_modern_sidecar_rejects_semantic_group_identity_drift(tmp_path):
@@ -112,6 +132,33 @@ def test_modern_sidecar_rejects_semantic_group_identity_drift(tmp_path):
     assert load_optimizer_state(ckpt, model, fresh, _DDP_SINGLE) is False
     assert len(fresh.state) == 0
     assert fresh.param_groups[0]["group_name"] == "trunk"
+
+
+def test_optimizer_sidecar_rejects_configured_base_lr_drift(tmp_path):
+    ckpt = tmp_path / "modern-base-lr.pt"
+    model, saved = _stepped_adam()
+    saved.param_groups[0].update(
+        group_name="historical_flat",
+        weight_decay_role="no_decay",
+        base_lr=1e-3,
+    )
+    assert save_optimizer_state(ckpt, model, saved, _DDP_SINGLE) is not None
+
+    fresh = torch.optim.Adam(
+        [
+            {
+                "params": list(model.parameters()),
+                "group_name": "historical_flat",
+                "weight_decay_role": "no_decay",
+                "base_lr": 2e-3,
+            }
+        ],
+        lr=2e-3,
+    )
+
+    assert load_optimizer_state(ckpt, model, fresh, _DDP_SINGLE) is False
+    assert len(fresh.state) == 0
+    assert fresh.param_groups[0]["base_lr"] == pytest.approx(2e-3)
 
 
 def test_load_missing_sidecar_is_failsafe(tmp_path):
