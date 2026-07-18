@@ -37,6 +37,28 @@ def _reviewed_ablation_code_binding() -> dict[str, object]:
     )
 
 
+def test_ablation_code_binding_ignores_retired_lock_inventory_path() -> None:
+    repo = Path(executor.__file__).resolve().parents[1]
+    retired = repo / "tools" / "retired_wave_only_tool.py"
+    assert not retired.exists()
+    binding = executor._current_ablation_code_binding(  # noqa: SLF001
+        {
+            "provenance": {
+                "learner_code": [
+                    {"path": str(repo / "tools/train_bc.py")},
+                    {"path": str(retired)},
+                ],
+                "runtime_code_tree": [
+                    {"path": str(repo / "tools/a1_one_dose_train.py")}
+                ],
+            }
+        }
+    )
+    observed = {row["relative_path"] for row in binding["records"]}
+    assert "tools/train_bc.py" in observed
+    assert "tools/retired_wave_only_tool.py" not in observed
+
+
 def _objective() -> dict[str, object]:
     return {
         "objective": "mse",

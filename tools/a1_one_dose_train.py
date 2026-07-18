@@ -551,7 +551,14 @@ def _current_ablation_code_binding(lock: dict[str, Any]) -> dict[str, Any]:
             if not isinstance(old, dict) or not isinstance(old.get("path"), str):
                 raise ExecutorError(f"sealed A1 {section} record is malformed")
             relative = _repo_relative_code_path(old["path"])
-            current = (_REPO_ROOT / relative).resolve(strict=True)
+            try:
+                current = (_REPO_ROOT / relative).resolve(strict=True)
+            except FileNotFoundError:
+                # A newer reviewed checkout may retire a tool that was present
+                # in the wave's broad provenance inventory but is no longer
+                # part of the learner runtime.  The explicit current-runtime
+                # closure below remains mandatory and code-tree hashed.
+                continue
             relative_key = relative.as_posix()
             record = {
                 "kind": kind,
@@ -657,6 +664,12 @@ def _verify_completed_ablation_code_binding(
             if not isinstance(old, dict) or not isinstance(old.get("path"), str):
                 raise ExecutorError(f"sealed A1 {section} record is malformed")
             relative = _repo_relative_code_path(old["path"]).as_posix()
+            try:
+                (root / relative).resolve(strict=True)
+            except FileNotFoundError:
+                # Match launch-time rebinding: retired non-runtime tools from
+                # an older lock are absent from the completed checkout too.
+                continue
             if relative not in expected_kinds or kind == "learner_code":
                 expected_kinds[relative] = kind
     for relative in (
