@@ -221,12 +221,23 @@ def _qualify_stage_c_game_traces(
     *,
     game_seeds: np.ndarray,
     decision_indices: np.ndarray,
+    pool_game_rows: np.ndarray | None = None,
 ) -> tuple[np.ndarray, dict[str, Any]]:
     """Classify traces that can replay from the canonical seeded initial state."""
 
     games = np.asarray(game_seeds, dtype=np.int64)
     decisions = np.asarray(decision_indices, dtype=np.int64)
-    if games.ndim != 1 or decisions.shape != games.shape or not len(games):
+    pool_rows = (
+        np.zeros(games.shape, dtype=np.bool_)
+        if pool_game_rows is None
+        else np.asarray(pool_game_rows, dtype=np.bool_)
+    )
+    if (
+        games.ndim != 1
+        or decisions.shape != games.shape
+        or pool_rows.shape != games.shape
+        or not len(games)
+    ):
         raise AlignmentError("Stage-C game-trace qualification inputs are malformed")
     if np.any(games[1:] < games[:-1]):
         raise AlignmentError("Stage-C corpus game_seed rows are not monotonically grouped")
@@ -241,6 +252,8 @@ def _qualify_stage_c_game_traces(
     qualified: list[int] = []
     excluded: list[int] = []
     reason_counts = {
+        "opponent_pool_single_seat_trace": 0,
+        "inconsistent_pool_game_provenance": 0,
         "missing_initial_decision_prefix": 0,
         "negative_decision_index": 0,
         "non_increasing_decision_index": 0,
@@ -249,7 +262,19 @@ def _qualify_stage_c_game_traces(
     for start, stop in zip(starts.tolist(), stops.tolist(), strict=True):
         seed = int(games[start])
         game_decisions = decisions[start:stop]
-        if np.any(game_decisions < 0):
+        game_pool_rows = pool_rows[start:stop]
+        if np.any(game_pool_rows != game_pool_rows[0]):
+            reason = "inconsistent_pool_game_provenance"
+        elif bool(game_pool_rows[0]):
+            # Opponent-pool generation intentionally archives only the
+            # producer seat.  A producer-first game therefore appears to have
+            # a valid decision-0 prefix but omits the opponent's multi-action
+            # initial settlement at decision 2 (and every later opponent
+            # choice).  Public feature/history tensors are learner inputs, not
+            # an authenticated action trace, so they cannot safely fill those
+            # branches.
+            reason = "opponent_pool_single_seat_trace"
+        elif np.any(game_decisions < 0):
             reason = "negative_decision_index"
         elif int(game_decisions[0]) != 0:
             reason = "missing_initial_decision_prefix"
@@ -267,6 +292,7 @@ def _qualify_stage_c_game_traces(
                     "reason": reason,
                     "first_decision_index": int(game_decisions[0]),
                     "recorded_row_count": int(stop - start),
+                    "is_pool_game": bool(game_pool_rows[0]),
                 }
             )
 
@@ -282,8 +308,12 @@ def _qualify_stage_c_game_traces(
                 "BUILD_INITIAL_SETTLEMENT, never an automatic transition"
             ),
             "later_sparse_gaps": (
-                "retained; executor must prove each omitted transition has exactly "
-                "one legal action"
+                "retained only for full-seat traces; executor must prove each "
+                "omitted transition has exactly one legal action"
+            ),
+            "opponent_pool_trace_semantics": (
+                "unreconstructable: pool games archive only the producer seat; "
+                "public feature/history tensors are not action-trace authority"
             ),
         },
         "total_games": int(len(starts)),
@@ -1838,6 +1868,11 @@ def _build_plan(args: argparse.Namespace) -> dict[str, Any]:
         ) = _qualify_stage_c_game_traces(
             game_seeds=population_game_seeds,
             decision_indices=population_decision_indices,
+            pool_game_rows=(
+                np.asarray(data["is_pool_game"], dtype=np.bool_)
+                if "is_pool_game" in data
+                else None
+            ),
         )
     else:
         reconstructable_game_seeds = np.unique(population_game_seeds)
@@ -2345,6 +2380,11 @@ def _verify_plan(path: Path) -> dict[str, Any]:
             ) = _qualify_stage_c_game_traces(
                 game_seeds=population_game_seeds,
                 decision_indices=population_decision_indices,
+                pool_game_rows=(
+                    np.asarray(source_data["is_pool_game"], dtype=np.bool_)
+                    if "is_pool_game" in source_data
+                    else None
+                ),
             )
             if plan.get("source_game_trace_qualification") != (
                 replayed_trace_qualification

@@ -405,6 +405,8 @@ def test_game_trace_qualification_excludes_only_proven_malformed_games() -> None
     assert receipt["qualified_games"] == 1
     assert receipt["excluded_games"] == 3
     assert receipt["exclusion_counts"] == {
+        "opponent_pool_single_seat_trace": 0,
+        "inconsistent_pool_game_provenance": 0,
         "missing_initial_decision_prefix": 1,
         "negative_decision_index": 1,
         "non_increasing_decision_index": 1,
@@ -413,6 +415,31 @@ def test_game_trace_qualification_excludes_only_proven_malformed_games() -> None
         11,
         12,
         13,
+    ]
+
+
+def test_game_trace_qualification_excludes_pool_games_with_decision_zero_prefix() -> None:
+    game_seeds = np.asarray([10, 10, 10, 11, 11, 11], dtype=np.int64)
+    decision_indices = np.asarray([0, 1, 6, 0, 1, 2], dtype=np.int64)
+    pool_rows = np.asarray([True, True, True, False, False, False], dtype=np.bool_)
+
+    qualified, receipt = alignment._qualify_stage_c_game_traces(  # noqa: SLF001
+        game_seeds=game_seeds,
+        decision_indices=decision_indices,
+        pool_game_rows=pool_rows,
+    )
+
+    assert qualified.tolist() == [11]
+    assert receipt["excluded_games"] == 1
+    assert receipt["exclusion_counts"]["opponent_pool_single_seat_trace"] == 1
+    assert receipt["exclusion_examples"] == [
+        {
+            "game_seed": 10,
+            "reason": "opponent_pool_single_seat_trace",
+            "first_decision_index": 0,
+            "recorded_row_count": 3,
+            "is_pool_game": True,
+        }
     ]
 
 
