@@ -116,6 +116,7 @@ def _fixture(tmp_path: Path) -> dict[str, Path]:
         "determinization_particles": 1,
         "correct_rust_chance_spectra": True,
         "lazy_interior_chance": True,
+        "rng_stream_separation": True,
         "symmetry_averaged_eval": True,
         "public_observation": True,
         "meaningful_public_history": True,
@@ -204,6 +205,16 @@ def test_post_wave_admission_reuses_existing_rows_and_replays_source_identity(
     )
     assert identity["search"]["n_full"] == 128
     assert identity["target_information_regime"] == admission.COHERENT_REGIME
+    assert identity["chance"]["rng_stream_separation"] is True
+    assert (
+        identity["chance"]["rng_stream_schema"]
+        == alignment.SEARCH_RNG_STREAM_SCHEMA
+    )
+    assert identity["chance"]["separate_rng_domains"] == [
+        "gumbel",
+        "chance",
+        "belief",
+    ]
 
 
 def test_post_wave_admission_rejects_audit_drift(tmp_path: Path) -> None:

@@ -1422,6 +1422,8 @@ def inspect_rd_contract(contract_path: Path) -> dict[str, Any]:
         "checkpoint": None,
         "games": 0,
     }
+    if value.get("operator", {}).get("rng_stream_separation") is True:
+        required_fields["rng_stream_separation"] = True
     drift = {
         key: {"expected": expected, "actual": fields.get(key)}
         for key, expected in required_fields.items()
@@ -1453,6 +1455,11 @@ def inspect_rd_contract(contract_path: Path) -> dict[str, Any]:
         raise InventoryError(f"{path}: search evidence is not required")
     if expected.get("--coherent-public-belief-search") is not True:
         raise InventoryError(f"{path}: coherent public search is not guard-required")
+    if (
+        value.get("operator", {}).get("rng_stream_separation") is True
+        and expected.get("--rng-stream-separation") is not True
+    ):
+        raise InventoryError(f"{path}: RNG stream separation is not guard-required")
     if (
         expected.get("--record-automatic-transitions")
         is not records_automatic_transitions

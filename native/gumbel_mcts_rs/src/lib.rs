@@ -164,7 +164,17 @@ pub struct SearchConfig {
     pub colors: Vec<Color>,
     pub map_kind: MapKind,
     pub max_depth: i32,
+    /// Historical shared-stream seed. This remains the only seed consumed
+    /// when the explicit domain-seed tuple below is absent.
     pub seed: u64,
+    /// Opt-in control stream for p-full selection, root Gumbel noise, and
+    /// gameplay policy sampling. All explicit domain seeds must be supplied
+    /// together so native execution cannot silently claim separation.
+    pub control_seed: Option<u64>,
+    /// Opt-in interior-chance stream. See `control_seed`.
+    pub chance_seed: Option<u64>,
+    /// Opt-in public-belief materialization stream. See `control_seed`.
+    pub belief_seed: Option<u64>,
     pub max_root_candidates: usize,
     pub max_root_candidates_wide: usize,
     pub wide_candidates_threshold: usize,
@@ -225,6 +235,9 @@ impl Default for SearchConfig {
             map_kind: MapKind::Base,
             max_depth: 80,
             seed: 0,
+            control_seed: None,
+            chance_seed: None,
+            belief_seed: None,
             max_root_candidates: 16,
             max_root_candidates_wide: 54,
             wide_candidates_threshold: 24,
@@ -588,7 +601,12 @@ pub struct SearchResult {
 
 pub struct GumbelMctsEngine {
     config: SearchConfig,
+    /// Control/Gumbel/gameplay stream. In legacy mode this is also the chance
+    /// stream, preserving the historical byte-for-byte draw order.
     rng: ChaCha8Rng,
+    /// Independent chance stream when the caller supplies an authenticated
+    /// three-domain tuple. None deliberately means historical shared RNG.
+    chance_rng: Option<ChaCha8Rng>,
     root_turn: usize,
     /// Immutable for one search recipe; building this per action was
     /// O(legal-width x full-action-space) and erased the native-loop win.
@@ -599,14 +617,26 @@ impl GumbelMctsEngine {
     pub fn new(config: SearchConfig) -> Self {
         assert!(config.temperature.is_finite(), "temperature must be finite");
         assert!(
+            (config.control_seed.is_none()
+                && config.chance_seed.is_none()
+                && config.belief_seed.is_none())
+                || (config.control_seed.is_some()
+                    && config.chance_seed.is_some()
+                    && config.belief_seed.is_some()),
+            "control_seed, chance_seed, and belief_seed must be supplied together"
+        );
+        assert!(
             config
                 .sigma_reference_visits
                 .is_none_or(|visits| visits >= 0),
             "sigma_reference_visits must be non-negative"
         );
         let action_space = ActionSpace::new(&config.colors, config.map_kind);
+        let control_seed = config.control_seed.unwrap_or(config.seed);
+        let chance_rng = config.chance_seed.map(ChaCha8Rng::seed_from_u64);
         Self {
-            rng: ChaCha8Rng::seed_from_u64(config.seed),
+            rng: ChaCha8Rng::seed_from_u64(control_seed),
+            chance_rng,
             config,
             root_turn: 0,
             action_space,
@@ -1390,7 +1420,12 @@ impl GumbelMctsEngine {
             .filter(|card| public_unknown[card.idx()] > 0)
             .collect::<Vec<_>>();
         materialize_conditioned_public_dev_support(&cards, &public_unknown, |requested| {
-            game.public_belief_development_draws(root_color, action, requested, self.config.seed)
+            game.public_belief_development_draws(
+                root_color,
+                action,
+                requested,
+                self.config.belief_seed.unwrap_or(self.config.seed),
+            )
         })
     }
 
@@ -1633,7 +1668,10 @@ impl GumbelMctsEngine {
         if outcomes.len() == 1 {
             return outcomes[0].0;
         }
-        let draw = self.rng.gen::<f64>();
+        let draw = match self.chance_rng.as_mut() {
+            Some(rng) => rng.gen::<f64>(),
+            None => self.rng.gen::<f64>(),
+        };
         let mut cum = 0.0;
         for &(idx, prob) in outcomes {
             cum += prob;
@@ -1911,6 +1949,36 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_chance_stream_is_independent_and_legacy_remains_shared() {
+        let separated = SearchConfig {
+            seed: 7,
+            control_seed: Some(11),
+            chance_seed: Some(13),
+            belief_seed: Some(17),
+            ..Default::default()
+        };
+        let mut baseline = GumbelMctsEngine::new(separated.clone());
+        let expected_chance = baseline.chance_rng.as_mut().unwrap().gen::<f64>();
+        let mut with_control_draw = GumbelMctsEngine::new(separated);
+        let _ = with_control_draw.sample_gumbel();
+        let actual_chance = with_control_draw.chance_rng.as_mut().unwrap().gen::<f64>();
+        assert_eq!(actual_chance, expected_chance);
+        assert_eq!(with_control_draw.config.belief_seed, Some(17));
+
+        let legacy = SearchConfig {
+            seed: 17,
+            ..Default::default()
+        };
+        let mut legacy_baseline = GumbelMctsEngine::new(legacy.clone());
+        let expected_shared = legacy_baseline.rng.gen::<f64>();
+        let mut legacy_with_control_draw = GumbelMctsEngine::new(legacy);
+        let _ = legacy_with_control_draw.sample_gumbel();
+        let actual_shared = legacy_with_control_draw.rng.gen::<f64>();
+        assert_ne!(actual_shared, expected_shared);
+        assert!(legacy_with_control_draw.chance_rng.is_none());
+    }
 
     #[test]
     fn sigma_reference_visits_is_budget_invariant_and_default_is_legacy() {

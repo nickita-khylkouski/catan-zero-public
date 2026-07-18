@@ -152,6 +152,31 @@ def test_native_rng_stream_separation_refuses_silent_operator_drift(
     with pytest.raises(ValueError, match="rng_stream_separation"):
         search._validate_native_semantics()
 
+def test_native_rng_stream_separation_routes_explicit_seed_domains(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(
+        sys.modules,
+        "catanatron_rs",
+        SimpleNamespace(
+            gumbel_search_capabilities=lambda: ["rng_stream_separation"]
+        ),
+    )
+    search = object.__new__(NativeGumbelChanceMCTS)
+    search.config = GumbelChanceMCTSConfig(rng_stream_separation=True)
+    search.using_native_hot_loop = True
+    search._gumbel_rng = SimpleNamespace(getrandbits=lambda _bits: 11)
+    search._chance_rng = SimpleNamespace(getrandbits=lambda _bits: 13)
+    search._belief_rng = SimpleNamespace(getrandbits=lambda _bits: 17)
+    search._boundary_value_particle_seeds = ()
+
+    native = search._native_config()
+
+    assert native["seed"] == 11
+    assert native["control_seed"] == 11
+    assert native["chance_seed"] == 13
+    assert native["belief_seed"] == 17
+
 
 def test_native_config_revalidates_temperature_after_runtime_mutation(
     monkeypatch: pytest.MonkeyPatch,

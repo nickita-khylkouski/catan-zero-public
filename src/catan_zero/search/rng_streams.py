@@ -13,6 +13,7 @@ import hashlib
 
 
 SEARCH_RNG_STREAM_SCHEMA = "gumbel-chance-belief-domain-separation-v1"
+SHARED_SEARCH_RNG_STREAM_SCHEMA = "gumbel-chance-belief-shared-stream-v1"
 SEARCH_RNG_STREAM_NAMES = ("gumbel", "chance", "belief")
 BOUNDARY_VALUE_PARTICLE_SCHEMA = "coherent-boundary-value-particle-v1"
 

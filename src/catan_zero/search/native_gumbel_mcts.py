@@ -90,10 +90,15 @@ class NativeGumbelChanceMCTS(GumbelChanceMCTS):
         if bool(self.config.uncertainty_backup_weighting):
             unsupported.append("uncertainty_backup_weighting=True")
         if self.using_native_hot_loop and bool(self.config.rng_stream_separation):
-            unsupported.append(
-                "rng_stream_separation=True requires independent native Gumbel, "
-                "chance, and belief RNG streams"
-            )
+            import catanatron_rs  # type: ignore
+
+            capability_fn = getattr(catanatron_rs, "gumbel_search_capabilities", None)
+            capabilities = set(capability_fn()) if callable(capability_fn) else set()
+            if "rng_stream_separation" not in capabilities:
+                unsupported.append(
+                    "rng_stream_separation=True requires a native wheel advertising "
+                    "independent control/Gumbel, chance, and belief streams"
+                )
         if self.using_native_hot_loop and bool(
             self.config.rescale_noise_floor_initial_road_only
         ):
@@ -244,8 +249,24 @@ class NativeGumbelChanceMCTS(GumbelChanceMCTS):
             # reference search object's ADVANCING RNG rather than resetting to
             # config.seed on every move/particle. This is deterministic across
             # identically seeded search objects but distinct within one run.
-            seed=self.rng.getrandbits(64),
         )
+        if bool(config.rng_stream_separation):
+            # Belief-root construction already consumes `_belief_rng` before
+            # this bridge. Bind every native draw to its matching advancing
+            # domain as well: p-full/Gumbel/gameplay control, interior chance,
+            # and public-belief development-card materialization.
+            control_seed = self._gumbel_rng.getrandbits(64)
+            chance_seed = self._chance_rng.getrandbits(64)
+            belief_seed = self._belief_rng.getrandbits(64)
+            values.update(
+                seed=control_seed,
+                control_seed=control_seed,
+                chance_seed=chance_seed,
+                belief_seed=belief_seed,
+            )
+        else:
+            # Preserve the exact historical shared-stream call contract.
+            values["seed"] = self.rng.getrandbits(64)
         values["prior_temperature"] = self._effective_prior_temperature()
         values["rescale_noise_floor_initial_road_only"] = bool(
             config.rescale_noise_floor_initial_road_only
