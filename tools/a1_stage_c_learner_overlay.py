@@ -1796,6 +1796,47 @@ def _seal_rewritten_payloads(
         os.close(directory)
 
 
+def _prime_materialized_payload_auth_cache(
+    output_root: Path, meta: Mapping[str, Any]
+) -> bool:
+    """Authenticate the final overlay and prime the learner's exact cache.
+
+    The overlay inventory alone is not sufficient authority for a cache entry:
+    preserved columns inherit content hashes from the base corpus, and the
+    trainer additionally binds the final corpus path and filesystem identities.
+    Run the trainer's own fail-closed validator after the final directory rename
+    so the cache entry is identical to the one a first learner launch would
+    otherwise create after rereading the entire corpus.
+
+    Cache publication remains best-effort inside ``train_bc``.  Authentication
+    failure is fatal; an unavailable user cache directory is not.
+    """
+
+    try:
+        inventory_sha, identities = train_bc._validate_memmap_payload_inventory(  # noqa: SLF001
+            output_root,
+            dict(meta),
+            return_identities=True,
+        )
+    except SystemExit as error:
+        raise OverlayError(
+            f"materialized Stage-C payload authentication failed: {error}"
+        ) from error
+    total_bytes = sum(int(identity["size_bytes"]) for identity in identities)
+    if any(int(identity["mode"]) & 0o222 for identity in identities):
+        return False
+    binding = train_bc._payload_auth_cache_binding(  # noqa: SLF001
+        output_root,
+        dict(meta),
+        inventory_sha,
+        identities,
+    )
+    return train_bc._load_payload_auth_cache(  # noqa: SLF001
+        binding,
+        total_bytes=total_bytes,
+    )
+
+
 def _unit_mean_capped_weights(raw: np.ndarray, *, cap: float) -> np.ndarray:
     values = np.asarray(raw, dtype=np.float64)
     if (
@@ -2038,6 +2079,7 @@ def _materialize(args: argparse.Namespace) -> dict[str, Any]:
         raise OverlayError(f"overlay output already exists: {output}")
     output.parent.mkdir(parents=True, exist_ok=True)
     temporary = Path(tempfile.mkdtemp(prefix=f".{output.name}.", dir=output.parent))
+    published_output = False
     try:
         meta = copy.deepcopy(base_meta)
         columns = meta.get("columns")
@@ -2414,6 +2456,8 @@ def _materialize(args: argparse.Namespace) -> dict[str, Any]:
         admission["admission_sha256"] = _value_sha256(admission)
         _write_json_immutable(temporary / "overlay.admission.json", admission)
         os.replace(temporary, output)
+        published_output = True
+        payload_auth_cache_ready = _prime_materialized_payload_auth_cache(output, meta)
         return {
             "receipt": str(final_receipt),
             "receipt_sha256": receipt["receipt_sha256"],
@@ -2421,9 +2465,12 @@ def _materialize(args: argparse.Namespace) -> dict[str, Any]:
             "admission_sha256": admission["admission_sha256"],
             "corpus": str(output),
             "selected_policy_rows": int(projection["selected_rows"]),
+            "payload_auth_cache_ready": payload_auth_cache_ready,
         }
     except Exception:
         shutil.rmtree(temporary, ignore_errors=True)
+        if published_output:
+            shutil.rmtree(output, ignore_errors=True)
         raise
 
 

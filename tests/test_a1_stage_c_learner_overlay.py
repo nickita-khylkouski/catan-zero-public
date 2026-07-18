@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -32,6 +33,67 @@ def test_seal_rewritten_payloads_makes_only_named_files_read_only(
     assert rewritten.read_bytes() == b"new-policy"
     assert rewritten.stat().st_mode & 0o222 == 0
     assert preserved.stat().st_mode & 0o222 != 0
+
+
+def test_materialized_payload_auth_cache_is_ready_for_first_learner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    corpus = tmp_path / "overlay"
+    corpus.mkdir()
+    payloads = {
+        "obs.dat": b"authenticated-observations",
+        "row_offsets.dat": np.asarray([0, 1], dtype=np.int64).tobytes(),
+    }
+    for filename, content in payloads.items():
+        path = corpus / filename
+        path.write_bytes(content)
+        os.chmod(path, 0o444)
+    inventory = [
+        {
+            "filename": filename,
+            "size_bytes": len(content),
+            "sha256": "sha256:" + hashlib.sha256(content).hexdigest(),
+        }
+        for filename, content in sorted(payloads.items())
+    ]
+    meta = {
+        "columns": {
+            "obs": {
+                "kind": "fixed",
+                "dtype": "uint8",
+                "inner_shape": [],
+            },
+            "row_offsets": {
+                "kind": "row_offsets",
+                "dtype": "int64",
+                "inner_shape": [],
+            },
+        },
+        "payload_inventory_schema": train_bc.MEMMAP_PAYLOAD_INVENTORY_SCHEMA,
+        "payload_inventory": inventory,
+        "payload_inventory_sha256": train_bc._canonical_json_sha256(  # noqa: SLF001
+            inventory
+        ),
+    }
+    (corpus / "corpus_meta.json").write_text(
+        json.dumps(meta, sort_keys=True), encoding="utf-8"
+    )
+    monkeypatch.setenv(
+        "TRAIN_BC_PAYLOAD_AUTH_CACHE_DIR", str(tmp_path / "payload-auth-cache")
+    )
+
+    assert overlay._prime_materialized_payload_auth_cache(  # noqa: SLF001
+        corpus, meta
+    )
+    first = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert [event["status"] for event in first] == ["miss"]
+
+    train_bc._validate_memmap_payload_inventory(corpus, meta)  # noqa: SLF001
+    second = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert [event["status"] for event in second] == ["hit"]
+    assert second[0]["bytes_avoided"] == sum(map(len, payloads.values()))
 
 
 def _completed_q_binding_fixture() -> tuple[dict, dict[str, np.ndarray], str]:
