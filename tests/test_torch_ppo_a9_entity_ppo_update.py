@@ -339,7 +339,75 @@ def test_forced_rows_do_not_dilute_entity_ppo_kl() -> None:
         minibatch_size=64,
     )
 
-    assert metrics["approx_kl"] == pytest.approx(1.0, abs=1e-6)
+    assert metrics["approx_kl"] == pytest.approx(np.exp(-1.0), abs=1e-6)
+
+
+def test_entity_target_kl_uses_nonnegative_k3_without_signed_cancellation() -> None:
+    """Opposite signed log-ratios must not cancel the target-KL stop signal."""
+    import torch
+    from catan_zero.rl.torch_ppo import (
+        _behavior_policy_logits,
+        _entity_action_column,
+        _entity_behavior_valid_mask,
+        _entity_graph_outputs,
+        ppo_update,
+    )
+
+    samples = _collect_real_samples(2)
+    trajectory = _make_trajectory(samples, force_indices=set())
+    policy = _make_entity_policy()
+    with torch.no_grad():
+        outputs = _entity_graph_outputs(policy, trajectory.samples)
+        for row, sample in enumerate(trajectory.samples):
+            least_likely_column = int(
+                outputs["logits"][row, : len(sample.valid_actions)].argmin().item()
+            )
+            sample.action = sample.valid_actions[least_likely_column]
+        behavior_logits = _behavior_policy_logits(
+            outputs["logits"],
+            1.0,
+            valid_mask=_entity_behavior_valid_mask(
+                trajectory.samples,
+                outputs["logits"],
+            ),
+        )
+        columns = torch.as_tensor(
+            [_entity_action_column(sample) for sample in trajectory.samples],
+            dtype=torch.long,
+            device=policy.device,
+        )
+        current = (
+            torch.distributions.Categorical(logits=behavior_logits)
+            .log_prob(columns)
+            .cpu()
+            .numpy()
+        )
+    # The historical signed estimator mean(old_logp - new_logp) is exactly
+    # zero here despite extreme per-row drift in opposite directions.
+    drift = 0.5
+    trajectory.old_log_probs = [
+        float(current[0] + drift),
+        float(current[1] - drift),
+    ]
+
+    metrics = ppo_update(
+        policy,
+        [trajectory],
+        learning_rate=0.0,
+        clip_ratio=0.2,
+        value_coef=0.0,
+        entropy_coef=0.0,
+        epochs=4,
+        minibatch_size=64,
+        target_kl=0.01,
+    )
+
+    assert metrics["approx_kl"] == pytest.approx(
+        np.cosh(drift) - 1.0, rel=1e-6
+    )
+    assert metrics["approx_kl"] >= 0.0
+    assert metrics["early_stop"] == 1.0
+    assert metrics["minibatches"] == 0.0
 
 
 def test_entity_ppo_uses_learner_reference_without_losing_actor_evidence() -> None:

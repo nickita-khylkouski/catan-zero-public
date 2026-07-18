@@ -53,8 +53,16 @@ def _bound_completed_q_data() -> dict:
     }
     data["meta"] = {
         "columns": {
-            "completed_q_values": {"kind": "ragged2d", "dtype": "float32"},
-            "completed_q_mask": {"kind": "ragged2d", "dtype": "bool"},
+            "completed_q_values": {
+                "kind": "ragged2d",
+                "dtype": "float32",
+                "fill": float("nan"),
+            },
+            "completed_q_mask": {
+                "kind": "ragged2d",
+                "dtype": "bool",
+                "fill": False,
+            },
         },
         "stage_c_policy_overlay": {
             "completed_q_binding": {
@@ -134,6 +142,30 @@ def test_completed_q_admission_binds_operator_and_never_target_scores() -> None:
 
     del corpus["meta"]["stage_c_policy_overlay"]
     with pytest.raises(SystemExit, match="unbound values"):
+        train_bc._completed_q_binding_admission(  # noqa: SLF001
+            corpus,
+            loss_weight=0.2,
+        )
+
+
+@pytest.mark.parametrize(
+    ("column", "field", "value"),
+    [
+        ("completed_q_values", "dtype", "float64"),
+        ("completed_q_values", "fill", 0.0),
+        ("completed_q_mask", "dtype", "uint8"),
+        ("completed_q_mask", "fill", True),
+    ],
+)
+def test_completed_q_admission_rejects_column_abi_drift(
+    column: str,
+    field: str,
+    value: object,
+) -> None:
+    corpus = _Corpus(_bound_completed_q_data())
+    corpus["meta"]["columns"][column][field] = value
+
+    with pytest.raises(SystemExit, match="corpus binding is malformed"):
         train_bc._completed_q_binding_admission(  # noqa: SLF001
             corpus,
             loss_weight=0.2,

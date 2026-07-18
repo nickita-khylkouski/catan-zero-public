@@ -85,6 +85,33 @@ def _behavior_policy_logits(logits, temperature: float, *, valid_mask=None):
     return behavior_logits
 
 
+def _ppo_k3_approx_kl(log_ratio):
+    """Return Schulman's nonnegative k3 sample estimator for PPO KL.
+
+    ``log_ratio`` is ``log(pi_new(a) / pi_old(a))`` on behavior-sampled
+    actions.  The historical ``-log_ratio`` sample mean is unbiased for
+    ``KL(pi_old || pi_new)``, but individual samples are signed; a minibatch
+    can therefore report zero or a negative value under severe policy drift
+    and bypass ``target_kl`` early stopping.  The control-variate estimator
+
+        (exp(log_ratio) - 1) - log_ratio
+
+    has the same expectation and is nonnegative for every sample.  Clamp only
+    the diagnostic exponent's input so malformed/extreme likelihood evidence
+    produces a large finite stop signal instead of overflow.  PPO's actual
+    optimization ratio remains unchanged.
+    """
+
+    import torch
+
+    bounded_log_ratio = torch.clamp(log_ratio.float(), min=-50.0, max=50.0)
+    estimate = torch.expm1(bounded_log_ratio) - bounded_log_ratio
+    # Roundoff near log_ratio == 0 can produce a negative sub-ULP value even
+    # though k3 is analytically nonnegative.  Telemetry/early-stop semantics
+    # are explicitly nonnegative, so close that numerical crack here.
+    return estimate.clamp_min(0.0)
+
+
 @dataclass(slots=True)
 class PPOTrajectory:
     samples: list[StepSample]
@@ -1412,6 +1439,17 @@ def ppo_update(
     )
     advantage_group_count = 0
     advantage_group_labels = _advantage_group_labels(trajectories)
+    # Preserve the established top-filter measure: global mode ranks raw GAE
+    # advantages after group weighting, while per-opponent mode ranks its
+    # normalized-and-weighted values. The policy-gradient tensor below has a
+    # separate ordering contract and always applies weights after normalization.
+    filter_advantages = None
+    if advantage_normalization_mode in {"global", "standard", "default"}:
+        filter_advantages, _, _ = _apply_advantage_group_weights(
+            raw_advantages,
+            advantage_group_labels,
+            advantage_group_weights,
+        )
     if advantage_normalization_mode not in {"global", "standard", "default"}:
         raw_advantages, advantage_group_count = _normalize_advantages_by_group(
             raw_advantages,
@@ -1419,6 +1457,23 @@ def ppo_update(
             mode=advantage_normalization_mode,
             eligible_mask=policy_active_np,
         )
+    advantages = torch.as_tensor(
+        raw_advantages,
+        dtype=torch.float32,
+        device=policy.device,
+    )
+    full_policy_active = torch.as_tensor(policy_active_np, device=policy.device)
+    if advantage_normalization_mode in {"global", "standard", "default"}:
+        advantages = _standardize_advantages_excluding_forced(
+            advantages,
+            full_policy_active,
+        )
+        raw_advantages = advantages.detach().cpu().numpy()
+    # Opponent-group weights are final policy-gradient multipliers, not inputs
+    # to the normalization statistics. Applying them before global
+    # standardization made any common group scalar cancel completely and
+    # distorted mixed-group ratios. Keep this after every normalization mode,
+    # matching the learner CLI contract and the existing per-opponent path.
     raw_advantages, advantage_group_weight_count, advantage_group_weight_mean = (
         _apply_advantage_group_weights(
             raw_advantages,
@@ -1431,15 +1486,9 @@ def ppo_update(
         dtype=torch.float32,
         device=policy.device,
     )
-    full_policy_active = torch.as_tensor(policy_active_np, device=policy.device)
-    if advantage_normalization_mode in {"global", "standard", "default"}:
-        advantages = _standardize_advantages_excluding_forced(
-            advantages,
-            full_policy_active,
-        )
     samples_before_filter = len(samples)
     keep_indices, advantage_filter_threshold = _top_advantage_keep_indices(
-        raw_advantages,
+        raw_advantages if filter_advantages is None else filter_advantages,
         top_fraction=top_advantage_fraction,
         min_samples=min_advantage_samples,
         eligible_mask=policy_active_np,
@@ -1554,7 +1603,8 @@ def ppo_update(
                 )
             dist = torch.distributions.Categorical(logits=behavior_logits)
             log_probs = dist.log_prob(batch_actions)
-            ratio = torch.exp(log_probs - batch_old_log_probs)
+            log_ratio = log_probs - batch_old_log_probs
+            ratio = torch.exp(log_ratio)
             unclipped = ratio * batch_advantages
             clipped = (
                 torch.clamp(ratio, 1.0 - clip_ratio, 1.0 + clip_ratio)
@@ -1597,7 +1647,11 @@ def ppo_update(
             else:
                 entropy = entropy_values.new_tensor(0.0)
             with torch.no_grad():
-                per_sample_kl = batch_old_log_probs - log_probs
+                # ``approx_kl`` is the nonnegative k3 estimator, not the old
+                # signed -log-ratio sample mean.  Keeping the telemetry key
+                # stable preserves downstream consumers while making its
+                # target-KL safety semantics cancellation-proof.
+                per_sample_kl = _ppo_k3_approx_kl(log_ratio)
                 per_sample_clipped = (torch.abs(ratio - 1.0) > clip_ratio).float()
                 if bool(batch_policy_active.any()):
                     approx_kl = per_sample_kl[batch_policy_active].mean()
@@ -1607,8 +1661,8 @@ def ppo_update(
                     clip_fraction = per_sample_clipped.new_tensor(0.0)
             candidate_approx_kl = float(approx_kl.item())
             if target_kl > 0.0 and candidate_approx_kl > target_kl:
-                # This KL describes the current (pre-step) policy. Once it is
-                # already outside the trust region, applying this minibatch
+                # This k3 KL describes the current (pre-step) policy. Once it
+                # is already outside the trust region, applying this minibatch
                 # would knowingly take one additional unconstrained update.
                 last_approx_kl = candidate_approx_kl
                 last_clip_fraction = float(clip_fraction.item())
@@ -1944,6 +1998,15 @@ def _ppo_update_entity_graph_body(
     )
     advantage_group_count = 0
     advantage_group_labels = _advantage_group_labels(trajectories)
+    # Keep top-advantage selection byte-compatible with the dense path and
+    # historical global-mode ranking while fixing the gradient multiplier.
+    filter_advantages = None
+    if advantage_normalization_mode in {"global", "standard", "default"}:
+        filter_advantages, _, _ = _apply_advantage_group_weights(
+            raw_advantages,
+            advantage_group_labels,
+            advantage_group_weights,
+        )
     if advantage_normalization_mode not in {"global", "standard", "default"}:
         raw_advantages, advantage_group_count = _normalize_advantages_by_group(
             raw_advantages,
@@ -1951,6 +2014,21 @@ def _ppo_update_entity_graph_body(
             mode=advantage_normalization_mode,
             eligible_mask=policy_active_np,
         )
+    advantages = torch.as_tensor(
+        raw_advantages,
+        dtype=torch.float32,
+        device=policy.device,
+    )
+    full_policy_active = torch.as_tensor(policy_active_np, device=policy.device)
+    if advantage_normalization_mode in {"global", "standard", "default"}:
+        advantages = _standardize_advantages_excluding_forced(
+            advantages,
+            full_policy_active,
+        )
+        raw_advantages = advantages.detach().cpu().numpy()
+    # Preserve configured group scalars after normalization; otherwise global
+    # standardization divides a single group's weight back out of the policy
+    # gradient and changes mixed-group weights non-multiplicatively.
     raw_advantages, advantage_group_weight_count, advantage_group_weight_mean = (
         _apply_advantage_group_weights(
             raw_advantages,
@@ -1963,16 +2041,10 @@ def _ppo_update_entity_graph_body(
         dtype=torch.float32,
         device=policy.device,
     )
-    full_policy_active = torch.as_tensor(policy_active_np, device=policy.device)
-    if advantage_normalization_mode in {"global", "standard", "default"}:
-        advantages = _standardize_advantages_excluding_forced(
-            advantages,
-            full_policy_active,
-        )
 
     samples_before_filter = len(samples)
     keep_indices, advantage_filter_threshold = _top_advantage_keep_indices(
-        raw_advantages,
+        raw_advantages if filter_advantages is None else filter_advantages,
         top_fraction=top_advantage_fraction,
         min_samples=min_advantage_samples,
         eligible_mask=policy_active_np,
@@ -2065,7 +2137,8 @@ def _ppo_update_entity_graph_body(
             )
             dist = torch.distributions.Categorical(logits=behavior_logits)
             log_probs = dist.log_prob(batch_actions)
-            ratio = torch.exp(log_probs - batch_old_log_probs)
+            log_ratio = log_probs - batch_old_log_probs
+            ratio = torch.exp(log_ratio)
             unclipped = ratio * batch_advantages
             clipped = (
                 torch.clamp(ratio, 1.0 - clip_ratio, 1.0 + clip_ratio)
@@ -2111,7 +2184,9 @@ def _ppo_update_entity_graph_body(
             else:
                 entropy = normalized_entropy.new_tensor(0.0)
             with torch.no_grad():
-                per_sample_kl = batch_old_log_probs - log_probs
+                # Match the dense PPO path: target-KL stopping and the public
+                # ``approx_kl`` metric both use nonnegative k3 samples.
+                per_sample_kl = _ppo_k3_approx_kl(log_ratio)
                 per_sample_clipped = (torch.abs(ratio - 1.0) > clip_ratio).float()
                 if bool(batch_policy_active.any()):
                     approx_kl = per_sample_kl[batch_policy_active].mean()
@@ -2121,8 +2196,8 @@ def _ppo_update_entity_graph_body(
                     clip_fraction = per_sample_clipped.new_tensor(0.0)
             candidate_approx_kl = float(approx_kl.item())
             if target_kl > 0.0 and candidate_approx_kl > target_kl:
-                # Refuse the violating minibatch before optimizer.step(); the
-                # old ordering detected the breach and still applied it.
+                # Refuse the violating minibatch before optimizer.step(); k3
+                # cannot cancel opposite signed likelihood-ratio samples.
                 last_approx_kl = candidate_approx_kl
                 last_clip_fraction = float(clip_fraction.item())
                 early_stop = True

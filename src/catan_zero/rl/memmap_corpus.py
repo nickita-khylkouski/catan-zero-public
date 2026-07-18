@@ -56,6 +56,22 @@ MEMMAP_LAZY_COLUMNS = frozenset(
     }
 )
 
+# One shared on-disk ABI for the Stage-C writer and every learner admission
+# path. Keeping this beside the memmap reader prevents either side from
+# silently dropping fill semantics while evolving its local validation code.
+COMPLETED_Q_COLUMN_SCHEMAS = {
+    "completed_q_values": {
+        "kind": "ragged2d",
+        "dtype": "float32",
+        "fill": float("nan"),
+    },
+    "completed_q_mask": {
+        "kind": "ragged2d",
+        "dtype": "bool",
+        "fill": False,
+    },
+}
+
 _VALIDATION_BLOCK_ROWS = 1024 * 1024
 
 

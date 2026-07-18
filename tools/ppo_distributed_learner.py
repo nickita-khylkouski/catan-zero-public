@@ -1124,6 +1124,7 @@ def apply_vtrace_in_place(
             behavior_logp.shape[0] != n
             or target_logp.shape[0] != n
             or current_values.shape[0] != n
+            or not np.isfinite(behavior_logp).all()
             or not np.isfinite(target_logp).all()
             or not np.isfinite(current_values).all()
         ):
@@ -1153,9 +1154,10 @@ def apply_vtrace_in_place(
         if not math.isfinite(bootstrap_value):
             bootstrap_value = 0.0
 
-        # NaN/inf guards: sanitize every V-trace input; a single bad value would poison the
-        # whole reverse recursion otherwise.
-        behavior_logp = np.nan_to_num(behavior_logp, nan=0.0, posinf=50.0, neginf=-50.0)
+        # Actor behavior log-probabilities are authenticated importance-ratio
+        # evidence and were rejected above; they must never be fabricated. Clamp
+        # only recomputed/derived inputs so one bad value cannot poison the reverse
+        # recursion.
         target_logp = np.nan_to_num(target_logp, nan=0.0, posinf=50.0, neginf=-50.0)
         values = np.nan_to_num(values, nan=0.0, posinf=1.0e4, neginf=-1.0e4)
         rewards = np.nan_to_num(rewards, nan=0.0, posinf=1.0e4, neginf=-1.0e4)

@@ -186,6 +186,51 @@ def test_dense_all_forced_rows_are_value_only() -> None:
     assert metrics["value_loss"] > 0.0
 
 
+def test_dense_target_kl_uses_nonnegative_k3_without_signed_cancellation() -> None:
+    """Dense PPO must stop when opposite signed log-ratios hide large drift."""
+    torch = pytest.importorskip("torch")
+    trajectory = _dense_trajectory(
+        valid_actions=[(0, 1), (0, 1)],
+        advantages=[1.0, -1.0],
+    )
+    policy = TorchPPOPolicy(3, 5, hidden_size=8, seed=44)
+    observations = torch.as_tensor(
+        np.stack([sample.observation for sample in trajectory.samples]),
+        dtype=torch.float32,
+        device=policy.device,
+    )
+    with torch.no_grad():
+        logits, _values = policy.forward(observations)
+        chosen = logits[:, :2].argmin(dim=-1)
+        for sample, column in zip(trajectory.samples, chosen.tolist(), strict=True):
+            sample.action = sample.valid_actions[int(column)]
+        current = torch.distributions.Categorical(logits=logits[:, :2]).log_prob(chosen)
+    drift = 0.5
+    trajectory.old_log_probs = [
+        float(current[0].item() + drift),
+        float(current[1].item() - drift),
+    ]
+
+    metrics = ppo_update(
+        policy,
+        [trajectory],
+        learning_rate=0.0,
+        clip_ratio=0.2,
+        value_coef=0.0,
+        entropy_coef=0.0,
+        epochs=4,
+        minibatch_size=64,
+        target_kl=0.01,
+    )
+
+    assert metrics["approx_kl"] == pytest.approx(
+        np.cosh(drift) - 1.0, rel=1e-6
+    )
+    assert metrics["approx_kl"] >= 0.0
+    assert metrics["early_stop"] == 1.0
+    assert metrics["minibatches"] == 0.0
+
+
 @pytest.mark.parametrize("field", ["returns", "advantages"])
 def test_dense_update_rejects_cross_trajectory_target_misalignment(field: str) -> None:
     """Equal global row counts must not hide a shift across trajectory boundaries."""

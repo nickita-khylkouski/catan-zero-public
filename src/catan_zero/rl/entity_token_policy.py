@@ -3211,7 +3211,6 @@ class EntityGraphPolicy:
     ) -> tuple[int, float, float, float, np.ndarray, np.ndarray, dict[str, np.ndarray]]:
         import torch
 
-        del rng
         # Direct sampler callers must get the same deterministic distribution
         # as collect_ppo_episode and the learner's likelihood recomputation.
         self.model.eval()
@@ -3232,9 +3231,48 @@ class EntityGraphPolicy:
             legal_q_values = q_values.squeeze(0)
             behavior_logits = _behavior_policy_logits(logits, action_temperature)
             dist = torch.distributions.Categorical(logits=behavior_logits)
-            column_t = dist.sample() if training else torch.argmax(logits, dim=-1)
-            column = int(column_t.item())
             probs = torch.softmax(behavior_logits, dim=-1)
+            if training:
+                # The actor gives every game its own replayable numpy stream.  Sampling
+                # through torch's process-global generator made resumed workers depend on
+                # how many decisions completed shards had consumed before the restart, and
+                # gave freshly spawned workers correlated categorical draws.  Draw from the
+                # caller-owned stream instead; the torch distribution remains the sole
+                # likelihood authority used for the stored behavior log-probability.
+                probabilities = (
+                    probs.detach().to(dtype=torch.float64).cpu().numpy()
+                )
+                probability_sum = float(probabilities.sum(dtype=np.float64))
+                if (
+                    not math.isfinite(probability_sum)
+                    or probability_sum <= 0.0
+                    or not bool(np.isfinite(probabilities).all())
+                    or bool(np.any(probabilities < 0.0))
+                ):
+                    raise RuntimeError(
+                        "entity_graph behavior probabilities are not a finite "
+                        "categorical distribution"
+                    )
+                cumulative = np.cumsum(
+                    probabilities / probability_sum,
+                    dtype=np.float64,
+                )
+                # Close the CDF exactly so floating-point summation cannot send a
+                # near-one draw through the fallback column.
+                cumulative[-1] = 1.0
+                draw = float(rng.random())
+                column = min(
+                    int(np.searchsorted(cumulative, draw, side="right")),
+                    len(valid_actions) - 1,
+                )
+                column_t = torch.as_tensor(
+                    column,
+                    dtype=torch.long,
+                    device=behavior_logits.device,
+                )
+            else:
+                column_t = torch.argmax(logits, dim=-1)
+            column = int(column_t.item())
         entity_copy = {
             key: np.asarray(value).copy()
             for key, value in entity.items()

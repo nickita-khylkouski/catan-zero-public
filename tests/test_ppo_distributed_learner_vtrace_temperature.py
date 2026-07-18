@@ -464,6 +464,50 @@ def test_vtrace_skip_does_not_commit_staged_learner_references(
         assert not hasattr(trajectory, "ppo_reference_values")
 
 
+@pytest.mark.parametrize("corrupt_log_prob", [float("nan"), float("inf"), -float("inf")])
+def test_vtrace_rejects_corrupt_actor_behavior_log_probs(
+    monkeypatch: pytest.MonkeyPatch,
+    corrupt_log_prob: float,
+) -> None:
+    sample = _make_trajectory(n=1).samples[0]
+    trajectory = SimpleNamespace(
+        samples=[sample],
+        returns=[10.0],
+        advantages=[20.0],
+        old_log_probs=[corrupt_log_prob],
+        old_values=[-2.0],
+        shaped_rewards=[0.0],
+        rewards=[1.0],
+        truncated=False,
+        bootstrap_value=0.0,
+    )
+    monkeypatch.setattr(
+        learner,
+        "_recompute_target_logp_and_values_batched",
+        lambda *_args, **_kwargs: (
+            np.asarray([0.0]),
+            np.asarray([0.0]),
+        ),
+    )
+    config = SimpleNamespace(
+        vtrace_forward_chunk=8192,
+        behavior_temperature=1.0,
+        vtrace_use_current_values=True,
+        gamma=0.9,
+        vtrace_clip_rho=1.0,
+        vtrace_clip_pg_rho=1.0,
+    )
+
+    stats = apply_vtrace_in_place(object(), [trajectory], config)
+
+    assert stats["vtrace_bad_trajectories"] == 1.0
+    assert stats["vtrace_skipped"] == 1.0
+    assert trajectory.returns == [10.0]
+    assert trajectory.advantages == [20.0]
+    assert not hasattr(trajectory, "ppo_reference_log_probs")
+    assert not hasattr(trajectory, "ppo_reference_values")
+
+
 def test_current_value_vtrace_uses_recomputed_cutoff_bootstrap(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

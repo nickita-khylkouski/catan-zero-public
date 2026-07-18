@@ -667,6 +667,7 @@ def _remove_option(command: list[str], flag: str) -> list[str]:
 
 def _training_report(verified: dict, checkpoint: Path) -> dict:
     recipe = verified["recipe"]
+    fused_optimizer_requested = bool(recipe["fused_optimizer"])
     resume_identity = {
         "schema_version": "train-bc-resume-recipe-v1",
         "normalized_train_config_sha256": "sha256:" + "9" * 64,
@@ -693,7 +694,14 @@ def _training_report(verified: dict, checkpoint: Path) -> dict:
         "optimizer": "adam",
         "resume_optimizer": False,
         "optimizer_restored": False,
-        "fused_optimizer": False,
+        "fused_optimizer": fused_optimizer_requested,
+        "fused_optimizer_requested": fused_optimizer_requested,
+        "fused_optimizer_runtime": {
+            "requested": fused_optimizer_requested,
+            "attempted": fused_optimizer_requested,
+            "effective": fused_optimizer_requested,
+            "fallback_after_type_error": False,
+        },
         "epochs": 1,
         "max_steps": 0,
         "exact_max_steps": False,

@@ -47,6 +47,7 @@ from tools import a1_post_wave_stage_c_admission as post_wave_admission  # noqa:
 from tools import a1_stage_c_reanalysis_executor as stage_c  # noqa: E402
 from tools import a1_stage_c_teacher_alignment as alignment  # noqa: E402
 from tools import train_bc  # noqa: E402
+from catan_zero.rl.memmap_corpus import COMPLETED_Q_COLUMN_SCHEMAS  # noqa: E402
 from catan_zero.rl.target_reliability import (  # noqa: E402
     TARGET_RELIABILITY_COLUMNS,
     TARGET_RELIABILITY_SCHEMA,
@@ -102,18 +103,6 @@ COMPLETED_Q_RAGGED_COLUMNS = {
 RAGGED_PATCH_COLUMNS = {
     **POLICY_RAGGED_COLUMNS,
     **COMPLETED_Q_RAGGED_COLUMNS,
-}
-COMPLETED_Q_COLUMN_SCHEMAS = {
-    COMPLETED_Q_VALUE_COLUMN: {
-        "kind": "ragged2d",
-        "dtype": "float32",
-        "fill": float("nan"),
-    },
-    COMPLETED_Q_MASK_COLUMN: {
-        "kind": "ragged2d",
-        "dtype": "bool",
-        "fill": False,
-    },
 }
 OPTIONAL_FIXED_PATCH_COLUMNS = {
     "simulations_used": "simulations_used",
