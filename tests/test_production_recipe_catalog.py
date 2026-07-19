@@ -77,6 +77,10 @@ APPROVED_V15_SPLIT1_VALUE_REPAIR = (
     "configs/training/a1_v15_split1_value_repair_warmup0_step32_35m_b200.schema1.json",
     "a1-v15-split1-value-repair-warmup0-step32",
 )
+APPROVED_V15_AUXONLY = (
+    "configs/training/a1_v15_auxonly_base0_aux1_warmup0_step12_35m_b200.schema1.json",
+    "a1-v15-auxonly-base0-aux1-warmup0-step12",
+)
 
 
 @pytest.mark.parametrize("entrypoint", sorted(APPROVED))
@@ -315,10 +319,29 @@ def test_v15_split1_value_repair_is_value_only_and_authenticated() -> None:
     )
     fields = payload["train_config"]["fields"]
     assert fields["train_value_only"] is True
+    assert fields["policy_aux_active_batch_size"] == 0
     assert fields["policy_aux_loss_weight"] == 0.0
     assert fields["lr_warmup_steps"] == 0
     assert fields["max_steps"] == 32
     assert payload["engine_settings"]["value_tower_split_layers"] == 1
+
+
+def test_v15_auxonly_recipe_uses_authenticated_teacher_batch_exclusively() -> None:
+    relative, expected_name = APPROVED_V15_AUXONLY
+    path = ROOT / relative
+    payload = json.loads(path.read_text(encoding="utf-8"))
+
+    assert (
+        require_production_recipe(entrypoint="train", path=path, payload=payload)
+        == expected_name
+    )
+    fields = payload["train_config"]["fields"]
+    assert fields["policy_base_loss_weight"] == 0.0
+    assert fields["policy_aux_loss_weight"] == 1.0
+    assert fields["policy_aux_active_batch_size"] == 64
+    assert fields["policy_aux_sampling_mode"] == "weighted_permutation_cycles_v1"
+    assert fields["lr_warmup_steps"] == 0
+    assert fields["max_steps"] == 12
 
 
 def test_generation_recipe_round_trips_every_typed_science_field() -> None:
@@ -384,6 +407,7 @@ def test_authenticated_catalog_listing_has_no_second_identity_registry() -> None
         "a1-parent-update-active-p10-warmup0-opening-value25-step16-35m-b200",
         "a1-parent-update-active-p25-35m-b200",
         "a1-v15-split1-value-repair-warmup0-step32",
+        "a1-v15-auxonly-base0-aux1-warmup0-step12",
     ]
     assert all(Path(entry["path"]).is_absolute() for entry in train)
     assert all(len(entry["canonical_sha256"]) == 64 for entry in train)
