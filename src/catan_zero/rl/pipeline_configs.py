@@ -349,6 +349,11 @@ class TrainConfig(PipelineConfig):
     # without changing the base/value row dose, so it must participate in the
     # typed config hash even when its backward-compatible default is zero.
     policy_aux_active_batch_size: int = 0
+    # Independently normalized base-policy objective coefficient. The default
+    # preserves the historical ``base_mean + aux_weight * aux_mean`` contract;
+    # setting it to zero permits an authenticated AUX-only causal arm without
+    # disabling the outer policy objective.
+    policy_base_loss_weight: float = 1.0
     # Independently normalized AUX-policy objective coefficient. Batch size is
     # only a sampling/throughput knob and must not redefine objective strength.
     policy_aux_loss_weight: float = 1.0

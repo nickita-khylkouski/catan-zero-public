@@ -283,6 +283,7 @@ A1_LEARNER_ABLATION_FIELDS = frozenset(
         "value_trunk_grad_scale",
         "policy_loss_weight",
         "policy_aux_active_batch_size",
+        "policy_base_loss_weight",
         "policy_aux_loss_weight",
         "policy_aux_opening_value_mix_fraction",
         "policy_aux_sampling_mode",
@@ -4066,6 +4067,7 @@ def bind_learner_ablation(
             )
     aux_batch_declared = "policy_aux_active_batch_size" in overrides
     aux_weight_declared = "policy_aux_loss_weight" in overrides
+    base_weight_declared = "policy_base_loss_weight" in overrides
     aux_opening_value_declared = (
         "policy_aux_opening_value_mix_fraction" in overrides
     )
@@ -4073,6 +4075,11 @@ def bind_learner_ablation(
         raise ExecutorError(
             "policy AUX ablations must declare policy_aux_active_batch_size and "
             "policy_aux_loss_weight together; batch size is not an objective dose"
+        )
+    if base_weight_declared and not aux_batch_declared:
+        raise ExecutorError(
+            "policy_base_loss_weight is an AUX-arm causal axis and requires "
+            "policy_aux_active_batch_size and policy_aux_loss_weight"
         )
     if aux_opening_value_declared and not aux_batch_declared:
         raise ExecutorError(
@@ -4100,6 +4107,7 @@ def bind_learner_ablation(
     # mean equal when an operator intended sqrt (or vice versa).
     effective["per_game_value_weight_mode"] = "equal"
     if aux_batch_declared:
+        effective["policy_base_loss_weight"] = 1.0
         effective["policy_aux_loss_weight"] = 1.0
     if aux_opening_value_declared:
         effective["policy_aux_opening_value_mix_fraction"] = 0.0
@@ -4148,6 +4156,7 @@ def bind_learner_ablation(
             if key
             in {
                 "value_trunk_grad_scale",
+                "policy_base_loss_weight",
                 "policy_aux_loss_weight",
                 "policy_aux_opening_value_mix_fraction",
                 "action_module_lr_mult",
@@ -4209,6 +4218,7 @@ def bind_learner_ablation(
         "value_trunk_grad_scale": (0.0, 1.0, True),
         "policy_loss_weight": (0.0, None, True),
         "policy_aux_active_batch_size": (0.0, None, True),
+        "policy_base_loss_weight": (0.0, 4.0, True),
         "policy_aux_loss_weight": (0.0, 4.0, False),
         "policy_aux_opening_value_mix_fraction": (0.0, 1.0, True),
         "completed_q_loss_weight": (0.0, None, True),
@@ -4313,14 +4323,16 @@ def bind_learner_ablation(
             effective["policy_kl_max_weight"]
         ):
             raise ExecutorError("adaptive policy-KL initial weight exceeds its maximum")
-    active_objective_mass = sum(
-        float(effective[key])
-        for key in (
-            "policy_loss_weight",
-            "value_loss_weight",
-            "final_vp_loss_weight",
-            "policy_kl_anchor_weight",
-        )
+    policy_inner_mass = float(
+        effective.get("policy_base_loss_weight", 1.0)
+    )
+    if int(effective.get("policy_aux_active_batch_size", 0)) > 0:
+        policy_inner_mass += float(effective["policy_aux_loss_weight"])
+    active_objective_mass = (
+        float(effective["policy_loss_weight"]) * policy_inner_mass
+        + float(effective["value_loss_weight"])
+        + float(effective["final_vp_loss_weight"])
+        + float(effective["policy_kl_anchor_weight"])
     )
     if active_objective_mass <= 0.0:
         raise ExecutorError(
@@ -4353,6 +4365,11 @@ def bind_learner_ablation(
             "contract": "disabled with policy_aux_active_batch_size=0",
             "effective": effective["policy_aux_loss_weight"],
         }
+        if float(effective.get("policy_base_loss_weight", 1.0)) != 1.0:
+            drift["policy_base_loss_weight"] = {
+                "contract": 1.0,
+                "effective": effective["policy_base_loss_weight"],
+            }
         if float(effective.get("policy_aux_opening_value_mix_fraction", 0.0)) != 0.0:
             drift["policy_aux_opening_value_mix_fraction"] = {
                 "contract": "disabled with policy_aux_active_batch_size=0",
@@ -4799,6 +4816,9 @@ def bind_diagnostic_training_descriptor(
             )
             if policy_aux_batch > 0:
                 derived_overrides["policy_aux_active_batch_size"] = policy_aux_batch
+                derived_overrides["policy_base_loss_weight"] = float(
+                    effective_recipe.get("policy_base_loss_weight", 1.0)
+                )
                 derived_overrides["policy_aux_loss_weight"] = float(
                     effective_recipe["policy_aux_loss_weight"]
                 )
@@ -6884,6 +6904,12 @@ def _build_direct_train_command(
             ]
         )
     if "policy_aux_active_batch_size" in recipe:
+        command.extend(
+            [
+                "--policy-base-loss-weight",
+                str(recipe.get("policy_base_loss_weight", 1.0)),
+            ]
+        )
         command.extend(
             [
                 "--policy-aux-active-batch-size",
@@ -11298,6 +11324,9 @@ def _verify_training_outputs(
         exposure = lineage_dose["objective_exposure"]
         expected_draws = {
             "policy_aux_active_batch_size": int(recipe["policy_aux_active_batch_size"]),
+            "policy_base_loss_weight": float(
+                recipe.get("policy_base_loss_weight", 1.0)
+            ),
             "policy_aux_loss_weight": float(recipe["policy_aux_loss_weight"]),
             "policy_aux_opening_value_mix_fraction": float(
                 recipe.get("policy_aux_opening_value_mix_fraction", 0.0)

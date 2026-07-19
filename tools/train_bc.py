@@ -1484,12 +1484,25 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--policy-base-loss-weight",
+        type=float,
+        default=1.0,
+        help=(
+            "Explicit coefficient for the independently normalized base-policy "
+            "objective. The full policy term is policy-loss-weight * "
+            "(base_weight * base_policy_mean + aux_weight * aux_policy_mean). "
+            "1 (default) preserves historical behavior; 0 enables a causal "
+            "AUX-only arm when a positive AUX stream is configured."
+        ),
+    )
+    parser.add_argument(
         "--policy-aux-loss-weight",
         type=float,
         default=1.0,
         help=(
             "Explicit coefficient for the independently normalized policy-AUX "
-            "objective: base_policy_mean + weight * aux_policy_mean. AUX batch "
+            "objective: base_weight * base_policy_mean + weight * "
+            "aux_policy_mean. AUX batch "
             "size controls estimator variance and coverage only; it no longer "
             "silently changes the objective strength with row weights or DDP "
             "world size. Used only when --policy-aux-active-batch-size > 0."
@@ -2926,6 +2939,8 @@ def _policy_training_signal_attestation(
     metrics: Sequence[dict[str, object]],
     *,
     policy_loss_weight: float,
+    policy_base_loss_weight: float = 1.0,
+    policy_aux_loss_weight: float = 1.0,
     optimizer_steps: int,
     train_value_only: bool,
 ) -> dict[str, object]:
@@ -2939,6 +2954,8 @@ def _policy_training_signal_attestation(
     """
 
     coefficient = _validate_policy_loss_weight(policy_loss_weight)
+    base_coefficient = _validate_policy_loss_weight(policy_base_loss_weight)
+    aux_coefficient = _validate_policy_loss_weight(policy_aux_loss_weight)
     base_active_rows = sum(
         int(metric.get("policy_base_active_rows", 0)) for metric in metrics
     )
@@ -3040,6 +3057,8 @@ def _policy_training_signal_attestation(
         "schema_version": "policy-training-signal-v2",
         "policy_objective_enabled": policy_enabled,
         "policy_loss_weight": coefficient,
+        "policy_base_loss_weight": base_coefficient,
+        "policy_aux_loss_weight": aux_coefficient,
         "optimizer_steps": int(optimizer_steps),
         "policy_optimizer_updates": int(policy_optimizer_updates),
         "policy_equivalent_optimizer_updates": float(
@@ -3144,6 +3163,7 @@ def _policy_microbatch_weight_for_lr_area(
     pending_group_lr_area_weight: float,
     globally_base_objective_mass: float,
     globally_aux_objective_mass: float,
+    policy_base_loss_weight: float = 1.0,
     policy_aux_loss_weight: float,
     accumulation_group_size: int,
 ) -> float:
@@ -3162,12 +3182,15 @@ def _policy_microbatch_weight_for_lr_area(
     pending_weight = float(pending_group_lr_area_weight)
     base_mass = float(globally_base_objective_mass)
     aux_mass = float(globally_aux_objective_mass)
+    base_weight = float(policy_base_loss_weight)
     aux_weight = float(policy_aux_loss_weight)
     group_size = int(accumulation_group_size)
     if not math.isfinite(pending_weight) or pending_weight < 0.0:
         raise ValueError(
             "pending policy LR-area weight must be finite and non-negative"
         )
+    if not math.isfinite(base_weight) or base_weight < 0.0:
+        raise ValueError("policy base objective weight must be finite and non-negative")
     if not math.isfinite(aux_weight) or aux_weight < 0.0:
         raise ValueError("policy AUX objective weight must be finite and non-negative")
     if (
@@ -3181,7 +3204,7 @@ def _policy_microbatch_weight_for_lr_area(
         raise ValueError("policy accumulation group size must be positive")
     pending_area = learning_rate * pending_weight
     effective_consumed = float(consumed_lr_area) + pending_area
-    stream_multiplier = base_mass + aux_weight * aux_mass
+    stream_multiplier = base_weight * base_mass + aux_weight * aux_mass
     # An objective-empty microbatch spends no policy dose. Keep the configured
     # coefficient while the boundary remains open so value-only work cannot
     # trigger post-dose representation freezing.
@@ -3227,16 +3250,16 @@ def _policy_objective_equivalent_active_rows(
     *,
     base_active_rows: float,
     aux_active_rows: float,
+    policy_base_loss_weight: float = 1.0,
     policy_aux_loss_weight: float,
     policy_objective_fraction: float,
 ) -> float:
     """Return coefficient- and boundary-aware pre-clip policy exposure.
 
     Base and AUX are independently normalized objective means:
-    ``base_mean + policy_aux_loss_weight * aux_mean``. Raw active-row telemetry
-    counts every presented row, while this pre-clip objective-mixture proxy
-    scales AUX rows by that coefficient. Otherwise P10 and P25 falsely report
-    the same objective mixture.
+    ``policy_base_loss_weight * base_mean + policy_aux_loss_weight * aux_mean``.
+    Raw active-row telemetry counts every presented row, while this pre-clip
+    objective-mixture proxy scales each stream by its coefficient.
 
     This quantity is deliberately *not* realized update amplitude. Global
     gradient clipping can map different pre-clip objective magnitudes onto the
@@ -3248,6 +3271,7 @@ def _policy_objective_equivalent_active_rows(
     values = (
         float(base_active_rows),
         float(aux_active_rows),
+        float(policy_base_loss_weight),
         float(policy_aux_loss_weight),
         float(policy_objective_fraction),
     )
@@ -3255,9 +3279,11 @@ def _policy_objective_equivalent_active_rows(
         raise ValueError("policy equivalent-row inputs must be finite")
     if min(values) < 0.0:
         raise ValueError("policy equivalent-row inputs must be non-negative")
-    if values[3] > 1.0 + 1.0e-12:
+    if values[4] > 1.0 + 1.0e-12:
         raise ValueError("policy objective fraction exceeds full dose")
-    return (values[0] + values[2] * values[1]) * min(1.0, values[3])
+    return (
+        values[2] * values[0] + values[3] * values[1]
+    ) * min(1.0, values[4])
 
 
 def _policy_dose_clipping_interpretation(
@@ -3458,6 +3484,7 @@ def _realized_policy_microbatch_dose(
     policy_objective_fraction: float,
     globally_base_objective_mass: float,
     globally_aux_objective_mass: float,
+    policy_base_loss_weight: float = 1.0,
     policy_aux_loss_weight: float,
     accumulation_group_size: int,
 ) -> tuple[float, float]:
@@ -3476,10 +3503,13 @@ def _realized_policy_microbatch_dose(
     fraction = float(policy_objective_fraction)
     base_mass = float(globally_base_objective_mass)
     aux_mass = float(globally_aux_objective_mass)
+    base_weight = float(policy_base_loss_weight)
     aux_weight = float(policy_aux_loss_weight)
     group_size = int(accumulation_group_size)
     if not math.isfinite(fraction) or not 0.0 <= fraction <= 1.0:
         raise ValueError("policy objective fraction must be finite and in [0, 1]")
+    if not math.isfinite(base_weight) or base_weight < 0.0:
+        raise ValueError("policy base objective weight must be finite and non-negative")
     if not math.isfinite(aux_weight) or aux_weight < 0.0:
         raise ValueError("policy AUX objective weight must be finite and non-negative")
     if (
@@ -3491,7 +3521,7 @@ def _realized_policy_microbatch_dose(
         raise ValueError("policy objective masses must be finite and non-negative")
     if group_size < 1:
         raise ValueError("policy accumulation group size must be positive")
-    objective_multiplier = base_mass + aux_weight * aux_mass
+    objective_multiplier = base_weight * base_mass + aux_weight * aux_mass
     if objective_multiplier == 0.0:
         return 0.0, 0.0
     return (
@@ -6084,6 +6114,7 @@ def _canonical_parent_diagnostic_descriptor_overrides(
         "lr_warmup_steps",
         "lr_schedule",
         "policy_aux_active_batch_size",
+        "policy_base_loss_weight",
         "policy_aux_loss_weight",
         "policy_aux_sampling_mode",
     )
@@ -6455,6 +6486,7 @@ def _preflight_flywheel_diagnostic_derivative(
         }
         optional_lr_dose_keys = {
             "policy_aux_active_batch_size",
+            "policy_base_loss_weight",
             "policy_aux_loss_weight",
             "policy_aux_opening_value_mix_fraction",
         }
@@ -6523,11 +6555,16 @@ def _preflight_flywheel_diagnostic_derivative(
                 policy_aux_loss_weight = effective_overrides.get(
                     "policy_aux_loss_weight"
                 )
+                policy_base_loss_weight = effective_overrides.get(
+                    "policy_base_loss_weight", 1.0
+                )
                 policy_aux_opening_value_mix_fraction = effective_overrides.get(
                     "policy_aux_opening_value_mix_fraction", 0.0
                 )
                 campaign_lr_dose_valid = (
                     campaign_lr_dose_valid
+                    and type(policy_base_loss_weight) is float
+                    and 0.0 <= policy_base_loss_weight <= 4.0
                     and type(policy_aux_loss_weight) is float
                     and 0.0 < policy_aux_loss_weight <= 4.0
                     and type(policy_aux_opening_value_mix_fraction) is float
@@ -7882,6 +7919,7 @@ def _validate_composite_learner_recipe_authorization(
         "per_game_value_weight_mode": str,
         "value_player_outcome_balance_mode": str,
         "policy_aux_active_batch_size": int,
+        "policy_base_loss_weight": float,
         "policy_aux_loss_weight": float,
         "policy_aux_opening_value_mix_fraction": float,
         "policy_loss_weight": float,
@@ -10900,7 +10938,14 @@ def _effective_a1_learner_training_recipe(
     )
     if int(getattr(args, "policy_aux_active_batch_size", 0)) > 0:
         effective["policy_aux_active_batch_size"] = int(args.policy_aux_active_batch_size)
+        effective["policy_base_loss_weight"] = float(
+            args.policy_base_loss_weight
+        )
         effective["policy_aux_loss_weight"] = float(args.policy_aux_loss_weight)
+    elif float(getattr(args, "policy_base_loss_weight", 1.0)) != 1.0:
+        effective["policy_base_loss_weight"] = float(
+            args.policy_base_loss_weight
+        )
         if float(args.policy_aux_opening_value_mix_fraction) != 0.0:
             effective["policy_aux_opening_value_mix_fraction"] = float(
                 args.policy_aux_opening_value_mix_fraction
@@ -13772,6 +13817,7 @@ def _validate_a1_learner_training_recipe(
         authorized_extra_fields.add("value_player_outcome_balance_mode")
     if int(getattr(args, "policy_aux_active_batch_size", 0)) > 0:
         authorized_extra_fields.add("policy_aux_active_batch_size")
+        authorized_extra_fields.add("policy_base_loss_weight")
         authorized_extra_fields.add("policy_aux_loss_weight")
         if "policy_aux_opening_value_mix_fraction" in effective:
             authorized_extra_fields.add(
@@ -13779,6 +13825,8 @@ def _validate_a1_learner_training_recipe(
             )
         if "policy_aux_sampling_mode" in effective:
             authorized_extra_fields.add("policy_aux_sampling_mode")
+    elif "policy_base_loss_weight" in effective:
+        authorized_extra_fields.add("policy_base_loss_weight")
     if "value_trunk_grad_scale" in effective:
         authorized_extra_fields.add("value_trunk_grad_scale")
     for diagnostic_field in (
@@ -13848,6 +13896,11 @@ def _validate_a1_learner_training_recipe(
             "contract": "disabled with policy_aux_active_batch_size=0",
             "effective": float(effective["policy_aux_loss_weight"]),
         }
+        if float(effective.get("policy_base_loss_weight", 1.0)) != 1.0:
+            drift["policy_base_loss_weight"] = {
+                "contract": 1.0,
+                "effective": float(effective["policy_base_loss_weight"]),
+            }
         if float(effective.get("policy_aux_opening_value_mix_fraction", 0.0)) != 0.0:
             drift["policy_aux_opening_value_mix_fraction"] = {
                 "contract": "disabled with policy_aux_active_batch_size=0",
@@ -15945,10 +15998,26 @@ def main(
     )
     if int(args.policy_aux_active_batch_size) < 0:
         raise SystemExit("--policy-aux-active-batch-size must be >= 0")
+    if not math.isfinite(float(args.policy_base_loss_weight)) or float(
+        args.policy_base_loss_weight
+    ) < 0.0:
+        raise SystemExit(
+            "--policy-base-loss-weight must be finite and >= 0"
+        )
     if not math.isfinite(float(args.policy_aux_loss_weight)) or float(
         args.policy_aux_loss_weight
     ) <= 0.0:
         raise SystemExit("--policy-aux-loss-weight must be finite and > 0")
+    if (
+        float(args.policy_loss_weight) > 0.0
+        and not bool(args.train_value_only)
+        and float(args.policy_base_loss_weight) == 0.0
+        and int(args.policy_aux_active_batch_size) == 0
+    ):
+        raise SystemExit(
+            "positive --policy-loss-weight has no active inner policy stream: "
+            "--policy-base-loss-weight is 0 and no policy-AUX batch is configured"
+        )
     opening_value_mix = float(args.policy_aux_opening_value_mix_fraction)
     if not math.isfinite(opening_value_mix) or not 0.0 <= opening_value_mix <= 1.0:
         raise SystemExit(
@@ -19883,6 +19952,7 @@ def main(
                 globally_aux_objective_mass=(
                     globally_aux_policy_objective_mass
                 ),
+                policy_base_loss_weight=float(args.policy_base_loss_weight),
                 policy_aux_loss_weight=float(args.policy_aux_loss_weight),
                 accumulation_group_size=accumulation_group_size,
             )
@@ -19975,6 +20045,9 @@ def main(
                     ),
                     policy_target_blend_semantics=str(
                         args.policy_target_blend_semantics
+                    ),
+                    policy_base_loss_weight=float(
+                        args.policy_base_loss_weight
                     ),
                     truncated_vp_margin_value_weight=args.truncated_vp_margin_value_weight,
                     **train_fn_extra_kwargs,
@@ -20144,9 +20217,12 @@ def main(
                             ]
                             * (1.0 - aux_opening_value_mix)
                         ),
-                        value_active_mask=value_active_row_mask,
-                        draw_stream="base",
-                        policy_objective_fraction=(
+                            value_active_mask=value_active_row_mask,
+                            draw_stream="base",
+                            policy_stream_coefficient=float(
+                                args.policy_base_loss_weight
+                            ),
+                            policy_objective_fraction=(
                             batch_policy_objective_fraction
                         ),
                     )
@@ -20224,6 +20300,7 @@ def main(
                 globally_aux_objective_mass=(
                     globally_aux_policy_objective_mass
                 ),
+                policy_base_loss_weight=float(args.policy_base_loss_weight),
                 policy_aux_loss_weight=float(args.policy_aux_loss_weight),
                 accumulation_group_size=accumulation_group_size,
             )
@@ -20414,11 +20491,16 @@ def main(
                     aux_active_rows=float(
                         batch_metrics.get("policy_aux_active_count", 0)
                     ),
+                    policy_base_loss_weight=float(
+                        args.policy_base_loss_weight
+                    ),
                     policy_aux_loss_weight=float(args.policy_aux_loss_weight),
                     policy_objective_fraction=batch_policy_objective_fraction,
                 )
             )
             batch_policy_effective_weight = float(
+                args.policy_base_loss_weight
+            ) * float(
                 batch_metrics.get("policy_base_loss_weight_sum", 0.0)
             ) + float(args.policy_aux_loss_weight) * float(
                 batch_metrics.get("policy_aux_loss_weight_sum", 0.0)
@@ -20869,6 +20951,10 @@ def main(
                 snapshot_policy_signal = _policy_training_signal_attestation(
                     [*metrics, checkpoint_partial_metric],
                     policy_loss_weight=float(args.policy_loss_weight),
+                    policy_base_loss_weight=float(
+                        args.policy_base_loss_weight
+                    ),
+                    policy_aux_loss_weight=float(args.policy_aux_loss_weight),
                     optimizer_steps=global_step,
                     train_value_only=bool(args.train_value_only),
                 )
@@ -21210,6 +21296,7 @@ def main(
             epoch_extra_sums,
             epoch_extra_denominators,
             aux_enabled=int(args.policy_aux_active_batch_size) > 0,
+            base_coefficient=float(args.policy_base_loss_weight),
             aux_coefficient=float(args.policy_aux_loss_weight),
         )
         policy_loss_epoch = policy_stream_epoch["policy_loss"]
@@ -21536,6 +21623,9 @@ def main(
                 "policy_loss": policy_loss_epoch,
                 "policy_base_loss": policy_stream_epoch["policy_base_loss"],
                 "policy_aux_loss": policy_stream_epoch["policy_aux_loss"],
+                "policy_base_loss_coefficient": float(
+                    args.policy_base_loss_weight
+                ),
                 "policy_aux_loss_coefficient": float(
                     args.policy_aux_loss_weight
                 ),
@@ -22195,6 +22285,9 @@ def main(
                 base_objective_metrics,
                 validation_policy_aux,
                 policy_loss_weight=float(args.policy_loss_weight),
+                policy_base_loss_weight=float(
+                    args.policy_base_loss_weight
+                ),
                 policy_aux_loss_weight=float(args.policy_aux_loss_weight),
                 policy_kl_anchor_weight=(
                     float(args.policy_kl_anchor_weight)
@@ -22307,6 +22400,8 @@ def main(
             epoch_policy_signal = _policy_training_signal_attestation(
                 metrics,
                 policy_loss_weight=float(args.policy_loss_weight),
+                policy_base_loss_weight=float(args.policy_base_loss_weight),
+                policy_aux_loss_weight=float(args.policy_aux_loss_weight),
                 optimizer_steps=global_step,
                 train_value_only=bool(args.train_value_only),
             )
@@ -22513,6 +22608,8 @@ def main(
     policy_training_signal = _policy_training_signal_attestation(
         metrics,
         policy_loss_weight=float(args.policy_loss_weight),
+        policy_base_loss_weight=float(args.policy_base_loss_weight),
+        policy_aux_loss_weight=float(args.policy_aux_loss_weight),
         optimizer_steps=global_step,
         train_value_only=bool(args.train_value_only),
     )
@@ -23250,6 +23347,7 @@ def main(
             post_policy_dose_value_routing
         ),
         "policy_aux_active_batch_size": int(args.policy_aux_active_batch_size),
+        "policy_base_loss_weight": float(args.policy_base_loss_weight),
         "policy_aux_loss_weight": float(args.policy_aux_loss_weight),
         "policy_aux_opening_value_mix_fraction": float(
             args.policy_aux_opening_value_mix_fraction
@@ -24575,6 +24673,7 @@ def _train_entity_batch(
     policy_aux_data=None,
     policy_aux_batch: np.ndarray | None = None,
     policy_aux_sample_weights: np.ndarray | None = None,
+    policy_base_loss_weight: float = 1.0,
     policy_aux_loss_weight: float = 1.0,
     policy_aux_opening_value_mix_fraction: float = 0.0,
     policy_aux_phase_loss_weights: Mapping[str, float] | None = None,
@@ -25046,7 +25145,7 @@ def _train_entity_batch(
         # science coefficient. Normalize the base and AUX measures independently
         # so row weights and DDP world size cannot silently redefine AUX strength.
         policy_loss = (
-            policy_base_loss
+            float(policy_base_loss_weight) * policy_base_loss
             + float(policy_aux_loss_weight) * policy_aux_loss
         )
         value_loss = torch.tensor(0.0, dtype=torch.float32, device=policy.device)
@@ -25808,6 +25907,10 @@ def _train_entity_batch(
         "scalar_value_mse_diagnostic": float(
             scalar_value_mse_diagnostic.item()
         ),
+        # ``policy_loss`` combines independently normalized stream means and
+        # therefore has no single sample denominator. Preserve stream
+        # sufficient statistics below; this compatibility scalar is only a
+        # per-batch diagnostic on the historical base denominator.
         "policy_loss_weighted_sum": float(
             (policy_loss.detach() * policy_base_loss_denominator).item()
         ),
@@ -25817,6 +25920,7 @@ def _train_entity_batch(
         "policy_base_loss_weight_sum": float(
             policy_base_loss_denominator.item()
         ),
+        "policy_base_loss_coefficient": float(policy_base_loss_weight),
         "policy_aux_loss": float(policy_aux_loss.item()),
         "policy_aux_loss_weighted_sum": float(policy_aux_loss_sum.item()),
         "policy_aux_loss_weight_sum": float(policy_aux_loss_denominator.item())
@@ -26472,6 +26576,7 @@ def _combine_policy_aux_validation_metrics(
     aux_metrics: dict,
     *,
     policy_loss_weight: float,
+    policy_base_loss_weight: float = 1.0,
     policy_aux_loss_weight: float,
     policy_kl_anchor_weight: float = 0.0,
     scalar_value_loss_weight: float = 0.0,
@@ -26491,11 +26596,14 @@ def _combine_policy_aux_validation_metrics(
         raise ValueError("base validation metrics are incomplete")
     if "policy_loss" not in aux_metrics:
         raise ValueError("policy AUX validation metrics are incomplete")
+    base_coefficient = float(policy_base_loss_weight)
     coefficient = float(policy_aux_loss_weight)
     policy_coefficient = float(policy_loss_weight)
     anchor_coefficient = float(policy_kl_anchor_weight)
     value_coefficient = float(scalar_value_loss_weight)
     opening_mix = float(opening_value_mix_fraction)
+    if not math.isfinite(base_coefficient) or base_coefficient < 0.0:
+        raise ValueError("policy base validation coefficient is invalid")
     if not math.isfinite(coefficient) or coefficient < 0.0:
         raise ValueError("policy AUX validation coefficient is invalid")
     if not math.isfinite(policy_coefficient) or policy_coefficient < 0.0:
@@ -26511,7 +26619,9 @@ def _combine_policy_aux_validation_metrics(
     aux_policy = float(aux_metrics["policy_loss"])
     base_anchor = float(base_metrics.get("policy_kl_anchor_loss", 0.0))
     aux_anchor = float(aux_metrics.get("policy_kl_anchor_loss", 0.0))
-    combined_policy = base_policy + coefficient * aux_policy
+    combined_policy = (
+        base_coefficient * base_policy + coefficient * aux_policy
+    )
     combined_anchor = base_anchor + coefficient * aux_anchor
     base_value = float(base_metrics.get("value_loss", 0.0))
     aux_opening_value = float(aux_metrics.get("value_loss", 0.0))
@@ -26521,6 +26631,7 @@ def _combine_policy_aux_validation_metrics(
     )
     combined_loss = (
         float(base_metrics["loss"])
+        + policy_coefficient * (base_coefficient - 1.0) * base_policy
         + policy_coefficient * coefficient * aux_policy
         + anchor_coefficient * coefficient * aux_anchor
         + value_coefficient * opening_mix * (
@@ -26567,6 +26678,7 @@ def _combine_policy_aux_validation_metrics(
             "policy_loss": combined_policy,
             "policy_base_loss": base_policy,
             "policy_aux_loss": aux_policy,
+            "policy_base_loss_weight": base_coefficient,
             "policy_aux_loss_weight": coefficient,
             "value_loss": combined_value,
             "value_base_loss": base_value,
@@ -34176,18 +34288,25 @@ def _policy_stream_epoch_metrics(
     denominators: Mapping[str, float],
     *,
     aux_enabled: bool,
+    base_coefficient: float = 1.0,
     aux_coefficient: float,
 ) -> dict[str, float]:
     """Reconstruct the independently normalized policy-stream objective.
 
-    When AUX is enabled, training optimizes ``base_mean + c * aux_mean``.
+    When AUX is enabled, training optimizes
+    ``base_coefficient * base_mean + aux_coefficient * aux_mean``.
     Multiplying each batch's combined mean by the base denominator and pooling
     those products instead computes a different objective whenever either
     stream's denominator or loss changes across batches. Preserve and combine
     the two streams' sufficient statistics independently instead.
     """
 
+    base_weight = float(base_coefficient)
     coefficient = float(aux_coefficient)
+    if not math.isfinite(base_weight) or base_weight < 0.0:
+        raise ValueError(
+            "policy base epoch coefficient must be finite and non-negative"
+        )
     if not math.isfinite(coefficient) or coefficient < 0.0:
         raise ValueError("policy AUX epoch coefficient must be finite and non-negative")
 
@@ -34196,7 +34315,7 @@ def _policy_stream_epoch_metrics(
             weighted_sums["policy_loss"], denominators["policy_loss"]
         )
         return {
-            "policy_loss": policy_loss,
+            "policy_loss": base_weight * policy_loss,
             "policy_base_loss": policy_loss,
             "policy_aux_loss": 0.0,
         }
@@ -34237,7 +34356,7 @@ def _policy_stream_epoch_metrics(
         denominators["policy_aux_loss"],
     )
     return {
-        "policy_loss": base_loss + coefficient * aux_loss,
+        "policy_loss": base_weight * base_loss + coefficient * aux_loss,
         "policy_base_loss": base_loss,
         "policy_aux_loss": aux_loss,
     }
@@ -47244,6 +47363,7 @@ def _checkpoint_dose_telemetry(
 
     denominators: dict[str, float] = {}
     observations: list[dict[str, object]] = []
+    policy_base_coefficients: list[float] = []
     policy_aux_coefficients: list[float] = []
     for metric in metrics:
         for name, value in (metric.get("loss_denominators") or {}).items():
@@ -47257,6 +47377,12 @@ def _checkpoint_dose_telemetry(
                     "checkpoint dose has an invalid policy AUX coefficient"
                 )
             policy_aux_coefficients.append(coefficient)
+        coefficient = float(metric.get("policy_base_loss_coefficient", 1.0))
+        if not math.isfinite(coefficient) or coefficient < 0.0:
+            raise RuntimeError(
+                "checkpoint dose has an invalid policy base coefficient"
+            )
+        policy_base_coefficients.append(coefficient)
         observations.extend(
             observation
             for observation in (
@@ -47335,6 +47461,17 @@ def _checkpoint_dose_telemetry(
         active_rows["policy_aux"] > 0
         or denominators["policy_aux_loss"] > 0.0
     )
+    base_coefficient = policy_base_coefficients[0]
+    if any(
+        not math.isclose(
+            coefficient, base_coefficient, rel_tol=0.0, abs_tol=0.0
+        )
+        for coefficient in policy_base_coefficients[1:]
+    ):
+        raise RuntimeError(
+            "checkpoint dose policy base coefficient changed within one "
+            "training trajectory"
+        )
     if aux_enabled:
         if len(policy_aux_coefficients) != len(metrics):
             raise RuntimeError(
@@ -47376,15 +47513,22 @@ def _checkpoint_dose_telemetry(
             )
         aux_coefficient = 0.0
     policy_stream_objective = {
-        "schema_version": "train-policy-stream-objective-v1",
-        "formula": "base_mean + aux_coefficient * aux_mean",
+        "schema_version": "train-policy-stream-objective-v2",
+        "formula": (
+            "base_coefficient * base_mean + "
+            "aux_coefficient * aux_mean"
+        ),
         "normalization": "independent_weighted_means",
-        "base_coefficient": 1.0,
+        "base_coefficient": base_coefficient,
         "aux_enabled": aux_enabled,
         "aux_coefficient": aux_coefficient,
         "base_denominator": float(denominators["policy_base_loss"]),
         "aux_denominator": float(denominators["policy_aux_loss"]),
     }
+    policy_effective["objective_weighted_total"] = (
+        base_coefficient * policy_effective["base"]
+        + aux_coefficient * policy_effective["aux"]
+    )
     for metric in metrics:
         for name, parts in (metric.get("aux_subgoal_loss_parts") or {}).items():
             if isinstance(parts, dict):

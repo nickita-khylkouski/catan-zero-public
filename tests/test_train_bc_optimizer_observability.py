@@ -565,9 +565,15 @@ def test_checkpoint_dose_telemetry_binds_exposure_and_feature_paths() -> None:
     assert dose["schema_version"] == train_bc.CHECKPOINT_DOSE_TELEMETRY_SCHEMA
     assert dose["active_rows"]["policy_total"] == 32
     assert dose["policy_effective_weight_sums"]["total"] == pytest.approx(27.0)
+    assert dose["policy_effective_weight_sums"][
+        "objective_weighted_total"
+    ] == pytest.approx(20.25)
     assert dose["policy_stream_objective"] == {
-        "schema_version": "train-policy-stream-objective-v1",
-        "formula": "base_mean + aux_coefficient * aux_mean",
+        "schema_version": "train-policy-stream-objective-v2",
+        "formula": (
+            "base_coefficient * base_mean + "
+            "aux_coefficient * aux_mean"
+        ),
         "normalization": "independent_weighted_means",
         "base_coefficient": 1.0,
         "aux_enabled": True,
@@ -834,3 +840,40 @@ def test_checkpoint_dose_allows_zero_base_mass_but_requires_aux_mass() -> None:
             public_card_enabled=False,
             meaningful_history_enabled=False,
         )
+
+
+def test_checkpoint_dose_reports_aux_only_objective_without_base_authority() -> None:
+    metric = {
+        "samples": 64,
+        "policy_base_active_rows": 3,
+        "policy_aux_active_rows": 512,
+        "policy_base_effective_weight_sum": 3.0,
+        "policy_aux_effective_weight_sum": 512.0,
+        "policy_base_loss_coefficient": 0.0,
+        "policy_aux_loss_coefficient": 1.0,
+        "loss_denominators": {
+            "policy_base_loss": 3.0,
+            "policy_aux_loss": 512.0,
+        },
+    }
+
+    dose = train_bc._checkpoint_dose_telemetry(
+        [metric],
+        optimizer_step=1,
+        optimizer_observed_steps=1,
+        optimizer_clipped_steps=0,
+        optimizer_zero_objective_steps=0,
+        optimizer_pre_clip_grad_norm_sum=0.5,
+        optimizer_pre_clip_grad_norm_max=0.5,
+        objective_gradient_cadence_batches=1,
+        train_diagnostic_cadence_batches=1,
+        public_card_enabled=False,
+        meaningful_history_enabled=False,
+    )
+
+    assert dose["policy_stream_objective"]["base_coefficient"] == 0.0
+    assert dose["policy_stream_objective"]["aux_coefficient"] == 1.0
+    assert dose["policy_effective_weight_sums"]["base"] == 3.0
+    assert dose["policy_effective_weight_sums"][
+        "objective_weighted_total"
+    ] == 512.0

@@ -86,6 +86,7 @@ def test_policy_lr_area_boundary_uses_realized_streams(
         pending_group_lr_area_weight=0.0,
         globally_base_objective_mass=base_mass,
         globally_aux_objective_mass=aux_mass,
+        policy_base_loss_weight=1.0,
         policy_aux_loss_weight=0.25,
         accumulation_group_size=1,
     ) == pytest.approx(expected_weight)
@@ -103,6 +104,7 @@ def test_policy_lr_area_boundary_accounts_for_pending_accumulation_dose() -> Non
         pending_group_lr_area_weight=0.5,
         globally_base_objective_mass=1.0,
         globally_aux_objective_mass=0.0,
+        policy_base_loss_weight=1.0,
         policy_aux_loss_weight=1.0,
         accumulation_group_size=2,
     ) == pytest.approx(0.2)
@@ -123,6 +125,7 @@ def test_sparse_fixed_denominator_policy_batch_has_exact_lr_area_ledger() -> Non
         pending_group_lr_area_weight=0.0,
         globally_base_objective_mass=base_mass,
         globally_aux_objective_mass=aux_mass,
+        policy_base_loss_weight=1.0,
         policy_aux_loss_weight=0.25,
         accumulation_group_size=1,
     )
@@ -132,6 +135,7 @@ def test_sparse_fixed_denominator_policy_batch_has_exact_lr_area_ledger() -> Non
             policy_objective_fraction=coefficient,
             globally_base_objective_mass=base_mass,
             globally_aux_objective_mass=aux_mass,
+            policy_base_loss_weight=1.0,
             policy_aux_loss_weight=0.25,
             accumulation_group_size=1,
         )
@@ -233,12 +237,14 @@ def test_policy_equivalent_active_rows_scale_auxiliary_treatment() -> None:
     p10 = train_bc._policy_objective_equivalent_active_rows(  # noqa: SLF001
         base_active_rows=223,
         aux_active_rows=6144,
+        policy_base_loss_weight=1.0,
         policy_aux_loss_weight=0.10,
         policy_objective_fraction=1.0,
     )
     p25 = train_bc._policy_objective_equivalent_active_rows(  # noqa: SLF001
         base_active_rows=223,
         aux_active_rows=6144,
+        policy_base_loss_weight=1.0,
         policy_aux_loss_weight=0.25,
         policy_objective_fraction=1.0,
     )
@@ -250,10 +256,80 @@ def test_policy_equivalent_active_rows_apply_partial_dose_boundary() -> None:
     equivalent = train_bc._policy_objective_equivalent_active_rows(  # noqa: SLF001
         base_active_rows=8,
         aux_active_rows=4,
+        policy_base_loss_weight=1.0,
         policy_aux_loss_weight=0.25,
         policy_objective_fraction=0.5,
     )
     assert equivalent == pytest.approx(4.5)
+
+
+def test_policy_equivalent_active_rows_apply_both_stream_coefficients() -> None:
+    equivalent = train_bc._policy_objective_equivalent_active_rows(  # noqa: SLF001
+        base_active_rows=8,
+        aux_active_rows=4,
+        policy_base_loss_weight=0.25,
+        policy_aux_loss_weight=0.75,
+        policy_objective_fraction=0.5,
+    )
+
+    assert equivalent == pytest.approx((0.25 * 8 + 0.75 * 4) * 0.5)
+
+
+def test_policy_equivalent_active_rows_support_aux_only_objective() -> None:
+    equivalent = train_bc._policy_objective_equivalent_active_rows(  # noqa: SLF001
+        base_active_rows=222,
+        aux_active_rows=6144,
+        policy_base_loss_weight=0.0,
+        policy_aux_loss_weight=1.0,
+        policy_objective_fraction=1.0,
+    )
+
+    assert equivalent == pytest.approx(6144.0)
+
+
+def test_policy_microbatch_dose_supports_aux_only_objective() -> None:
+    base_only_weight, base_only_fraction = (
+        train_bc._realized_policy_microbatch_dose(  # noqa: SLF001
+            policy_loss_weight=1.0,
+            policy_objective_fraction=1.0,
+            globally_base_objective_mass=1.0,
+            globally_aux_objective_mass=0.0,
+            policy_base_loss_weight=0.0,
+            policy_aux_loss_weight=1.0,
+            accumulation_group_size=1,
+        )
+    )
+    mixed_stream_weight, mixed_stream_fraction = (
+        train_bc._realized_policy_microbatch_dose(  # noqa: SLF001
+            policy_loss_weight=1.0,
+            policy_objective_fraction=1.0,
+            globally_base_objective_mass=1.0,
+            globally_aux_objective_mass=1.0,
+            policy_base_loss_weight=0.0,
+            policy_aux_loss_weight=1.0,
+            accumulation_group_size=1,
+        )
+    )
+
+    assert (base_only_weight, base_only_fraction) == (0.0, 0.0)
+    assert mixed_stream_weight == pytest.approx(1.0)
+    assert mixed_stream_fraction == pytest.approx(1.0)
+
+
+def test_policy_microbatch_dose_applies_mixed_stream_coefficients() -> None:
+    weight, fraction = train_bc._realized_policy_microbatch_dose(  # noqa: SLF001
+        policy_loss_weight=1.0,
+        policy_objective_fraction=1.0,
+        globally_base_objective_mass=0.4,
+        globally_aux_objective_mass=1.0,
+        policy_base_loss_weight=0.25,
+        policy_aux_loss_weight=0.75,
+        accumulation_group_size=2,
+    )
+
+    expected = (0.25 * 0.4 + 0.75 * 1.0) / 2.0
+    assert weight == pytest.approx(expected)
+    assert fraction == pytest.approx(expected)
 
 
 @pytest.mark.parametrize(
@@ -292,6 +368,7 @@ def test_policy_group_dose_follows_realized_active_microbatches(
                 policy_objective_fraction=1.0,
                 globally_base_objective_mass=float(base_active),
                 globally_aux_objective_mass=float(aux_active),
+                policy_base_loss_weight=1.0,
                 policy_aux_loss_weight=aux_weight,
                 accumulation_group_size=group_size,
             )
@@ -343,6 +420,7 @@ def test_value_only_group_does_not_trigger_post_policy_freeze() -> None:
         policy_objective_fraction=1.0,
         globally_base_objective_mass=0.0,
         globally_aux_objective_mass=0.0,
+        policy_base_loss_weight=1.0,
         policy_aux_loss_weight=1.0,
         accumulation_group_size=1,
     )

@@ -1340,7 +1340,12 @@ def test_policy_aux_batch_combines_parts_and_adds_no_value_gradient(tmp_path) ->
     template = _make_entity_policy()
     initial = copy.deepcopy(template.model.state_dict())
 
-    def run(*, auxiliary: bool, aux_weight_scale: float = 1.0):
+    def run(
+        *,
+        auxiliary: bool,
+        aux_weight_scale: float = 1.0,
+        base_loss_weight: float = 1.0,
+    ):
         policy = _make_entity_policy()
         policy.model.load_state_dict(initial)
         policy.model.eval()  # make the duplicated-forward equality exact (no dropout)
@@ -1357,6 +1362,7 @@ def test_policy_aux_batch_combines_parts_and_adds_no_value_gradient(tmp_path) ->
             soft_target_source="scores",
             soft_target_min_legal_coverage=0.0,
             policy_loss_weight=1.0,
+            policy_base_loss_weight=base_loss_weight,
             value_loss_weight=0.0,
             final_vp_loss_weight=0.0,
             q_loss_weight=0.0,
@@ -1382,12 +1388,23 @@ def test_policy_aux_batch_combines_parts_and_adds_no_value_gradient(tmp_path) ->
 
     _control_policy, control = run(auxiliary=False)
     aux_policy, auxiliary = run(auxiliary=True)
+    _aux_only_policy, aux_only = run(
+        auxiliary=True, base_loss_weight=0.0
+    )
     _scaled_policy, scaled_auxiliary = run(auxiliary=True, aux_weight_scale=17.0)
     # Duplicating the same policy rows in the active-policy stream must add one
     # complete auxiliary dose without shrinking the original base objective.
     assert auxiliary["policy_loss"] == pytest.approx(
         2.0 * control["policy_loss"], rel=1e-6
     )
+    assert aux_only["policy_loss"] == pytest.approx(
+        control["policy_loss"], rel=1e-6
+    )
+    assert aux_only["policy_base_loss"] == pytest.approx(
+        control["policy_loss"], rel=1e-6
+    )
+    assert aux_only["policy_base_loss_coefficient"] == 0.0
+    assert aux_only["policy_aux_loss_coefficient"] == 1.0
     assert auxiliary["policy_loss_weighted_sum"] == pytest.approx(
         2.0 * control["policy_loss_weighted_sum"], rel=1e-6
     )

@@ -40,6 +40,81 @@ def test_policy_epoch_reconstructs_independent_base_and_aux_means() -> None:
     }
 
 
+def test_policy_epoch_default_base_coefficient_preserves_legacy_objective() -> None:
+    sums = {
+        "policy_base_loss": 28.0,
+        "policy_aux_loss": 16.0,
+        "policy_loss": 44.0,
+    }
+    denominators = {
+        "policy_base_loss": 10.0,
+        "policy_aux_loss": 2.0,
+        "policy_loss": 10.0,
+    }
+
+    implicit = train_bc._policy_stream_epoch_metrics(
+        sums,
+        denominators,
+        aux_enabled=True,
+        aux_coefficient=0.25,
+    )
+    explicit = train_bc._policy_stream_epoch_metrics(
+        sums,
+        denominators,
+        aux_enabled=True,
+        base_coefficient=1.0,
+        aux_coefficient=0.25,
+    )
+
+    assert implicit == explicit
+    assert implicit["policy_loss"] == pytest.approx(2.8 + 0.25 * 8.0)
+
+
+def test_policy_epoch_applies_mixed_stream_coefficients() -> None:
+    metrics = train_bc._policy_stream_epoch_metrics(
+        {
+            "policy_base_loss": 28.0,
+            "policy_aux_loss": 16.0,
+            "policy_loss": 44.0,
+        },
+        {
+            "policy_base_loss": 10.0,
+            "policy_aux_loss": 2.0,
+            "policy_loss": 10.0,
+        },
+        aux_enabled=True,
+        base_coefficient=0.25,
+        aux_coefficient=0.75,
+    )
+
+    assert metrics["policy_base_loss"] == pytest.approx(2.8)
+    assert metrics["policy_aux_loss"] == pytest.approx(8.0)
+    assert metrics["policy_loss"] == pytest.approx(0.25 * 2.8 + 0.75 * 8.0)
+
+
+def test_policy_epoch_aux_only_excludes_base_from_combined_objective() -> None:
+    metrics = train_bc._policy_stream_epoch_metrics(
+        {
+            "policy_base_loss": 28.0,
+            "policy_aux_loss": 16.0,
+            "policy_loss": 44.0,
+        },
+        {
+            "policy_base_loss": 10.0,
+            "policy_aux_loss": 2.0,
+            "policy_loss": 10.0,
+        },
+        aux_enabled=True,
+        base_coefficient=0.0,
+        aux_coefficient=1.0,
+    )
+
+    # Base remains visible as a raw diagnostic but contributes no authority.
+    assert metrics["policy_base_loss"] == pytest.approx(2.8)
+    assert metrics["policy_aux_loss"] == pytest.approx(8.0)
+    assert metrics["policy_loss"] == pytest.approx(8.0)
+
+
 def test_policy_epoch_without_aux_preserves_legacy_statistic() -> None:
     metrics = train_bc._policy_stream_epoch_metrics(
         {"policy_loss": 9.0},

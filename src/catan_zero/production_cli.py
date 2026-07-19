@@ -1130,6 +1130,9 @@ def _require_parent_echoes(
         "weight_decay": float(fields["weight_decay"]),
         "policy_loss_weight": float(fields["policy_loss_weight"]),
         "policy_aux_active_batch_size": int(fields["policy_aux_active_batch_size"]),
+        "policy_base_loss_weight": float(
+            fields.get("policy_base_loss_weight", 1.0)
+        ),
         "policy_aux_loss_weight": float(fields["policy_aux_loss_weight"]),
         "policy_aux_sampling_mode": fields["policy_aux_sampling_mode"],
         "value_lr_mult": float(fields["value_lr_mult"]),
@@ -1147,9 +1150,21 @@ def _require_parent_echoes(
     if max_steps != 12 or fields.get("exact_max_steps") is not True:
         raise ProductionCLIError("canonical parent-update recipe is not exact step-12")
     drift = {
-        key: {"expected": value, "actual": report.get(key)}
+        key: {
+            "expected": value,
+            "actual": (
+                report.get(key, 1.0)
+                if key == "policy_base_loss_weight"
+                else report.get(key)
+            ),
+        }
         for key, value in expected.items()
-        if report.get(key) != value
+        if (
+            report.get(key, 1.0)
+            if key == "policy_base_loss_weight"
+            else report.get(key)
+        )
+        != value
     }
     if drift:
         raise ProductionCLIError(
@@ -1513,19 +1528,39 @@ def _require_parent_policy_objective(
     policy_active: int,
     base_mass: float,
     aux_mass: float,
+    base_coefficient: float,
     aux_coefficient: float,
 ) -> float:
     stream = row.get("policy_stream_objective")
     dose = row.get("policy_objective_dose")
     aux_enabled = aux_mass > 0.0
     expected_coefficient = aux_coefficient if aux_enabled else 0.0
-    weighted_mass = base_mass + expected_coefficient * aux_mass
+    weighted_mass = (
+        base_coefficient * base_mass + expected_coefficient * aux_mass
+    )
+    legacy_stream = bool(
+        isinstance(stream, Mapping)
+        and stream.get("schema_version")
+        == "train-policy-stream-objective-v1"
+        and stream.get("formula")
+        == "base_mean + aux_coefficient * aux_mean"
+        and base_coefficient == 1.0
+    )
+    current_stream = bool(
+        isinstance(stream, Mapping)
+        and stream.get("schema_version")
+        == "train-policy-stream-objective-v2"
+        and stream.get("formula")
+        == (
+            "base_coefficient * base_mean + "
+            "aux_coefficient * aux_mean"
+        )
+    )
     if (
         not isinstance(stream, Mapping)
-        or stream.get("schema_version") != "train-policy-stream-objective-v1"
-        or stream.get("formula") != "base_mean + aux_coefficient * aux_mean"
+        or not (legacy_stream or current_stream)
         or stream.get("normalization") != "independent_weighted_means"
-        or stream.get("base_coefficient") != 1.0
+        or stream.get("base_coefficient") != base_coefficient
         or stream.get("aux_enabled") is not aux_enabled
         or stream.get("aux_coefficient") != expected_coefficient
         or not math.isclose(
@@ -1678,6 +1713,7 @@ def _verify_parent_update_outputs(
     ):
         raise ProductionCLIError("parent-update checkpoint dose trajectory drifted")
     aux_batch = int(fields["policy_aux_active_batch_size"])
+    base_coefficient = float(fields.get("policy_base_loss_weight", 1.0))
     aux_coefficient = float(fields["policy_aux_loss_weight"])
     weighted_policy_masses: list[float] = []
     for step, row in zip(expected_steps, rows, strict=True):
@@ -1736,6 +1772,7 @@ def _verify_parent_update_outputs(
                 policy_active=policy_total,
                 base_mass=base_mass,
                 aux_mass=aux_mass,
+                base_coefficient=base_coefficient,
                 aux_coefficient=aux_coefficient,
             )
         )

@@ -341,7 +341,14 @@ def _load_recipe(path: str | Path) -> tuple[TrainConfig, dict[str, Any]]:
     if not isinstance(fields, dict):
         raise SystemExit("canonical train config train_config.fields must be an object")
     expected_fields = {field.name for field in dataclasses.fields(TrainConfig)}
-    missing_fields = sorted(expected_fields - set(fields))
+    # ``policy_base_loss_weight`` was added as a backward-compatible causal
+    # ablation axis after the sealed production recipes were hashed. Preserve
+    # those immutable files: omission means the dataclass default 1.0, while
+    # every new recipe may bind the field explicitly.
+    backward_compatible_default_fields = {"policy_base_loss_weight"}
+    missing_fields = sorted(
+        expected_fields - set(fields) - backward_compatible_default_fields
+    )
     unknown_fields = sorted(set(fields) - expected_fields)
     if missing_fields or unknown_fields:
         raise SystemExit(
