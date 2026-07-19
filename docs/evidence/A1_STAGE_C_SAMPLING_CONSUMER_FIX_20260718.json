@@ -56,5 +56,25 @@
     "rare_selected_action_draws_before": 290,
     "rare_selected_action_draws_after": 417,
     "note": "Selected-action labels are diagnostic and are not the teacher argmax contract."
+  },
+  "rare_action_balanced_followup": {
+    "checkpoint_sha256": "sha256:369f0f13f5f36daf8e349d38084a2295c7f2ae67536732e61c54bfcfb46e8a5f",
+    "base_measure": "stage_c_rare_action_balanced",
+    "effective_sample_size": 64353.741510054344,
+    "active_policy_teacher_gap_closure": 0.027184204309516513,
+    "common_uniform_clean_outcome_scalar_mse": 0.6273383776331714,
+    "paired_h2h_vs_production_weighted": {
+      "operator": "coherent_public_n128.schema22",
+      "base_seed": 202607184600,
+      "pairs": 50,
+      "games": 100,
+      "candidate_wins": 48,
+      "baseline_wins": 52,
+      "ww_pairs": 4,
+      "ll_pairs": 6,
+      "split_pairs": 40,
+      "errors": [],
+      "status": "strength_neutral_slightly_unfavorable"
+    }
   }
 }
