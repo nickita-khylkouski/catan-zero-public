@@ -842,6 +842,44 @@ def test_rare_action_balanced_sampling_raises_observed_teacher_mass() -> None:
     ]
 
 
+def test_wide_choice_balanced_sampling_raises_width_20_mass() -> None:
+    rows = 100
+    subset = {
+        "row_index": np.arange(rows, dtype=np.int64),
+        "stratum": np.asarray(["ordinary"] * rows),
+        "phase": np.asarray(["PLAY_TURN"] * rows),
+        "legal_width": np.asarray([4] * 90 + [24] * 10, dtype=np.int64),
+    }
+    patch = {"row_index": subset["row_index"]}
+    export = {
+        "sampling_population": {
+            "candidate_counts_by_stratum": {"ordinary": rows},
+            "selected_counts_by_stratum": {"ordinary": rows},
+        }
+    }
+    validation = np.zeros(rows, dtype=np.bool_)
+    validation[-2:] = True
+
+    weights, report = overlay._selected_sampling_weights(  # noqa: SLF001
+        export=export,
+        subset=subset,
+        patch=patch,
+        selected_validation=validation,
+        arm="WIDE_CHOICE_BALANCED",
+        production_weight_cap=4.0,
+    )
+
+    assert np.mean(weights[~validation]) == pytest.approx(1.0)
+    assert np.max(weights[~validation]) <= 4.0
+    assert weights[90] > weights[0]
+    balance = report["wide_choice_balance"]["training"]
+    assert balance["row_count"] == 8
+    assert balance["realized_mass_fraction"] == pytest.approx(0.10)
+    assert balance["composition"] == (
+        "production_inverse_inclusion_weight_times_wide_choice_multiplier"
+    )
+
+
 def test_teacher_action_type_projection_rejects_unbound_catalog_ids() -> None:
     patch = {
         "row_index": np.asarray([4], dtype=np.int64),

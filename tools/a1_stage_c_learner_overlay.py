@@ -77,6 +77,8 @@ RARE_STRATEGIC_ACTION_TYPES = (
     "PLAY_KNIGHT_CARD",
 )
 RARE_ACTION_TARGET_MASS_FRACTION = 0.02
+WIDE_CHOICE_MIN_LEGAL_ACTIONS = 20
+WIDE_CHOICE_TARGET_MASS_FRACTION = 0.10
 LEGACY_ADMISSION_SCHEMA = "a1-coherent-n128-corpus-admission-v1"
 SUPPORTED_BASE_ADMISSION_SCHEMAS = frozenset(
     {
@@ -2012,6 +2014,60 @@ def _rare_action_balance_weights(
     }
 
 
+def _wide_choice_balance_weights(
+    legal_widths: np.ndarray,
+    *,
+    selected: np.ndarray,
+    base_weights: np.ndarray,
+    cap: float,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Give genuinely wide decisions a bounded share of the sampling measure."""
+
+    widths = np.asarray(legal_widths, dtype=np.int64)
+    scope = np.asarray(selected, dtype=np.bool_)
+    base = np.asarray(base_weights, dtype=np.float64)
+    if (
+        widths.ndim != 1
+        or scope.shape != widths.shape
+        or base.shape != widths.shape
+        or not np.any(scope)
+        or not np.isfinite(base).all()
+        or np.any(base <= 0.0)
+    ):
+        raise OverlayError("wide-choice balancing scope is empty or malformed")
+    wide = scope & (widths >= WIDE_CHOICE_MIN_LEGAL_ACTIONS)
+    observed_mass = float(base[wide].sum())
+    non_wide_mass = float(base[scope & ~wide].sum())
+    target_mass = float(
+        WIDE_CHOICE_TARGET_MASS_FRACTION
+        * non_wide_mass
+        / (1.0 - WIDE_CHOICE_TARGET_MASS_FRACTION)
+    )
+    requested_multiplier = (
+        max(1.0, target_mass / observed_mass) if observed_mass > 0.0 else 1.0
+    )
+    raw = base.copy()
+    raw[wide] *= requested_multiplier
+    result = base.copy()
+    result[scope] = _unit_mean_capped_weights(raw[scope], cap=cap)
+    realized_mass = float(result[wide].sum())
+    return result, {
+        "minimum_legal_actions": WIDE_CHOICE_MIN_LEGAL_ACTIONS,
+        "target_mass_fraction": WIDE_CHOICE_TARGET_MASS_FRACTION,
+        "target_mass": target_mass,
+        "row_count": int(np.count_nonzero(wide)),
+        "base_weight_mass": observed_mass,
+        "requested_multiplier": float(requested_multiplier),
+        "realized_weight_mass": realized_mass,
+        "realized_mass_fraction": float(realized_mass / result[scope].sum()),
+        "composition": (
+            "production_inverse_inclusion_weight_times_wide_choice_multiplier"
+        ),
+        "cap": float(cap),
+        "missing_wide_choices_are_not_synthesized": True,
+    }
+
+
 def _selected_sampling_weights(
     *,
     export: Mapping[str, Any],
@@ -2065,16 +2121,22 @@ def _selected_sampling_weights(
     if validation.shape != raw.shape or np.all(validation):
         raise OverlayError("Stage-C selected training split is empty or misaligned")
     train = ~validation
+    legal_widths = np.asarray([width for _, _, width in descriptors], dtype=np.int64)
     weights = np.ones(raw.size, dtype=np.float64)
     teacher_action_types = None
     rare_action_balance = None
+    wide_choice_balance = None
     if action_types_by_id is not None:
         teacher_action_types = _teacher_argmax_action_types(
             patch, action_types_by_id=action_types_by_id
         )
         if teacher_action_types.shape != raw.shape:
             raise OverlayError("Stage-C teacher action types are row-misaligned")
-    if arm in {"PRODUCTION_WEIGHTED", "RARE_ACTION_BALANCED"}:
+    if arm in {
+        "PRODUCTION_WEIGHTED",
+        "RARE_ACTION_BALANCED",
+        "WIDE_CHOICE_BALANCED",
+    }:
         production_weights = np.ones(raw.size, dtype=np.float64)
         production_weights[train] = _unit_mean_capped_weights(
             raw[train], cap=float(production_weight_cap)
@@ -2110,6 +2172,27 @@ def _selected_sampling_weights(
             )
             weights[validation] = validation_weights[validation]
         rare_action_balance = {
+            "training": training_balance,
+            "validation": validation_balance,
+        }
+    if arm == "WIDE_CHOICE_BALANCED":
+        train_weights, training_balance = _wide_choice_balance_weights(
+            legal_widths,
+            selected=train,
+            base_weights=production_weights,
+            cap=float(production_weight_cap),
+        )
+        weights[train] = train_weights[train]
+        validation_balance = None
+        if np.any(validation):
+            validation_weights, validation_balance = _wide_choice_balance_weights(
+                legal_widths,
+                selected=validation,
+                base_weights=production_weights,
+                cap=float(production_weight_cap),
+            )
+            weights[validation] = validation_weights[validation]
+        wide_choice_balance = {
             "training": training_balance,
             "validation": validation_balance,
         }
@@ -2168,6 +2251,7 @@ def _selected_sampling_weights(
             teacher_action_types
         )
         report["rare_action_balance"] = rare_action_balance
+    report["wide_choice_balance"] = wide_choice_balance
     report["sampling_sha256"] = _value_sha256(report)
     return weights.astype(np.float32), report
 
