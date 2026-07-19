@@ -79,6 +79,10 @@ def test_exact_two_stream_admission_accepts_aux_only_hard_phase_mass():
         policy_aux_sampling_mode="weighted_permutation_cycles_v1",
         ddp={"enabled": False, "world_size": 1, "rank": 0, "local_rank": 0},
         initial_policy_aux_global_draw_offset=0,
+        max_steps=1,
+        batch_size=8,
+        grad_accum_steps=1,
+        completed_optimizer_steps=0,
     )
 
     assert report["admitted"] is True
@@ -89,6 +93,41 @@ def test_exact_two_stream_admission_accepts_aux_only_hard_phase_mass():
     assert report["per_phase"]["PLAY_TURN"][
         "policy_objective_mass_fraction"
     ] == pytest.approx(4.0 / 8.0)
+
+
+def test_exact_two_stream_aux_only_derives_geometry_without_base_receipt():
+    report = _exact_two_stream_policy_phase_objective_mass_admission(
+        _two_stream_phase_data(),
+        np.arange(8, dtype=np.int64),
+        # Direct authenticated corpora can use a non-planned base sampler. With
+        # c_base=0 that sampler has no policy contribution and must not block
+        # the exact AUX-only schedule.
+        base_admission={"identity_sha256": "direct-base-no-plan", "per_phase": {}},
+        policy_sample_weights=np.ones(8, dtype=np.float64),
+        policy_aux_sampling_weights=np.ones(8, dtype=np.float64) / 8.0,
+        policy_aux_phase_loss_weights=None,
+        minimum_phase_mass_fractions={
+            "BUILD_INITIAL_SETTLEMENT": 0.02,
+            "BUILD_INITIAL_ROAD": 0.02,
+            "DISCARD": 0.02,
+            "MOVE_ROBBER": 0.02,
+        },
+        policy_base_loss_weight=0.0,
+        policy_aux_loss_weight=1.0,
+        policy_aux_active_batch_size=8,
+        sampler_seed=2,
+        policy_aux_sampling_mode="weighted_permutation_cycles_v1",
+        ddp={"enabled": False, "world_size": 1, "rank": 0, "local_rank": 0},
+        initial_policy_aux_global_draw_offset=0,
+        max_steps=1,
+        batch_size=64,
+        grad_accum_steps=1,
+        completed_optimizer_steps=0,
+    )
+
+    assert report["admitted"] is True
+    assert report["base_planned_receipt_available"] is False
+    assert report["aux_planned_synchronous_global_microbatch_count"] == 1
 
 
 def test_exact_two_stream_admission_uses_loss_coefficients_and_undoes_phase_weights():
@@ -114,6 +153,10 @@ def test_exact_two_stream_admission_uses_loss_coefficients_and_undoes_phase_weig
         policy_aux_sampling_mode="weighted_permutation_cycles_v1",
         ddp={"enabled": False, "world_size": 1, "rank": 0, "local_rank": 0},
         initial_policy_aux_global_draw_offset=0,
+        max_steps=1,
+        batch_size=8,
+        grad_accum_steps=1,
+        completed_optimizer_steps=0,
     )
 
     # The phase allocation has already selected the AUX measure, so undoing
@@ -149,6 +192,10 @@ def test_exact_two_stream_admission_refuses_aux_hard_phase_below_floor():
             policy_aux_sampling_mode="weighted_permutation_cycles_v1",
             ddp={"enabled": False, "world_size": 1, "rank": 0, "local_rank": 0},
             initial_policy_aux_global_draw_offset=0,
+            max_steps=1,
+            batch_size=8,
+            grad_accum_steps=1,
+            completed_optimizer_steps=0,
         )
 
 

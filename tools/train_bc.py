@@ -18637,6 +18637,14 @@ def main(
                 policy_aux_sampling_mode=str(args.policy_aux_sampling_mode),
                 ddp=ddp,
                 initial_policy_aux_global_draw_offset=phase_admission_aux_offset,
+                max_steps=int(args.max_steps),
+                batch_size=int(args.batch_size),
+                grad_accum_steps=int(args.grad_accum_steps),
+                completed_optimizer_steps=(
+                    0
+                    if resume_progress is None
+                    else int(resume_progress["optimizer_step"])
+                ),
             ),
         )
         base_sampler_report["policy_phase_objective_mass_admission"] = dict(
@@ -44852,6 +44860,10 @@ def _exact_two_stream_policy_phase_objective_mass_admission(
     policy_aux_sampling_mode: str,
     ddp: Mapping[str, int | bool],
     initial_policy_aux_global_draw_offset: int,
+    max_steps: int,
+    batch_size: int,
+    grad_accum_steps: int,
+    completed_optimizer_steps: int,
 ) -> dict[str, object]:
     """Replay the exact coefficient-weighted base+AUX policy objective.
 
@@ -44879,11 +44891,6 @@ def _exact_two_stream_policy_phase_objective_mass_admission(
         raise SystemExit("two-stream policy objective has zero total coefficient")
     if aux_coefficient <= 0.0:
         return dict(base_admission)
-    if "epoch_receipts" not in base_admission or "geometry" not in base_admission:
-        raise SystemExit(
-            "exact two-stream phase admission requires an exact planned base "
-            "sampler receipt"
-        )
     rows = np.asarray(train_indices, dtype=np.int64)
     aux_sampling = np.asarray(policy_aux_sampling_weights, dtype=np.float64)
     policy_weights = np.asarray(policy_sample_weights, dtype=np.float64)
@@ -44901,12 +44908,46 @@ def _exact_two_stream_policy_phase_objective_mass_admission(
     if "phase" not in data:
         raise SystemExit("exact two-stream phase admission requires a phase column")
 
-    geometry = dict(base_admission["geometry"])
-    world_size = int(geometry["world_size"])
-    grad_accum_steps = int(geometry["grad_accum_steps"])
-    if world_size <= 0 or grad_accum_steps <= 0:
+    exact_base_receipt_available = (
+        "epoch_receipts" in base_admission and "geometry" in base_admission
+    )
+    if base_coefficient > 0.0 and not exact_base_receipt_available:
+        raise SystemExit(
+            "exact two-stream phase admission requires an exact planned base "
+            "sampler receipt whenever the base coefficient is nonzero"
+        )
+    if exact_base_receipt_available:
+        geometry = dict(base_admission["geometry"])
+        world_size = int(geometry["world_size"])
+        accumulation = int(geometry["grad_accum_steps"])
+        receipts = list(base_admission["epoch_receipts"])
+    else:
+        # AUX-only recipes have no base-gradient contribution, so a direct
+        # corpus is allowed to omit the base weighted-sampler receipt.  The
+        # trainer still consumes one AUX microbatch beside every configured
+        # base microbatch.  With an exact step cap, that geometry is fully
+        # determined by the optimizer schedule and does not depend on which
+        # base rows would have been drawn.
+        world_size = int(ddp["world_size"]) if ddp.get("enabled", False) else 1
+        accumulation = int(grad_accum_steps)
+        remaining_steps = int(max_steps) - int(completed_optimizer_steps)
+        if remaining_steps <= 0:
+            raise SystemExit(
+                "AUX-only exact phase admission requires a positive remaining "
+                "--max-steps budget when no base sampler receipt exists"
+            )
+        if int(batch_size) <= 0:
+            raise ValueError("AUX-only exact phase admission requires batch_size > 0")
+        receipts = [
+            {
+                "epoch": int(completed_optimizer_steps),
+                "consumed_synchronous_global_microbatch_count": (
+                    remaining_steps * accumulation
+                ),
+            }
+        ]
+    if world_size <= 0 or accumulation <= 0:
         raise ValueError("two-stream phase admission has invalid base geometry")
-    receipts = list(base_admission["epoch_receipts"])
     if not receipts:
         raise SystemExit("exact two-stream phase admission has no planned batches")
 
@@ -44988,8 +45029,8 @@ def _exact_two_stream_policy_phase_objective_mass_admission(
     # reconstruct that same per-optimizer-step average before taking the
     # run-wide mean.  This preserves a final partial group exactly.
     aux_optimizer_attributions: list[dict[str, float]] = []
-    for start in range(0, aux_batch_count, grad_accum_steps):
-        group = aux_phase_group_attributions[start : start + grad_accum_steps]
+    for start in range(0, aux_batch_count, accumulation):
+        group = aux_phase_group_attributions[start : start + accumulation]
         combined: Counter[str] = Counter()
         for attribution in group:
             combined.update(attribution)
@@ -45051,6 +45092,7 @@ def _exact_two_stream_policy_phase_objective_mass_admission(
         "objective_measure": "exact_coefficient_weighted_two_stream_synchronous_global_minibatch_v1",
         "normalization": "independently_self_normalized_streams_then_configured_coefficients_v1",
         "base_admission_identity_sha256": base_admission.get("identity_sha256"),
+        "base_planned_receipt_available": exact_base_receipt_available,
         "policy_base_loss_weight": base_coefficient,
         "policy_aux_loss_weight": aux_coefficient,
         "policy_aux_active_batch_size": aux_batch_size,
@@ -45064,6 +45106,13 @@ def _exact_two_stream_policy_phase_objective_mass_admission(
         "final_policy_aux_global_draw_offset": int(aux_offset),
         "aux_planned_synchronous_global_microbatch_count": aux_batch_count,
         "aux_planned_optimizer_batch_count": len(aux_optimizer_attributions),
+        "geometry": {
+            "world_size": world_size,
+            "batch_size": int(batch_size),
+            "grad_accum_steps": accumulation,
+            "max_steps": int(max_steps),
+            "completed_optimizer_steps": int(completed_optimizer_steps),
+        },
         "required_phases": list(HARD_DECISION_POLICY_MASS_PHASES),
         "minimum_phase_mass_fractions": minima,
         "per_phase": per_phase,
