@@ -16263,7 +16263,16 @@ def main(
         "policy-target completeness admission",
         lambda: _policy_target_completeness_report(
             data,
-            policy_loss_weight=float(args.policy_loss_weight),
+            # ``train_value_only`` freezes the complete policy-producing
+            # surface and the policy-signal attestation marks that objective
+            # disabled.  Admission must use the same effective objective:
+            # requiring coherent policy-target completeness here made the
+            # otherwise supported value-repair path impossible to launch.
+            policy_loss_weight=(
+                0.0
+                if bool(args.train_value_only)
+                else float(args.policy_loss_weight)
+            ),
             train_value_only=bool(args.train_value_only),
             soft_target_source=str(args.soft_target_source),
             soft_target_weight=float(args.soft_target_weight),

@@ -181,6 +181,21 @@ def test_legacy_rows_remain_usable_for_value_only_rehearsal():
     assert report["mismatched_target_information_rows"] == 0
 
 
+def test_disabled_policy_objective_does_not_require_target_completeness():
+    data = _data(
+        [
+            TARGET_INFORMATION_REGIME_PUBLIC_COHERENT,
+            TARGET_INFORMATION_REGIME_PUBLIC,
+        ]
+    )
+
+    report = _admit(data, policy_loss_weight=0.0)
+
+    assert report["search_target_objectives"] == []
+    assert report["search_objective_active_rows"] == 0
+    assert "policy_target_completeness" not in report
+
+
 @pytest.mark.parametrize(
     "regime", ["authoritative_hidden_state_search_v1", "unknown", ""]
 )
