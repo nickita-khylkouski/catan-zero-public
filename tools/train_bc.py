@@ -18345,10 +18345,18 @@ def main(
         data, "policy_aux_phase_sampling_weights", None
     )
     policy_aux_phase_loss_weights = None
-    direct_stage_c_base = _require_stage_c_policy_aux_stream(
-        data,
-        train_indices,
-        active_batch_size=int(args.policy_aux_active_batch_size),
+    policy_objective_enabled = (
+        float(args.policy_loss_weight) > 0.0
+        and not bool(args.train_value_only)
+    )
+    direct_stage_c_base = (
+        _require_stage_c_policy_aux_stream(
+            data,
+            train_indices,
+            active_batch_size=int(args.policy_aux_active_batch_size),
+        )
+        if policy_objective_enabled
+        else None
     )
     if bool(getattr(data, "policy_aux_phase_scope_authenticated", False)):
         policy_aux_phase_loss_weights = dict(policy_phase_weight_map)
@@ -18363,7 +18371,8 @@ def main(
                 f"--phase-weights: {invalid_phase_loss_weights}"
             )
     if (
-        bool(getattr(data, "policy_aux_phase_scope_authenticated", False))
+        policy_objective_enabled
+        and bool(getattr(data, "policy_aux_phase_scope_authenticated", False))
         and int(args.policy_aux_active_batch_size) <= 0
     ):
         raise SystemExit(
