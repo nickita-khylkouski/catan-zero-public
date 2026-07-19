@@ -73,6 +73,10 @@ APPROVED_VALUE_HEAD_PARENT_UPDATE = (
     "configs/training/a1_parent_update_value25_35m_b200.schema1.json",
     "a1-parent-update-value25-35m-b200",
 )
+APPROVED_V15_SPLIT1_VALUE_REPAIR = (
+    "configs/training/a1_v15_split1_value_repair_warmup0_step32_35m_b200.schema1.json",
+    "a1-v15-split1-value-repair-warmup0-step32",
+)
 
 
 @pytest.mark.parametrize("entrypoint", sorted(APPROVED))
@@ -300,6 +304,23 @@ def test_checked_in_value_head_parent_update_recipe_is_authenticated() -> None:
     assert fields["value_lr_mult"] == pytest.approx(0.25)
 
 
+def test_v15_split1_value_repair_is_value_only_and_authenticated() -> None:
+    relative, expected_name = APPROVED_V15_SPLIT1_VALUE_REPAIR
+    path = ROOT / relative
+    payload = json.loads(path.read_text(encoding="utf-8"))
+
+    assert (
+        require_production_recipe(entrypoint="train", path=path, payload=payload)
+        == expected_name
+    )
+    fields = payload["train_config"]["fields"]
+    assert fields["train_value_only"] is True
+    assert fields["policy_aux_loss_weight"] == 0.0
+    assert fields["lr_warmup_steps"] == 0
+    assert fields["max_steps"] == 32
+    assert payload["engine_settings"]["value_tower_split_layers"] == 1
+
+
 def test_generation_recipe_round_trips_every_typed_science_field() -> None:
     path = ROOT / APPROVED["generate"][0]
     payload = json.loads(path.read_text(encoding="utf-8"))
@@ -362,6 +383,7 @@ def test_authenticated_catalog_listing_has_no_second_identity_registry() -> None
         "a1-parent-update-active-p10-warmup0-opening-value25-35m-b200",
         "a1-parent-update-active-p10-warmup0-opening-value25-step16-35m-b200",
         "a1-parent-update-active-p25-35m-b200",
+        "a1-v15-split1-value-repair-warmup0-step32",
     ]
     assert all(Path(entry["path"]).is_absolute() for entry in train)
     assert all(len(entry["canonical_sha256"]) == 64 for entry in train)

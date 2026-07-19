@@ -84,6 +84,11 @@
         "canonical_sha256": "940e70128bafeb6b35a8e267058e7551affc73922282bef19ada83042cab3b50",
         "name": "a1-parent-update-active-p25-35m-b200",
         "path": "configs/training/a1_parent_update_active_p25_35m_b200.schema1.json"
+      },
+      {
+        "canonical_sha256": "1bbd0a3daff5711932c90641280ec0e21c13a7298d73b5efd6e698b6478f41b3",
+        "name": "a1-v15-split1-value-repair-warmup0-step32",
+        "path": "configs/training/a1_v15_split1_value_repair_warmup0_step32_35m_b200.schema1.json"
       }
     ]
   }
