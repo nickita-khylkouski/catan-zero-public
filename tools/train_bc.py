@@ -26167,6 +26167,192 @@ def _reduce_common_uniform_clean_outcome_scalar_mse(
     )
 
 
+VALUE_SCOPE_CLEAN_OUTCOME_SCALAR_MSE_KEY = (
+    "value_scope_clean_outcome_scalar_mse"
+)
+VALUE_SCOPE_CLEAN_OUTCOME_SCALAR_MSE_SCHEMA = (
+    "value-scope-clean-outcome-scalar-mse-v1"
+)
+_VALUE_SCOPE_CLEAN_OUTCOME_SCALAR_MSE_CONTRACT_FIELDS = (
+    "schema_version",
+    "measure",
+    "target",
+    "prediction_readout",
+    "prediction_scale",
+    "positive_training_value_sample_weight_scope_applied",
+    "training_value_sample_weights_applied",
+    "outcome_confidence_applied",
+    "truncated_rows_included",
+    "root_value_blend_applied",
+)
+
+
+def _value_scope_clean_outcome_scalar_mse_report(
+    squared_error_sum: float,
+    eligible_rows: int,
+    *,
+    prediction_readout: str,
+    prediction_scale: float,
+) -> dict[str, object]:
+    """Finalize clean terminal-outcome MSE inside the learner's value scope."""
+
+    error_sum = float(squared_error_sum)
+    rows = int(eligible_rows)
+    scale = float(prediction_scale)
+    if (
+        not math.isfinite(error_sum)
+        or error_sum < 0.0
+        or isinstance(eligible_rows, bool)
+        or rows < 0
+        or not math.isfinite(scale)
+        or scale <= 0.0
+        or not str(prediction_readout)
+    ):
+        raise ValueError("value-scope scalar-value metric parts are malformed")
+    if rows == 0 and error_sum != 0.0:
+        raise ValueError("empty value-scope scalar-value metric has nonzero error")
+    return {
+        "schema_version": VALUE_SCOPE_CLEAN_OUTCOME_SCALAR_MSE_SCHEMA,
+        "measure": (
+            "uniform_clean_terminal_outcome_rows_with_positive_"
+            "training_value_sample_weight"
+        ),
+        "target": "actor_perspective_terminal_outcome_pm1",
+        "prediction_readout": str(prediction_readout),
+        "prediction_scale": scale,
+        "positive_training_value_sample_weight_scope_applied": True,
+        "training_value_sample_weights_applied": False,
+        "outcome_confidence_applied": False,
+        "truncated_rows_included": False,
+        "root_value_blend_applied": False,
+        "available": rows > 0,
+        "eligible_rows": rows,
+        "squared_error_sum": error_sum,
+        "mse": error_sum / rows if rows > 0 else None,
+    }
+
+
+def _validated_value_scope_clean_outcome_scalar_mse(
+    value: object,
+) -> tuple[dict[str, object], float, int]:
+    if not isinstance(value, dict):
+        raise ValueError("value-scope scalar-value metric is not a mapping")
+    required = {
+        *_VALUE_SCOPE_CLEAN_OUTCOME_SCALAR_MSE_CONTRACT_FIELDS,
+        "available",
+        "eligible_rows",
+        "squared_error_sum",
+        "mse",
+    }
+    if set(value) != required:
+        raise ValueError("value-scope scalar-value metric fields are malformed")
+    if (
+        isinstance(value["eligible_rows"], bool)
+        or not isinstance(value["eligible_rows"], int)
+        or isinstance(value["squared_error_sum"], bool)
+        or isinstance(value["prediction_scale"], bool)
+        or not isinstance(value["prediction_readout"], str)
+        or not isinstance(value["available"], bool)
+        or (value["mse"] is not None and isinstance(value["mse"], bool))
+        or value["positive_training_value_sample_weight_scope_applied"] is not True
+        or any(
+            value[key] is not False
+            for key in (
+                "training_value_sample_weights_applied",
+                "outcome_confidence_applied",
+                "truncated_rows_included",
+                "root_value_blend_applied",
+            )
+        )
+    ):
+        raise ValueError("value-scope scalar-value metric values are malformed")
+    try:
+        rows = int(value["eligible_rows"])
+        error_sum = float(value["squared_error_sum"])
+        scale = float(value["prediction_scale"])
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            "value-scope scalar-value metric values are malformed"
+        ) from error
+    expected = _value_scope_clean_outcome_scalar_mse_report(
+        error_sum,
+        rows,
+        prediction_readout=str(value["prediction_readout"]),
+        prediction_scale=scale,
+    )
+    if value != expected:
+        raise ValueError("value-scope scalar-value metric is inconsistent")
+    contract = {
+        key: expected[key]
+        for key in _VALUE_SCOPE_CLEAN_OUTCOME_SCALAR_MSE_CONTRACT_FIELDS
+    }
+    return contract, error_sum, rows
+
+
+def _aggregate_value_scope_clean_outcome_scalar_mse(
+    reports: list[dict],
+) -> dict[str, object] | None:
+    present = [VALUE_SCOPE_CLEAN_OUTCOME_SCALAR_MSE_KEY in row for row in reports]
+    if not any(present):
+        return None
+    if not all(present):
+        raise SystemExit(
+            "validation reports only partially expose the value-scope "
+            "scalar-value metric"
+        )
+    try:
+        parsed = [
+            _validated_value_scope_clean_outcome_scalar_mse(
+                row[VALUE_SCOPE_CLEAN_OUTCOME_SCALAR_MSE_KEY]
+            )
+            for row in reports
+        ]
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
+    contract = parsed[0][0]
+    if any(item[0] != contract for item in parsed[1:]):
+        raise SystemExit(
+            "value-scope scalar-value prediction contracts differ across "
+            "validation reports"
+        )
+    return _value_scope_clean_outcome_scalar_mse_report(
+        sum(item[1] for item in parsed),
+        sum(item[2] for item in parsed),
+        prediction_readout=str(contract["prediction_readout"]),
+        prediction_scale=float(contract["prediction_scale"]),
+    )
+
+
+def _reduce_value_scope_clean_outcome_scalar_mse(
+    squared_error_sum: float,
+    eligible_rows: int,
+    ddp: dict[str, int | bool],
+    *,
+    prediction_readout: str,
+    prediction_scale: float,
+) -> dict[str, object]:
+    reduced = _reduce_named_sums(
+        {
+            "squared_error_sum": float(squared_error_sum),
+            "eligible_rows": float(eligible_rows),
+        },
+        ddp,
+    )
+    reduced_rows = float(reduced["eligible_rows"])
+    if (
+        not math.isfinite(reduced_rows)
+        or reduced_rows < 0.0
+        or not reduced_rows.is_integer()
+    ):
+        raise ValueError("reduced value-scope scalar-value row count is malformed")
+    return _value_scope_clean_outcome_scalar_mse_report(
+        float(reduced["squared_error_sum"]),
+        int(reduced_rows),
+        prediction_readout=prediction_readout,
+        prediction_scale=prediction_scale,
+    )
+
+
 _OBJECTIVE_MATCHED_VALIDATION_MEANS = (
     "loss",
     "raw_batch_mean_loss",
@@ -27258,6 +27444,17 @@ def _objective_measure_validation_aggregate(
         metrics[COMMON_UNIFORM_CLEAN_OUTCOME_SCALAR_MSE_KEY] = (
             common_uniform_value
         )
+    value_scope_clean_outcome = (
+        _aggregate_value_scope_clean_outcome_scalar_mse(reports)
+    )
+    if value_scope_clean_outcome is not None:
+        # Unlike the all-component diagnostic above, this metric admits only
+        # rows with positive learner value weight.  Authenticated composite
+        # components outside the value-training scope therefore contribute
+        # zero rows, while eligible rows remain uniformly weighted.
+        metrics[VALUE_SCOPE_CLEAN_OUTCOME_SCALAR_MSE_KEY] = (
+            value_scope_clean_outcome
+        )
     if all(
         isinstance(report.get("value_mse_strata_sufficient_statistics"), dict)
         and int(report.get("samples", 0)) > 0
@@ -28038,6 +28235,8 @@ def evaluate_bc_batches(
         ] = {}
         common_uniform_clean_outcome_squared_error_sum = 0.0
         common_uniform_clean_outcome_eligible_rows = 0
+        value_scope_clean_outcome_squared_error_sum = 0.0
+        value_scope_clean_outcome_eligible_rows = 0
         eval_fn = _eval_entity_batch
         eval_fn_extra_kwargs: dict[str, object] = {
             "policy_kl_anchor_weight": float(policy_kl_anchor_weight),
@@ -28225,6 +28424,16 @@ def evaluate_bc_batches(
                     "_common_uniform_clean_outcome_scalar_eligible_rows"
                 ]
             )
+            value_scope_clean_outcome_squared_error_sum += float(
+                batch_metrics[
+                    "_value_scope_clean_outcome_scalar_squared_error_sum"
+                ]
+            )
+            value_scope_clean_outcome_eligible_rows += int(
+                batch_metrics[
+                    "_value_scope_clean_outcome_scalar_eligible_rows"
+                ]
+            )
         extra_sums = _reduce_named_sums(extra_sums, ddp)
         extra_denominators = _reduce_named_sums(extra_denominators, ddp)
         aux_subgoal_sums = _reduce_named_sums(aux_subgoal_sums, ddp)
@@ -28256,6 +28465,15 @@ def evaluate_bc_batches(
             _reduce_common_uniform_clean_outcome_scalar_mse(
                 common_uniform_clean_outcome_squared_error_sum,
                 common_uniform_clean_outcome_eligible_rows,
+                ddp,
+                prediction_readout=scalar_value_loss_readout,
+                prediction_scale=scalar_value_loss_scale,
+            )
+        )
+        value_scope_clean_outcome_scalar_mse = (
+            _reduce_value_scope_clean_outcome_scalar_mse(
+                value_scope_clean_outcome_squared_error_sum,
+                value_scope_clean_outcome_eligible_rows,
                 ddp,
                 prediction_readout=scalar_value_loss_readout,
                 prediction_scale=scalar_value_loss_scale,
@@ -28343,6 +28561,9 @@ def evaluate_bc_batches(
             "scalar_value_mse_diagnostic": scalar_value_mse_diagnostic_eval,
             COMMON_UNIFORM_CLEAN_OUTCOME_SCALAR_MSE_KEY: (
                 common_uniform_clean_outcome_scalar_mse
+            ),
+            VALUE_SCOPE_CLEAN_OUTCOME_SCALAR_MSE_KEY: (
+                value_scope_clean_outcome_scalar_mse
             ),
             "value_mse_strata": _finalize_value_validation_strata(
                 value_mse_strata_sufficient_statistics
@@ -28809,6 +29030,14 @@ def _eval_entity_batch(
                     torch.ones_like(common_uniform_clean_outcome_error),
                     mask=has_outcome,
                 )
+                (
+                    value_scope_clean_outcome_squared_error_sum,
+                    value_scope_clean_outcome_eligible_rows,
+                ) = _weighted_loss_parts(
+                    common_uniform_clean_outcome_error,
+                    torch.ones_like(common_uniform_clean_outcome_error),
+                    mask=has_outcome & (value_weights > 0.0),
+                )
                 effective_value_weights = value_weights * outcome_confidence
                 value_mse_strata_sufficient_statistics = (
                     _value_validation_strata_parts(
@@ -28831,6 +29060,10 @@ def _eval_entity_batch(
                 (
                     common_uniform_clean_outcome_squared_error_sum,
                     common_uniform_clean_outcome_eligible_rows,
+                ) = _zero_loss_parts(policy.device)
+                (
+                    value_scope_clean_outcome_squared_error_sum,
+                    value_scope_clean_outcome_eligible_rows,
                 ) = _zero_loss_parts(policy.device)
             if vp_targets is not None and "final_vp" in outputs:
                 vp_error = nn.functional.mse_loss(outputs["final_vp"], vp_targets, reduction="none")
@@ -29263,6 +29496,12 @@ def _eval_entity_batch(
             ),
             "_common_uniform_clean_outcome_scalar_eligible_rows": int(
                 common_uniform_clean_outcome_eligible_rows.item()
+            ),
+            "_value_scope_clean_outcome_scalar_squared_error_sum": float(
+                value_scope_clean_outcome_squared_error_sum.item()
+            ),
+            "_value_scope_clean_outcome_scalar_eligible_rows": int(
+                value_scope_clean_outcome_eligible_rows.item()
             ),
             "final_vp_loss_weighted_sum": float(final_vp_loss_sum.item()),
             "final_vp_loss_weight_sum": float(final_vp_loss_denominator.item()),

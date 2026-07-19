@@ -12,6 +12,7 @@ from tools.train_bc import (
     _objective_measure_validation_aggregate,
     _policy_aux_validation_objective_weights,
     _reduce_common_uniform_clean_outcome_scalar_mse,
+    _reduce_value_scope_clean_outcome_scalar_mse,
     evaluate_composite_validation_measure,
     objective_matched_validation_component_metrics,
     objective_matched_validation_evaluation_identity,
@@ -678,6 +679,108 @@ def test_common_uniform_value_reduction_uses_global_sse_and_row_count(
     assert report["eligible_rows"] == 5
     assert report["squared_error_sum"] == 14.0
     assert report["mse"] == pytest.approx(2.8)
+
+
+def test_value_scope_metric_reduction_uses_global_sse_and_row_count(
+    monkeypatch,
+) -> None:
+    def reduce_named(values, _ddp):
+        assert values == {"squared_error_sum": 2.0, "eligible_rows": 1.0}
+        return {"squared_error_sum": 5.0, "eligible_rows": 3.0}
+
+    monkeypatch.setattr("tools.train_bc._reduce_named_sums", reduce_named)
+    report = _reduce_value_scope_clean_outcome_scalar_mse(
+        2.0,
+        1,
+        {"enabled": True, "world_size": 2, "rank": 0, "local_rank": 0},
+        prediction_readout="raw",
+        prediction_scale=1.0,
+    )
+
+    assert report["eligible_rows"] == 3
+    assert report["squared_error_sum"] == 5.0
+    assert report["mse"] == pytest.approx(5.0 / 3.0)
+
+
+def test_excluded_component_cannot_change_value_scope_metric() -> None:
+    scoped_current = {
+        "schema_version": "value-scope-clean-outcome-scalar-mse-v1",
+        "measure": (
+            "uniform_clean_terminal_outcome_rows_with_positive_"
+            "training_value_sample_weight"
+        ),
+        "target": "actor_perspective_terminal_outcome_pm1",
+        "prediction_readout": "raw",
+        "prediction_scale": 1.0,
+        "positive_training_value_sample_weight_scope_applied": True,
+        "training_value_sample_weights_applied": False,
+        "outcome_confidence_applied": False,
+        "truncated_rows_included": False,
+        "root_value_blend_applied": False,
+        "available": True,
+        "eligible_rows": 2,
+        "squared_error_sum": 1.0,
+        "mse": 0.5,
+    }
+    scoped_excluded = {
+        **scoped_current,
+        "available": False,
+        "eligible_rows": 0,
+        "squared_error_sum": 0.0,
+        "mse": None,
+    }
+    common = {
+        "schema_version": "common-uniform-clean-outcome-scalar-mse-v1",
+        "measure": "uniform_clean_terminal_outcome_rows",
+        "target": "actor_perspective_terminal_outcome_pm1",
+        "prediction_readout": "raw",
+        "prediction_scale": 1.0,
+        "training_value_sample_weights_applied": False,
+        "outcome_confidence_applied": False,
+        "truncated_rows_included": False,
+        "root_value_blend_applied": False,
+        "available": True,
+        "eligible_rows": 2,
+        "squared_error_sum": 1.0,
+        "mse": 0.5,
+    }
+
+    def aggregate(excluded_sse: float) -> dict:
+        metrics, _ = _objective_measure_validation_aggregate(
+            [
+                {
+                    "samples": 2,
+                    "loss": 0.5,
+                    "common_uniform_clean_outcome_scalar_mse": common,
+                    "value_scope_clean_outcome_scalar_mse": scoped_current,
+                },
+                {
+                    "samples": 2,
+                    "loss": 0.0,
+                    "common_uniform_clean_outcome_scalar_mse": {
+                        **common,
+                        "squared_error_sum": excluded_sse,
+                        "mse": excluded_sse / 2.0,
+                    },
+                    "value_scope_clean_outcome_scalar_mse": scoped_excluded,
+                },
+            ],
+            np.asarray([0.5, 0.5], dtype=np.float64),
+        )
+        return metrics
+
+    baseline = aggregate(1.0)
+    poisoned = aggregate(200.0)
+
+    assert poisoned["common_uniform_clean_outcome_scalar_mse"]["mse"] > baseline[
+        "common_uniform_clean_outcome_scalar_mse"
+    ]["mse"]
+    assert poisoned["value_scope_clean_outcome_scalar_mse"] == baseline[
+        "value_scope_clean_outcome_scalar_mse"
+    ]
+    assert poisoned["value_scope_clean_outcome_scalar_mse"]["mse"] == pytest.approx(
+        0.5
+    )
 
 
 def test_common_uniform_value_metric_rejects_mismatched_component_contracts() -> None:

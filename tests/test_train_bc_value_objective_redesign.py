@@ -525,6 +525,52 @@ def test_common_uniform_clean_outcome_mse_ignores_recipe_value_weights() -> None
     ]
 
 
+def test_value_scope_clean_outcome_mse_excludes_zero_weight_rows() -> None:
+    torch = pytest.importorskip("torch")
+    policy, data = _validation_fixture()
+    with torch.no_grad():
+        policy.model.marker.fill_(0.5)
+
+    metrics = _evaluate(
+        policy,
+        data,
+        scalar_weight=1.0,
+        categorical_weight=0.0,
+        value_weights=np.asarray([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
+    )
+
+    # The all-component diagnostic still observes all four clean rows.
+    assert metrics["common_uniform_clean_outcome_scalar_mse"]["eligible_rows"] == 4
+    assert metrics["common_uniform_clean_outcome_scalar_mse"]["mse"] == pytest.approx(
+        1.25
+    )
+    # The promotion-facing metric sees only the one row admitted to value
+    # training and does not apply its magnitude as a second weighting.
+    scoped = metrics["value_scope_clean_outcome_scalar_mse"]
+    assert scoped == {
+        "schema_version": "value-scope-clean-outcome-scalar-mse-v1",
+        "measure": (
+            "uniform_clean_terminal_outcome_rows_with_positive_"
+            "training_value_sample_weight"
+        ),
+        "target": "actor_perspective_terminal_outcome_pm1",
+        "prediction_readout": "raw",
+        "prediction_scale": 1.0,
+        "positive_training_value_sample_weight_scope_applied": True,
+        "training_value_sample_weights_applied": False,
+        "outcome_confidence_applied": False,
+        "truncated_rows_included": False,
+        "root_value_blend_applied": False,
+        "available": True,
+        "eligible_rows": 1,
+        "squared_error_sum": pytest.approx(0.25),
+        "mse": pytest.approx(0.25),
+    }
+    assert "value_scope_clean_outcome_scalar_mse" not in metrics[
+        "loss_denominators"
+    ]
+
+
 def test_common_uniform_clean_outcome_mse_excludes_truncated_proxy_targets() -> None:
     torch = pytest.importorskip("torch")
     policy, data = _validation_fixture()
