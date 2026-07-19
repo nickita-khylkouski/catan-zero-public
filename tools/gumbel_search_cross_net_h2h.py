@@ -1349,6 +1349,38 @@ def _prepare_progress_dir(report_path: str) -> str:
     return str(progress_dir)
 
 
+def _iter_worker_pairs(worker_args: dict[str, Any]):
+    """Yield whole paired-seat jobs assigned to one device-affine worker.
+
+    Normal panels use a shared manager queue.  A worker keeps its evaluators
+    and MCTS objects on the device selected at construction, but asks for its
+    *next complete pair* only after its previous pair has finished.  That
+    removes the long tail from fixed modulo shards: a slow Catan game can no
+    longer strand the other GPUs behind the five pairs initially assigned to
+    its device.
+
+    Pair identity, game seed, and the two seat-swap orientations stay attached
+    to the job.  Search RNGs are reset from that identity in
+    ``_reset_game_search_rngs``, so the schedule cannot affect game receipts.
+    The list fallback deliberately remains for direct callers and small unit
+    tests that do not use multiprocessing.
+    """
+    pair_queue = worker_args.get("pair_queue")
+    if pair_queue is None:
+        yield from worker_args.get("pairs", ())
+        return
+
+    while True:
+        pair = pair_queue.get()
+        # ``None`` is a pickling-stable sentinel; object identity sentinels are
+        # not stable across multiprocessing.Manager proxy boundaries.
+        if pair is None:
+            return
+        if not isinstance(pair, dict):
+            raise TypeError(f"pair queue yielded non-dict job: {type(pair)!r}")
+        yield pair
+
+
 def _run_worker(worker_args: dict[str, Any]) -> dict[str, Any]:
     threads_per_worker = int(worker_args.get("threads_per_worker", 0))
     if threads_per_worker > 0:
@@ -1413,7 +1445,7 @@ def _run_worker(worker_args: dict[str, Any]) -> dict[str, Any]:
     archived_sequences: dict[tuple[str, int], Any] = {}
     pinned_replay_scopes: dict[Path, PinnedReplayScope] = {}
     try:
-        for pair in worker_args["pairs"]:
+        for pair in _iter_worker_pairs(worker_args):
             game_seed = int(pair["game_seed"])
             # Isolate failures per pair: one bad game must not discard the whole
             # worker's completed games. A half-finished pair is dropped entirely
@@ -2207,10 +2239,6 @@ def main() -> None:
         import os as _os
 
         _os.environ[name] = str(threads_per_worker)
-    shards: list[list[dict[str, Any]]] = [[] for _ in range(workers)]
-    for i, pair in enumerate(pairs):
-        shards[i % workers].append(pair)
-
     # Multi-GPU: spread workers round-robin across --devices (falls back to --device).
     devices = (
         [d.strip() for d in args.devices.split(",")] if args.devices else [args.device]
@@ -2225,13 +2253,18 @@ def main() -> None:
     # live stop/continue decision use games from the previous run.
     progress_dir = _prepare_progress_dir(args.out)
 
+    # Build one persistent evaluator per worker/device assignment.  Pairs are
+    # dispatched below through a shared queue so a slow game does not leave a
+    # fixed modulo shard as the panel's wall-time tail.  The number of workers
+    # cannot usefully exceed the number of complete paired jobs.
     worker_args = []
-    for worker_index, pair_shard in enumerate(shards):
-        if not pair_shard:
-            continue
+    active_workers = min(workers, len(pairs))
+    for worker_index in range(active_workers):
         args_dict = {
             "worker_index": worker_index,
-            "pairs": pair_shard,
+            # Direct callers retain list scheduling; main replaces this with a
+            # manager-backed work queue immediately before spawn.
+            "pairs": [],
             "candidate_checkpoint": args.candidate,
             "baseline_checkpoint": args.baseline,
             "device": devices[worker_index % len(devices)],
@@ -2361,37 +2394,56 @@ def main() -> None:
 
     started = time.perf_counter()
     if len(worker_args) <= 1:
-        results = [_worker_entry(worker_args[0])] if worker_args else []
+        if worker_args:
+            worker_args[0]["pairs"] = pairs
+            results = [_worker_entry(worker_args[0])]
+        else:
+            results = []
     else:
+        # A Manager queue is intentionally used instead of Queue: this script
+        # uses the spawn context and Pool task arguments are pickled *after*
+        # child processes exist.  A bare multiprocessing.Queue cannot safely
+        # be sent through that path.  Queue traffic is one tiny dict per pair,
+        # dwarfed by a two-game n128 search job.
         ctx = multiprocessing.get_context("spawn")
-        results = []
-        with ctx.Pool(processes=len(worker_args)) as pool:
-            # imap_unordered streams results as each worker finishes, so we can log incremental
-            # completion (and the per-worker progress files give an even finer live read).
-            for done, result in enumerate(
-                pool.imap_unordered(_worker_entry, worker_args), start=1
-            ):
-                results.append(result)
-                _g = sum(len(r.get("games", ())) for r in results)
-                _w = sum(
-                    1
-                    for r in results
-                    for gm in r.get("games", ())
-                    if gm.get("candidate_won")
-                )
-                print(
-                    json.dumps(
-                        {
-                            "progress": "worker_done",
-                            "workers_done": done,
-                            "workers_total": len(worker_args),
-                            "games_so_far": _g,
-                            "candidate_wins_so_far": _w,
-                            "running_winrate": round(_w / _g, 4) if _g else None,
-                        }
-                    ),
-                    flush=True,
-                )
+        with ctx.Manager() as manager:
+            pair_queue = manager.Queue()
+            for pair in pairs:
+                pair_queue.put(pair)
+            for _ in worker_args:
+                pair_queue.put(None)
+            for args_dict in worker_args:
+                args_dict["pair_queue"] = pair_queue
+
+            results = []
+            with ctx.Pool(processes=len(worker_args)) as pool:
+                # imap_unordered streams results as each device-affine worker
+                # drains complete pairs.  Per-worker progress remains useful
+                # while scheduling is now pair-level work stealing.
+                for done, result in enumerate(
+                    pool.imap_unordered(_worker_entry, worker_args), start=1
+                ):
+                    results.append(result)
+                    _g = sum(len(r.get("games", ())) for r in results)
+                    _w = sum(
+                        1
+                        for r in results
+                        for gm in r.get("games", ())
+                        if gm.get("candidate_won")
+                    )
+                    print(
+                        json.dumps(
+                            {
+                                "progress": "worker_done",
+                                "workers_done": done,
+                                "workers_total": len(worker_args),
+                                "games_so_far": _g,
+                                "candidate_wins_so_far": _w,
+                                "running_winrate": round(_w / _g, 4) if _g else None,
+                            }
+                        ),
+                        flush=True,
+                    )
     elapsed = time.perf_counter() - started
 
     all_games: list[dict[str, Any]] = []
@@ -2406,6 +2458,17 @@ def main() -> None:
             )
         for pair_error in result.get("pair_errors") or ():
             errors.append({"worker_index": result.get("worker_index"), **pair_error})
+
+    # Worker completion order is intentionally nondeterministic under dynamic
+    # scheduling.  Canonicalize receipts before summary/write so identical
+    # pair results produce an identically ordered artifact regardless of which
+    # device claimed each job.
+    all_games.sort(
+        key=lambda game: (
+            int(game["pair_id"]),
+            0 if game.get("orientation") == "candidate_red" else 1,
+        )
+    )
 
     outcomes = [
         bool(game["candidate_won"])

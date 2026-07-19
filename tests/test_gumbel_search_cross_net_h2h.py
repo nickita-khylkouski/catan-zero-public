@@ -10,6 +10,7 @@ import sys
 import json
 import copy
 import os
+import queue
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -34,6 +35,7 @@ from gumbel_search_cross_net_h2h import (  # type: ignore  # noqa: E402
     _build_summary,
     _load_held_out_high_regret_suite,
     _new_search_telemetry,
+    _iter_worker_pairs,
     _prepare_progress_dir,
     _resolve_c_scales,
     _resolve_role_search_calibration,
@@ -53,6 +55,40 @@ def test_prepare_progress_dir_removes_stale_worker_tallies(tmp_path: Path) -> No
 
     assert Path(_prepare_progress_dir(str(report))) == progress
     assert list(progress.iterdir()) == []
+
+
+def test_pair_level_work_queue_preserves_whole_seeded_pairs_once() -> None:
+    """Dynamic scheduling moves complete pair receipts, never individual games.
+
+    This is the scheduling contract that lets an idle device claim a slow
+    device's next pair without changing the paired seat-swap seed identity.
+    ``queue.Queue`` exercises the same get/sentinel protocol as the
+    multiprocessing Manager queue without spawning CUDA workers in unit test.
+    """
+    pair_queue: queue.Queue[dict[str, int] | None] = queue.Queue()
+    expected = [
+        {"pair_id": 7, "game_seed": 101},
+        {"pair_id": 8, "game_seed": 102},
+        {"pair_id": 9, "game_seed": 103},
+    ]
+    for pair in expected:
+        pair_queue.put(pair)
+    pair_queue.put(None)
+    pair_queue.put(None)
+
+    first_worker = _iter_worker_pairs({"pair_queue": pair_queue})
+    second_worker = _iter_worker_pairs({"pair_queue": pair_queue})
+    claimed = [next(first_worker), next(second_worker)]
+    claimed.extend(first_worker)
+    claimed.extend(second_worker)
+
+    assert sorted(claimed, key=lambda pair: pair["pair_id"]) == expected
+    assert all(set(pair) == {"pair_id", "game_seed"} for pair in claimed)
+
+
+def test_pair_iterator_keeps_direct_callers_on_their_explicit_pair_list() -> None:
+    pairs = [{"pair_id": 3, "game_seed": 23}]
+    assert list(_iter_worker_pairs({"pairs": pairs})) == pairs
 
 
 def test_zero_game_worker_failure_is_a_failed_evaluation() -> None:
