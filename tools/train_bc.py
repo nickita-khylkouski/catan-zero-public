@@ -2234,6 +2234,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--a1-curriculum-parent-receipt", default="", help=argparse.SUPPRESS
     )
+    parser.add_argument(
+        "--a1-value-only-child-receipt", default="", help=argparse.SUPPRESS
+    )
     parser.add_argument("--a1-batch-probe-plan", default="", help=argparse.SUPPRESS)
     parser.add_argument("--a1-batch-probe-run-id", default="", help=argparse.SUPPRESS)
     parser.add_argument(
@@ -10521,6 +10524,7 @@ def _validate_a1_learner_objective(
         ):
             raise SystemExit("A1 HL-Gauss sigma differs from the contract")
     curriculum_parent = _validate_a1_curriculum_parent(args, bound)
+    value_only_child = _validate_a1_value_only_child_initializer(args, bound)
     expected_initializer_sha256 = bound.get(
         "learner_initializer_sha256", bound["producer_checkpoint_sha256"]
     )
@@ -10554,11 +10558,61 @@ def _validate_a1_learner_objective(
         actual_initializer_sha256 != expected_initializer_sha256
         and not authorized_migrated_initializer
         and curriculum_parent is None
+        and value_only_child is None
     ):
         raise SystemExit(
             "A1 warm-start checkpoint differs from its bound learner initializer"
         )
     args.a1_curriculum_parent = curriculum_parent
+    args.a1_value_only_child_binding = value_only_child
+
+
+def _validate_a1_value_only_child_initializer(
+    args: argparse.Namespace, bound: dict[str, object]
+) -> dict[str, object] | None:
+    """Allow a SHA-bound policy child only for a non-promotable value repair.
+
+    This is deliberately narrower than curriculum chaining: the policy and
+    shared representation are frozen by ``train_value_only`` while the value
+    surface receives an independently selected calibration dose.
+    """
+
+    raw = str(getattr(args, "a1_value_only_child_receipt", "") or "")
+    if not raw:
+        return None
+    from tools import a1_value_only_child
+
+    try:
+        receipt = a1_value_only_child.verify_receipt(raw)
+    except (OSError, a1_value_only_child.ValueOnlyChildError) as error:
+        raise SystemExit(f"A1 value-only child receipt refused: {error}") from error
+    child = receipt["child_checkpoint"]
+    if (
+        receipt["parent_producer"]["sha256"] != bound.get("producer_checkpoint_sha256")
+        or child["sha256"] != getattr(args, "init_checkpoint_sha256", None)
+        or str(Path(str(child["path"])).expanduser().resolve(strict=True))
+        != str(Path(str(args.init_checkpoint)).expanduser().resolve(strict=True))
+    ):
+        raise SystemExit("A1 value-only child receipt does not bind producer/init")
+    forbidden_nonzero = (
+        "policy_aux_active_batch_size",
+        "policy_kl_anchor_weight",
+        "q_loss_weight",
+        "completed_q_loss_weight",
+        "policy_aux_completed_q_loss_weight",
+        "aux_subgoal_loss_weight",
+        "belief_resource_loss_weight",
+    )
+    if (
+        not bool(getattr(args, "train_value_only", False))
+        or getattr(args, "policy_kl_target", None) is not None
+        or float(getattr(args, "policy_dose_lr_area", 0.0)) != 0.0
+        or any(float(getattr(args, name, 0.0)) != 0.0 for name in forbidden_nonzero)
+    ):
+        raise SystemExit(
+            "A1 value-only child requires a policy-disabled value-only objective"
+        )
+    return receipt
 
 
 def _validate_a1_curriculum_parent(
@@ -23236,6 +23290,9 @@ def main(
         "init_checkpoint": args.init_checkpoint or None,
         "init_checkpoint_sha256": str(args.init_checkpoint_sha256) or None,
         "a1_curriculum_parent": getattr(args, "a1_curriculum_parent", None),
+        "a1_value_only_child_binding": getattr(
+            args, "a1_value_only_child_binding", None
+        ),
         "grow_from_checkpoint_sha256": (
             str(args.grow_from_checkpoint_sha256) or None
         ),

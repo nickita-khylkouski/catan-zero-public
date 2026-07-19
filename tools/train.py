@@ -125,6 +125,7 @@ _CANONICAL_RUNTIME_DEFAULTS: dict[str, Any] = {
     "a1_dual_learner_lock": "",
     "a1_dual_reviewed_lock_file_sha256": "",
     "a1_curriculum_parent_receipt": "",
+    "a1_value_only_child_receipt": "",
     "a1_batch_probe_plan": "",
     "a1_batch_probe_run_id": "",
     "save_each_epoch": False,
@@ -273,6 +274,14 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Reviewed non-promotable information-contract migration connecting "
             "--parent-checkpoint to --init-checkpoint. Required for the v6 treatment."
+        ),
+    )
+    parser.add_argument(
+        "--a1-value-only-child-receipt",
+        default="",
+        help=(
+            "Non-promotable receipt authorizing a policy-trained child as the "
+            "initializer for a policy/trunk-frozen value-only calibration pass."
         ),
     )
     parser.add_argument("--device", default="auto")
@@ -684,10 +693,15 @@ def _parent_initializer_binding(
         public_args.init_checkpoint, where="learner initializer"
     )
     receipt_raw = str(public_args.information_contract_migration_receipt or "")
+    child_receipt_raw = str(public_args.a1_value_only_child_receipt or "")
+    if receipt_raw and child_receipt_raw:
+        raise SystemExit(
+            "value-only-child initialization cannot also claim an information migration"
+        )
     if parent["sha256"] == initializer["sha256"]:
-        if receipt_raw:
+        if receipt_raw or child_receipt_raw:
             raise SystemExit(
-                "exact-parent initialization must not claim a migration receipt"
+                "exact-parent initialization must not claim a child or migration receipt"
             )
         return {
             "schema_version": "a1-canonical-parent-initializer-v1",
@@ -695,6 +709,28 @@ def _parent_initializer_binding(
             "parent": parent,
             "initializer": initializer,
             "information_contract_migration": None,
+        }
+    if child_receipt_raw:
+        from tools import a1_value_only_child
+
+        try:
+            child_binding = a1_value_only_child.verify_receipt(child_receipt_raw)
+        except (OSError, a1_value_only_child.ValueOnlyChildError) as error:
+            raise SystemExit(f"value-only child receipt refused: {error}") from error
+        if (
+            not _same_checkpoint_bytes(child_binding.get("parent_producer"), parent)
+            or not _same_checkpoint_bytes(child_binding.get("child_checkpoint"), initializer)
+        ):
+            raise SystemExit(
+                "value-only child receipt must bind the exact parent and initializer"
+            )
+        return {
+            "schema_version": "a1-canonical-parent-initializer-v1",
+            "mode": "value_only_child",
+            "parent": parent,
+            "initializer": initializer,
+            "information_contract_migration": None,
+            "value_only_child": child_binding,
         }
     if not receipt_raw:
         raise SystemExit(
@@ -770,6 +806,26 @@ def _bind_parent_report(
         raise SystemExit("canonical parent report must be a JSON object")
     if not isinstance(canonical_authority, Mapping) or not canonical_authority:
         raise SystemExit("canonical parent report requires non-empty launch authority")
+    if initialization.get("mode") == "value_only_child":
+        child = initialization.get("value_only_child")
+        if not isinstance(child, Mapping):
+            raise SystemExit("value-only child initialization lost its receipt binding")
+        payload["a1_value_only_child_initialization"] = dict(child)
+        payload["a1_parent_update_initialization"] = dict(initialization)
+        payload["a1_canonical_parent_update_authority"] = dict(canonical_authority)
+        payload["promotion_eligible"] = False
+        payload["promotion_block_reason"] = "value_only_child_calibration_nonpromotable"
+        temporary = path.with_name(f".{path.name}.tmp.{os.getpid()}.{time.time_ns()}")
+        try:
+            with temporary.open("x", encoding="utf-8") as handle:
+                json.dump(payload, handle, indent=2, sort_keys=True)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
+        return
     steps = payload.get("steps_completed")
     sampled_rows = payload.get("base_training_row_draws")
     if (
