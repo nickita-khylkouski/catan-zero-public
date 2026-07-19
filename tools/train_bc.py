@@ -22607,20 +22607,21 @@ def main(
                     where="completed training dose",
                 )
             )
-            objective_gradient_signal_admission = (
-                feature_signal_admission.verify_objective_interference(
-                    objective_gradient_interference,
-                    cadence_batches=int(
-                        args.objective_gradient_interference_every_batches
-                    ),
-                    minimum_observations=minimum_feature_observations,
-                    expected_world_size=int(ddp["world_size"]),
-                    expected_value_trunk_grad_scale=float(
-                        args.value_trunk_grad_scale
-                    ),
-                    where="completed training dose",
+            if not bool(args.train_value_only):
+                objective_gradient_signal_admission = (
+                    feature_signal_admission.verify_objective_interference(
+                        objective_gradient_interference,
+                        cadence_batches=int(
+                            args.objective_gradient_interference_every_batches
+                        ),
+                        minimum_observations=minimum_feature_observations,
+                        expected_world_size=int(ddp["world_size"]),
+                        expected_value_trunk_grad_scale=float(
+                            args.value_trunk_grad_scale
+                        ),
+                        where="completed training dose",
+                    )
                 )
-            )
         except feature_signal_admission.FeatureSignalError as error:
             raise RuntimeError(
                 "terminal checkpoint refused by feature learning-signal "
