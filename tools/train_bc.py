@@ -10587,8 +10587,11 @@ def _validate_a1_value_only_child_initializer(
     except (OSError, a1_value_only_child.ValueOnlyChildError) as error:
         raise SystemExit(f"A1 value-only child receipt refused: {error}") from error
     child = receipt["child_checkpoint"]
+    expected_parent_sha = bound.get(
+        "learner_initializer_sha256", bound.get("producer_checkpoint_sha256")
+    )
     if (
-        receipt["parent_producer"]["sha256"] != bound.get("producer_checkpoint_sha256")
+        receipt["parent_producer"]["sha256"] != expected_parent_sha
         or child["sha256"] != getattr(args, "init_checkpoint_sha256", None)
         or str(Path(str(child["path"])).expanduser().resolve(strict=True))
         != str(Path(str(args.init_checkpoint)).expanduser().resolve(strict=True))
