@@ -16,11 +16,14 @@ import os
 from pathlib import Path
 import sys
 
+import numpy as np
+
 # Direct ``python tools/...py`` execution puts ``tools/`` rather than the
 # repository root on sys.path.  Keep the CLI usable by the sealed executor.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from tools import train_bc
+from catan_zero.rl.memmap_corpus import MemmapCorpus
 
 
 class OverlayError(RuntimeError):
@@ -113,18 +116,105 @@ def _write_once(path: Path, payload: dict[str, object]) -> None:
     os.replace(temporary, path)
 
 
+def _canonical_validation_contract(
+    *, corpus_dir: Path, source: Path, output: Path | None
+) -> Path:
+    """Accept an exact holdout or convert a trainer receipt into one once.
+
+    Older Stage-C receipts contain the exact game seed set but include runtime
+    fields and omit the held-out row count.  The descriptor contract requires a
+    smaller immutable sidecar.  Derive it from the authenticated corpus rather
+    than recomputing a nominal split.
+    """
+
+    source = source.resolve(strict=True)
+    payload = json.loads(source.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise OverlayError("validation source is not an object")
+    exact_fields = {
+        "schema_version",
+        "a1_contract_sha256",
+        "validation_fraction",
+        "validation_seed",
+        "validation_max_samples",
+        "validation_game_seed_ranges",
+        "validation_game_seed_count",
+        "validation_row_count",
+        "validation_game_seed_set_sha256",
+        "game_seeds",
+    }
+    if set(payload) == exact_fields:
+        return source
+    if output is None:
+        raise OverlayError(
+            "trainer validation receipt needs --validation-contract-output"
+        )
+    required = {
+        "a1_contract_sha256",
+        "validation_fraction",
+        "validation_seed",
+        "validation_max_samples",
+        "game_seeds",
+    }
+    if not required.issubset(payload):
+        raise OverlayError("validation source lacks an exact Stage-C seed receipt")
+    raw_seeds = payload["game_seeds"]
+    if (
+        not isinstance(raw_seeds, list)
+        or not raw_seeds
+        or any(isinstance(seed, bool) or not isinstance(seed, int) for seed in raw_seeds)
+    ):
+        raise OverlayError("validation source game seeds are invalid")
+    seeds = np.asarray(raw_seeds, dtype=np.int64)
+    if not np.all(seeds[1:] > seeds[:-1]):
+        raise OverlayError("validation source game seeds are not sorted and unique")
+    corpus = MemmapCorpus(corpus_dir)
+    game_seeds = np.asarray(corpus["game_seed"], dtype=np.int64)
+    validation_rows = int(np.count_nonzero(np.isin(game_seeds, seeds)))
+    if validation_rows <= 0:
+        raise OverlayError("validation source selects no rows in this corpus")
+    contract = {
+        "schema_version": "train-validation-game-seeds-v1",
+        "a1_contract_sha256": payload["a1_contract_sha256"],
+        "validation_fraction": payload["validation_fraction"],
+        "validation_seed": payload["validation_seed"],
+        "validation_max_samples": payload["validation_max_samples"],
+        "validation_game_seed_ranges": [],
+        "validation_game_seed_count": int(seeds.size),
+        "validation_row_count": validation_rows,
+        "validation_game_seed_set_sha256": train_bc._game_seed_set_sha256(seeds),
+        "game_seeds": seeds.tolist(),
+    }
+    _write_once(output.resolve(), contract)
+    return output.resolve()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--corpus-dir", required=True)
     parser.add_argument("--validation-manifest", required=True)
+    parser.add_argument(
+        "--validation-contract-output",
+        default="",
+        help="required only when --validation-manifest is an older trainer receipt",
+    )
     parser.add_argument("--output", required=True)
     parser.add_argument("--component-id", default="stage_c")
     parser.add_argument("--phase-weight", action="append", default=[])
     args = parser.parse_args()
     phase_weights = _parse_phase_weights(list(args.phase_weight))
+    validation_manifest = _canonical_validation_contract(
+        corpus_dir=Path(args.corpus_dir),
+        source=Path(args.validation_manifest),
+        output=(
+            None
+            if not args.validation_contract_output
+            else Path(args.validation_contract_output)
+        ),
+    )
     payload = build_overlay(
         corpus_dir=Path(args.corpus_dir),
-        validation_manifest=Path(args.validation_manifest),
+        validation_manifest=validation_manifest,
         component_id=str(args.component_id),
         phase_weights=phase_weights,
     )
