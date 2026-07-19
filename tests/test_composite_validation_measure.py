@@ -71,6 +71,39 @@ def test_policy_aux_validation_reconstructs_the_training_objective() -> None:
     assert combined["policy_aux_validation_effective_weight_sum"] == 3.0
 
 
+def test_policy_aux_validation_can_disable_base_policy_and_anchor() -> None:
+    """AUX-only trust-region validation must not retain base-stream KL."""
+
+    combined = _combine_policy_aux_validation_metrics(
+        {
+            "loss": 2.0,
+            "policy_loss": 0.5,
+            "value_loss": 1.5,
+            "policy_kl_anchor_loss": 0.1,
+            "loss_denominators": {"policy_kl_anchor_loss": 10.0},
+        },
+        {
+            "samples": 40,
+            "policy_loss": 1.2,
+            "policy_kl_anchor_loss": 0.5,
+            "loss_denominators": {
+                "policy_loss": 3.0,
+                "policy_kl_anchor_loss": 6.0,
+            },
+        },
+        policy_loss_weight=1.0,
+        policy_base_loss_weight=0.0,
+        policy_aux_loss_weight=1.0,
+        policy_kl_anchor_weight=0.4,
+    )
+
+    assert combined["policy_loss"] == pytest.approx(1.2)
+    assert combined["policy_kl_anchor_loss"] == pytest.approx(0.5)
+    assert combined["policy_kl_anchor_controller_measure"] == pytest.approx(0.5)
+    assert combined["policy_kl_anchor_controller_weight_sum"] == pytest.approx(6.0)
+    assert combined["loss"] == pytest.approx(2.86)
+
+
 def test_policy_aux_validation_reconstructs_opening_value_mix() -> None:
     combined = _combine_policy_aux_validation_metrics(
         {
