@@ -157,7 +157,7 @@
       "training_excluded_game_seed_set_sha256": "",
       "training_rng_rank_offset": true,
       "truncated_vp_margin_value_weight": 0.25,
-      "trunk_lr_mult": 0.25,
+      "trunk_lr_mult": 1.0,
       "validation_contract_file_sha256": "",
       "validation_fraction": 0.05,
       "validation_game_seed_ranges": "",

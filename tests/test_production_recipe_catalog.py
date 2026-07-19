@@ -327,6 +327,7 @@ def test_v15_split1_value_repair_is_value_only_and_authenticated() -> None:
     )
     assert fields["lr_warmup_steps"] == 0
     assert fields["max_steps"] == 32
+    assert fields["trunk_lr_mult"] == 1.0
     assert payload["engine_settings"]["value_tower_split_layers"] == 1
 
 
