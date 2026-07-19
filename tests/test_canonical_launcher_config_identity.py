@@ -213,6 +213,24 @@ def test_canonical_evaluation_forwards_cpu_placement(
     assert forwarded[index + 1] == str(threads_per_worker)
 
 
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    (
+        ("0,1,2,3", "cuda:0,cuda:1,cuda:2,cuda:3"),
+        (" cuda:0, cuda:1 ", "cuda:0,cuda:1"),
+        ("cpu", "cpu"),
+    ),
+)
+def test_canonical_evaluation_normalizes_devices(raw: str, expected: str) -> None:
+    assert evaluate._normalize_devices(raw) == expected  # noqa: SLF001
+
+
+@pytest.mark.parametrize("raw", ("", "0,,1", "N", "cuda:N"))
+def test_canonical_evaluation_rejects_invalid_devices(raw: str) -> None:
+    with pytest.raises(ValueError, match="devices"):
+        evaluate._normalize_devices(raw)  # noqa: SLF001
+
+
 def test_canonical_evaluation_attests_native_runtime_before_exec(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

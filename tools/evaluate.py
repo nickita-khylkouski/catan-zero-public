@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Sequence
@@ -33,6 +34,7 @@ from tools import production_runtime_contract  # noqa: E402
 
 
 CANONICAL_OPTION_COUNT = 10
+_DEVICE_PATTERN = re.compile(r"(?:cpu|mps|cuda(?::[0-9]+)?)")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -53,6 +55,32 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--base-seed", type=int, required=True)
     parser.add_argument("--held-out-suite", type=Path)
     return parser
+
+
+def _normalize_devices(value: str) -> str:
+    """Return an executor-safe comma-separated device list.
+
+    CUDA launchers commonly set ``CUDA_VISIBLE_DEVICES`` and then pass logical
+    ordinals such as ``0,1``.  Torch does not accept those bare ordinals as
+    device strings, so normalize them before any evaluator workers are
+    spawned.  Reject other malformed values here instead of turning a launch
+    typo into a successful-looking zero-game panel.
+    """
+
+    tokens = [token.strip() for token in value.split(",")]
+    if not tokens or any(not token for token in tokens):
+        raise ValueError("--devices must be a non-empty comma-separated device list")
+    normalized = [
+        f"cuda:{int(token)}" if token.isdecimal() else token for token in tokens
+    ]
+    invalid = [token for token in normalized if _DEVICE_PATTERN.fullmatch(token) is None]
+    if invalid:
+        raise ValueError(
+            "invalid --devices token(s) "
+            f"{invalid!r}; use logical CUDA ordinals (for example 0,1) or "
+            "torch device strings (for example cuda:0,cuda:1)"
+        )
+    return ",".join(normalized)
 
 
 def _validate_config(path: Path) -> None:
@@ -188,6 +216,10 @@ def main(argv: Sequence[str] | None = None) -> None:
         parser.error("--threads-per-worker must be non-negative")
     if args.base_seed < 0:
         parser.error("--base-seed must be non-negative")
+    try:
+        args.devices = _normalize_devices(args.devices)
+    except ValueError as error:
+        parser.error(str(error))
     try:
         _validate_config(args.config.expanduser())
     except ValueError as error:

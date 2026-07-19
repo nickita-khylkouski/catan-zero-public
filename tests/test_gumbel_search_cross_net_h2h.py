@@ -55,6 +55,22 @@ def test_prepare_progress_dir_removes_stale_worker_tallies(tmp_path: Path) -> No
     assert list(progress.iterdir()) == []
 
 
+def test_zero_game_worker_failure_is_a_failed_evaluation() -> None:
+    assert h2h._evaluation_exit_code(  # noqa: SLF001
+        {
+            "games_played": 0,
+            "errors": [{"worker_index": 0, "error": "invalid device"}],
+        }
+    ) == 1
+
+
+def test_completed_or_intentionally_empty_evaluation_does_not_false_fail() -> None:
+    assert h2h._evaluation_exit_code(  # noqa: SLF001
+        {"games_played": 2, "errors": [{"worker_index": 1, "error": "partial failure"}]}
+    ) == 0
+    assert h2h._evaluation_exit_code({"games_played": 0, "errors": []}) == 0  # noqa: SLF001
+
+
 def test_role_specific_raw_policy_thresholds_enable_three_panel_decomposition() -> None:
     shared = SimpleNamespace(
         raw_policy_above_width=None,

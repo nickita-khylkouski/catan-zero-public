@@ -814,6 +814,14 @@ def _worker_entry(worker_args: dict[str, Any]) -> dict[str, Any]:
         }
 
 
+def _evaluation_exit_code(summary: dict[str, Any]) -> int:
+    """Make a total evaluator failure visible to launch orchestration."""
+
+    if int(summary.get("games_played", 0)) == 0 and summary.get("errors"):
+        return 1
+    return 0
+
+
 def _resolve_value_readouts(args: Any) -> tuple[str, str]:
     """Return the effective candidate/baseline value readouts.
 
@@ -2460,6 +2468,9 @@ def main() -> None:
             {k: v for k, v in summary.items() if k != "games"}, indent=2, sort_keys=True
         )
     )
+    exit_code = _evaluation_exit_code(summary)
+    if exit_code:
+        raise SystemExit(exit_code)
 
 
 def _build_summary(
