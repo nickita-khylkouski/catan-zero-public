@@ -329,6 +329,15 @@ def test_v15_split1_value_repair_is_value_only_and_authenticated() -> None:
     assert fields["max_steps"] == 32
     assert fields["trunk_lr_mult"] == 1.0
     assert payload["engine_settings"]["value_tower_split_layers"] == 1
+    required_signal_modules = set(
+        payload["engine_settings"]["require_feature_learning_signal_modules"].split(
+            ","
+        )
+    )
+    assert {"value_blocks", "value_head", "value_state_norm"} <= (
+        required_signal_modules
+    )
+    assert "action_cross_blocks" not in required_signal_modules
 
 
 def test_v15_auxonly_recipe_uses_authenticated_teacher_batch_exclusively() -> None:
