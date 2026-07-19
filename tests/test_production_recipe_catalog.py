@@ -321,6 +321,10 @@ def test_v15_split1_value_repair_is_value_only_and_authenticated() -> None:
     assert fields["train_value_only"] is True
     assert fields["policy_aux_active_batch_size"] == 0
     assert fields["policy_aux_loss_weight"] == 1.0
+    assert (
+        fields["policy_aux_sampling_mode"]
+        == "weighted_with_replacement_legacy_v1"
+    )
     assert fields["lr_warmup_steps"] == 0
     assert fields["max_steps"] == 32
     assert payload["engine_settings"]["value_tower_split_layers"] == 1
