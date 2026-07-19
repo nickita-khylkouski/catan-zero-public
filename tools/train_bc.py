@@ -16307,7 +16307,11 @@ def main(
             data,
             args.data,
             mask_hidden_info=bool(args.mask_hidden_info),
-            policy_loss_weight=float(args.policy_loss_weight),
+            policy_loss_weight=(
+                0.0
+                if bool(args.train_value_only)
+                else float(args.policy_loss_weight)
+            ),
             train_value_only=bool(args.train_value_only),
             production=bool(args.require_production_35m_teacher),
             acknowledged_authoritative_targets=bool(
@@ -16374,7 +16378,11 @@ def main(
             policy_target_blend_semantics=str(
                 args.policy_target_blend_semantics
             ),
-            policy_loss_weight=float(args.policy_loss_weight),
+            policy_loss_weight=(
+                0.0
+                if bool(args.train_value_only)
+                else float(args.policy_loss_weight)
+            ),
             q_loss_weight=float(args.q_loss_weight),
             completed_q_loss_weight=float(args.completed_q_loss_weight),
             policy_aux_completed_q_loss_weight=float(
