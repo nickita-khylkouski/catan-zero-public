@@ -1,0 +1,104 @@
+{
+  "schema_version": "a1-stage-c-objective-authority-v1",
+  "date_utc": "2026-07-19",
+  "scope": "2p_no_trade_v15_short_dose_parent_update",
+  "parent": {
+    "checkpoint": "v8-historyfixed-action25-shared-action25-v15/candidate.pt",
+    "sha256": "sha256:10ed4ae2a8de9f9c5db791facd02402d4d5ef840e05c30f183691b826f7dfc26"
+  },
+  "root_cause": {
+    "summary": "The legacy joint policy objective gave a sparse base branch most of the optimization authority even though the authenticated active-policy branch carried far more teacher evidence.",
+    "base_policy_rows_seen": 222,
+    "aux_policy_rows_seen": 6144,
+    "legacy_base_coefficient": 1.0,
+    "legacy_aux_coefficient": 0.1,
+    "legacy_base_objective_share_approx": 0.91,
+    "implication": "The learner optimized a small noisy sample more strongly than the complete authenticated teacher stream."
+  },
+  "implemented_repairs": [
+    {
+      "name": "independent_base_policy_coefficient",
+      "field": "policy_base_loss_weight",
+      "default": 1.0,
+      "semantics": "policy_loss_weight * (policy_base_loss_weight * base_mean + policy_aux_loss_weight * aux_mean)"
+    },
+    {
+      "name": "aux_only_causal_recipe",
+      "config": "configs/training/a1_v15_auxonly_base0_aux1_warmup0_step12_35m_b200.schema1.json",
+      "base_coefficient": 0.0,
+      "aux_coefficient": 1.0,
+      "steps": 12,
+      "optimizer_initialization": "exact_parent_fresh_adamw"
+    },
+    {
+      "name": "independent_value_only_repair_path",
+      "config": "configs/training/a1_v15_split1_value_repair_warmup0_step32_35m_b200.schema1.json",
+      "policy_objective": "disabled",
+      "shared_trunk": "frozen",
+      "value_surface": "trainable"
+    }
+  ],
+  "causal_results": {
+    "legacy_corrected_production_teacher_gap_closure": 0.02728624,
+    "aux_only": {
+      "candidate_sha256": "sha256:bec31af8412e4866d750e7db433ae250e4855550e2754e3c5b6ff2370178c0cb",
+      "authenticated_teacher_rows": 6144,
+      "frontier": [
+        {
+          "step": 4,
+          "teacher_gap_closure": 0.03835989,
+          "scoped_outcome_mse": 0.6283117
+        },
+        {
+          "step": 8,
+          "teacher_gap_closure": 0.05481043,
+          "scoped_outcome_mse": 0.6438691
+        },
+        {
+          "step": 10,
+          "teacher_gap_closure": 0.05804791,
+          "scoped_outcome_mse": 0.6328631
+        },
+        {
+          "step": 12,
+          "teacher_gap_closure": 0.06149396,
+          "scoped_outcome_mse": 0.6311814
+        }
+      ],
+      "closure_multiple_vs_legacy_corrected_production": 2.2537
+    },
+    "value_only": {
+      "candidate_sha256": "sha256:275ad6d88a94eb7fb508e45575fe196619e5ad154a352f7128b834ac752365e9",
+      "frontier": [
+        {
+          "step": 8,
+          "scoped_outcome_mse": 0.6348067616
+        },
+        {
+          "step": 12,
+          "scoped_outcome_mse": 0.6255577263
+        },
+        {
+          "step": 16,
+          "scoped_outcome_mse": 0.626175724
+        },
+        {
+          "step": 24,
+          "scoped_outcome_mse": 0.6288009662
+        },
+        {
+          "step": 32,
+          "scoped_outcome_mse": 0.6283126587
+        }
+      ],
+      "selected_step": 12,
+      "finding": "The isolated value surface has a short U-shaped dose frontier; longer training is not automatically better."
+    }
+  },
+  "decision": {
+    "policy": "Use the authenticated active-policy stream as the sole policy optimization authority for the next parent-update recipe.",
+    "value": "Commission value learning independently at its step-12 frontier instead of coupling its dose to policy steps.",
+    "sampler": "Stop sampler micro-tuning: the wide-choice variant was neutral at 52-48 over 100 paired games while the objective-authority correction more than doubled teacher closure.",
+    "promotion": "Strength promotion remains conditional on matched coherent-public n128 H2H."
+  }
+}
