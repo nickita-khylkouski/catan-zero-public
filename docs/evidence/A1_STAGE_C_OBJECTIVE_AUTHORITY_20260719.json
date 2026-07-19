@@ -69,6 +69,7 @@
     },
     "value_only": {
       "candidate_sha256": "sha256:275ad6d88a94eb7fb508e45575fe196619e5ad154a352f7128b834ac752365e9",
+      "exact_parent_scoped_outcome_mse": 0.6328304944724774,
       "frontier": [
         {
           "step": 8,
@@ -92,7 +93,10 @@
         }
       ],
       "selected_step": 12,
-      "finding": "The isolated value surface has a short U-shaped dose frontier; longer training is not automatically better."
+      "selected_scoped_outcome_mse": 0.6255577262623517,
+      "absolute_mse_improvement_vs_exact_parent": 0.0072727682101257,
+      "relative_mse_improvement_vs_exact_parent": 0.0114924,
+      "finding": "The isolated value surface improves the exact parent by 1.149% MSE at step 12 and has a short U-shaped dose frontier; longer training is not automatically better."
     }
   },
   "decision": {
