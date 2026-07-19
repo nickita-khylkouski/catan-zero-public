@@ -37,7 +37,6 @@ RUN_RECEIPT_SCHEMA = "catan-zero-production-run-v1"
 _RUN_ID = re.compile(r"^[a-z0-9][a-z0-9._-]{2,95}$")
 _CUDA_DEVICE = re.compile(r"^cuda:(0|[1-9][0-9]*)$")
 _SCRATCH_TRAIN_RECIPE = "a1-current-35m-b200"
-_PARENT_UPDATE_RECIPE_PREFIX = "a1-parent-update-"
 _COMMON_KEYS = {"schema_version", "pipeline", "run_id", "run_dir"}
 _PIPELINE_KEYS = {
     "generate": {
@@ -77,7 +76,24 @@ class ProductionCLIError(RuntimeError):
 
 
 def _is_parent_update_recipe(value: object) -> bool:
-    return isinstance(value, str) and value.startswith(_PARENT_UPDATE_RECIPE_PREFIX)
+    """Classify an authenticated recipe by initializer semantics, not its name.
+
+    Recipe names are human-facing catalog identities.  Treating the
+    ``a1-parent-update-`` prefix as an execution role caused a cataloged
+    parent-fresh recipe with a different experimental lineage name to skip the
+    parent-update output verifier.  Replay the authenticated config instead so
+    new names cannot silently weaken output admission.
+    """
+
+    if not isinstance(value, str) or not value:
+        return False
+    try:
+        return (
+            training_initialization_mode(repo_root(), value)
+            == "parent_fresh_optimizer"
+        )
+    except ProductionContractError:
+        return False
 
 
 def repo_root() -> Path:
@@ -1192,9 +1208,13 @@ def _require_parent_lr_dose(
     dose = report.get("optimizer_lr_dose")
     groups = dose.get("parameter_groups") if isinstance(dose, Mapping) else None
     warmup = int(fields["lr_warmup_steps"])
-    if fields["lr_schedule"] != "flat" or warmup <= 0:
+    if fields["lr_schedule"] != "flat" or warmup < 0:
         raise ProductionCLIError("parent-update LR schedule contract drifted")
-    area = sum(min(1.0, (step + 1) / warmup) for step in range(max_steps))
+    area = (
+        float(max_steps)
+        if warmup == 0
+        else sum(min(1.0, (step + 1) / warmup) for step in range(max_steps))
+    )
     if (
         not isinstance(dose, Mapping)
         or dose.get("schema_version") != "optimizer-lr-dose-v2"
@@ -1525,7 +1545,8 @@ def _require_parent_policy_objective(
     row: Mapping[str, Any],
     *,
     step: int,
-    policy_active: int,
+    base_active: int,
+    aux_active: int,
     base_mass: float,
     aux_mass: float,
     base_coefficient: float,
@@ -1537,6 +1558,11 @@ def _require_parent_policy_objective(
     expected_coefficient = aux_coefficient if aux_enabled else 0.0
     weighted_mass = (
         base_coefficient * base_mass + expected_coefficient * aux_mass
+    )
+    policy_active = base_active + aux_active
+    equivalent_active = (
+        base_coefficient * float(base_active)
+        + expected_coefficient * float(aux_active)
     )
     legacy_stream = bool(
         isinstance(stream, Mapping)
@@ -1589,7 +1615,7 @@ def _require_parent_policy_objective(
                 field="equivalent policy active rows",
                 minimum=0.0,
             ),
-            float(policy_active),
+            equivalent_active,
             rel_tol=1.0e-12,
         )
         or not math.isclose(
@@ -1769,7 +1795,8 @@ def _verify_parent_update_outputs(
             _require_parent_policy_objective(
                 row,
                 step=step,
-                policy_active=policy_total,
+                base_active=policy_base,
+                aux_active=expected_aux,
                 base_mass=base_mass,
                 aux_mass=aux_mass,
                 base_coefficient=base_coefficient,

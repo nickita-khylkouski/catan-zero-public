@@ -1174,6 +1174,7 @@ def _parent_update_admissible_report(
     }
 
     aux_batch_size = int(fields["policy_aux_active_batch_size"])
+    base_coefficient = float(fields.get("policy_base_loss_weight", 1.0))
     aux_coefficient = float(fields["policy_aux_loss_weight"])
 
     def dose_row(step: int) -> dict[str, object]:
@@ -1182,8 +1183,11 @@ def _parent_update_admissible_report(
         base_mass = float(base_draws)
         aux_mass = float(aux_draws)
         total_mass = base_mass + aux_mass
-        weighted_mass = base_mass + (
+        weighted_mass = base_coefficient * base_mass + (
             aux_coefficient * aux_mass if aux_draws > 0 else 0.0
+        )
+        equivalent_active_rows = base_coefficient * base_draws + (
+            aux_coefficient * aux_draws if aux_draws > 0 else 0.0
         )
         optimizer = {
             "observed_steps": step,
@@ -1212,7 +1216,7 @@ def _parent_update_admissible_report(
             },
             "policy_objective_dose": {
                 "active_rows": base_draws + aux_draws,
-                "equivalent_active_rows": float(base_draws + aux_draws),
+                "equivalent_active_rows": float(equivalent_active_rows),
                 "coefficient_weighted_effective_weight_sum": weighted_mass,
                 "equivalent_effective_weight_sum": weighted_mass,
                 "optimizer_updates": step,
@@ -1224,10 +1228,21 @@ def _parent_update_admissible_report(
                 "total": total_mass,
             },
             "policy_stream_objective": {
-                "schema_version": "train-policy-stream-objective-v1",
-                "formula": "base_mean + aux_coefficient * aux_mean",
+                "schema_version": (
+                    "train-policy-stream-objective-v1"
+                    if base_coefficient == 1.0
+                    else "train-policy-stream-objective-v2"
+                ),
+                "formula": (
+                    "base_mean + aux_coefficient * aux_mean"
+                    if base_coefficient == 1.0
+                    else (
+                        "base_coefficient * base_mean + "
+                        "aux_coefficient * aux_mean"
+                    )
+                ),
                 "normalization": "independent_weighted_means",
-                "base_coefficient": 1.0,
+                "base_coefficient": base_coefficient,
                 "aux_enabled": aux_draws > 0,
                 "aux_coefficient": aux_coefficient if aux_draws > 0 else 0.0,
                 "base_denominator": base_mass,
@@ -1262,8 +1277,14 @@ def _parent_update_admissible_report(
 
     trajectory_rows = [dose_row(step) for step in terminal_steps]
     terminal_dose = trajectory_rows[-1]
-    multiplier_area = sum(
-        (step + 1) / int(fields["lr_warmup_steps"]) for step in range(max_steps)
+    warmup_steps = int(fields["lr_warmup_steps"])
+    multiplier_area = (
+        float(max_steps)
+        if warmup_steps == 0
+        else sum(
+            min(1.0, (step + 1) / warmup_steps)
+            for step in range(max_steps)
+        )
     )
     base_lr = float(fields["lr"])
     semantic_multipliers = {"base": 1.0}
@@ -1319,6 +1340,7 @@ def _parent_update_admissible_report(
         "weight_decay": float(fields["weight_decay"]),
         "policy_loss_weight": float(fields["policy_loss_weight"]),
         "policy_aux_active_batch_size": aux_batch_size,
+        "policy_base_loss_weight": base_coefficient,
         "policy_aux_loss_weight": aux_coefficient,
         "policy_aux_sampling_mode": fields["policy_aux_sampling_mode"],
         "value_lr_mult": float(fields["value_lr_mult"]),
@@ -1468,6 +1490,7 @@ def _parent_validation_fixture(
         "a1-parent-update-value25-35m-b200",
         "a1-parent-update-active-p10-35m-b200",
         "a1-parent-update-active-p25-35m-b200",
+        "a1-v15-auxonly-base0-aux1-warmup0-step12",
     ),
 )
 def test_parent_update_validator_accepts_every_catalog_recipe(
@@ -1484,9 +1507,13 @@ def test_parent_update_validator_accepts_every_catalog_recipe(
         checkpoint_ref=checkpoint_ref,
     )
 
+    expected_steps = (
+        {4, 8, 10}
+        if recipe == "a1-v15-auxonly-base0-aux1-warmup0-step12"
+        else {8, 10}
+    )
     assert set(admitted) == {
-        "training_checkpoint_step_000008",
-        "training_checkpoint_step_000010",
+        f"training_checkpoint_step_{step:06d}" for step in expected_steps
     }
     if recipe in {
         "a1-parent-update-35m-b200",
@@ -1498,6 +1525,90 @@ def test_parent_update_validator_accepts_every_catalog_recipe(
             "base",
             "trunk",
         ]
+
+
+def test_parent_update_role_uses_authenticated_initializer_not_name_prefix() -> None:
+    assert cli._is_parent_update_recipe(  # noqa: SLF001
+        "a1-v15-auxonly-base0-aux1-warmup0-step12"
+    )
+    assert not cli._is_parent_update_recipe("a1-current-35m-b200")  # noqa: SLF001
+    assert not cli._is_parent_update_recipe("a1-parent-update-not-cataloged")  # noqa: SLF001
+
+
+def test_parent_update_lr_dose_accepts_authenticated_zero_warmup(
+    tmp_path: Path,
+) -> None:
+    plan, report, _checkpoint, _checkpoint_ref = _parent_validation_fixture(
+        tmp_path,
+        recipe="a1-v15-auxonly-base0-aux1-warmup0-step12",
+    )
+    fields, engine = cli._parent_update_recipe(plan)  # noqa: SLF001
+
+    cli._require_parent_lr_dose(  # noqa: SLF001
+        report,
+        fields,
+        max_steps=int(fields["max_steps"]),
+    )
+
+    assert int(fields["lr_warmup_steps"]) == 0
+    assert report["optimizer_lr_dose"]["integrated_schedule_multiplier_area"] == 12.0
+    assert engine["initialization_mode"] == "parent_fresh_optimizer"
+
+
+def test_parent_policy_dose_separates_raw_and_coefficient_weighted_rows() -> None:
+    row = {
+        "policy_stream_objective": {
+            "schema_version": "train-policy-stream-objective-v2",
+            "formula": (
+                "base_coefficient * base_mean + "
+                "aux_coefficient * aux_mean"
+            ),
+            "normalization": "independent_weighted_means",
+            "base_coefficient": 0.0,
+            "aux_enabled": True,
+            "aux_coefficient": 1.0,
+            "base_denominator": 10.0,
+            "aux_denominator": 20.0,
+        },
+        "policy_objective_dose": {
+            "active_rows": 30,
+            "equivalent_active_rows": 20.0,
+            "coefficient_weighted_effective_weight_sum": 20.0,
+            "equivalent_effective_weight_sum": 20.0,
+            "optimizer_updates": 1,
+            "equivalent_optimizer_updates": 1.0,
+        },
+    }
+
+    assert (
+        cli._require_parent_policy_objective(  # noqa: SLF001
+            row,
+            step=1,
+            base_active=10,
+            aux_active=20,
+            base_mass=10.0,
+            aux_mass=20.0,
+            base_coefficient=0.0,
+            aux_coefficient=1.0,
+        )
+        == 20.0
+    )
+
+    row["policy_objective_dose"]["equivalent_active_rows"] = 30.0
+    with pytest.raises(
+        cli.ProductionCLIError,
+        match="coefficient-weighted policy objective drifted",
+    ):
+        cli._require_parent_policy_objective(  # noqa: SLF001
+            row,
+            step=1,
+            base_active=10,
+            aux_active=20,
+            base_mass=10.0,
+            aux_mass=20.0,
+            base_coefficient=0.0,
+            aux_coefficient=1.0,
+        )
 
 
 @pytest.mark.parametrize(
