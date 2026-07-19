@@ -16,14 +16,11 @@ import os
 from pathlib import Path
 import sys
 
-import numpy as np
-
 # Direct ``python tools/...py`` execution puts ``tools/`` rather than the
 # repository root on sys.path.  Keep the CLI usable by the sealed executor.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from tools import train_bc
-from catan_zero.rl.memmap_corpus import MemmapCorpus
 
 
 class OverlayError(RuntimeError):
@@ -116,15 +113,13 @@ def _write_once(path: Path, payload: dict[str, object]) -> None:
     os.replace(temporary, path)
 
 
-def _canonical_validation_contract(
-    *, corpus_dir: Path, source: Path, output: Path | None
-) -> Path:
-    """Accept an exact holdout or convert a trainer receipt into one once.
+def _canonical_validation_contract(*, corpus_dir: Path, source: Path) -> Path:
+    """Return the audit-bound holdout rather than reconstructing one.
 
-    Older Stage-C receipts contain the exact game seed set but include runtime
-    fields and omit the held-out row count.  The descriptor contract requires a
-    smaller immutable sidecar.  Derive it from the authenticated corpus rather
-    than recomputing a nominal split.
+    Older Stage-C trainer receipts retain the selected seed list but are not
+    the exact sidecar authenticated by the post-wave audit.  Recomputing an
+    equivalent sidecar would weaken that binding, so resolve the original
+    immutable holdout from corpus metadata and require identical game seeds.
     """
 
     source = source.resolve(strict=True)
@@ -145,59 +140,27 @@ def _canonical_validation_contract(
     }
     if set(payload) == exact_fields:
         return source
-    if output is None:
-        raise OverlayError(
-            "trainer validation receipt needs --validation-contract-output"
-        )
-    required = {
-        "a1_contract_sha256",
-        "validation_fraction",
-        "validation_seed",
-        "validation_max_samples",
-        "game_seeds",
-    }
-    if not required.issubset(payload):
-        raise OverlayError("validation source lacks an exact Stage-C seed receipt")
-    raw_seeds = payload["game_seeds"]
-    if (
-        not isinstance(raw_seeds, list)
-        or not raw_seeds
-        or any(isinstance(seed, bool) or not isinstance(seed, int) for seed in raw_seeds)
-    ):
-        raise OverlayError("validation source game seeds are invalid")
-    seeds = np.asarray(raw_seeds, dtype=np.int64)
-    if not np.all(seeds[1:] > seeds[:-1]):
-        raise OverlayError("validation source game seeds are not sorted and unique")
-    corpus = MemmapCorpus(corpus_dir)
-    game_seeds = np.asarray(corpus["game_seed"], dtype=np.int64)
-    validation_rows = int(np.count_nonzero(np.isin(game_seeds, seeds)))
-    if validation_rows <= 0:
-        raise OverlayError("validation source selects no rows in this corpus")
-    contract = {
-        "schema_version": "train-validation-game-seeds-v1",
-        "a1_contract_sha256": payload["a1_contract_sha256"],
-        "validation_fraction": payload["validation_fraction"],
-        "validation_seed": payload["validation_seed"],
-        "validation_max_samples": payload["validation_max_samples"],
-        "validation_game_seed_ranges": [],
-        "validation_game_seed_count": int(seeds.size),
-        "validation_row_count": validation_rows,
-        "validation_game_seed_set_sha256": train_bc._game_seed_set_sha256(seeds),
-        "game_seeds": seeds.tolist(),
-    }
-    _write_once(output.resolve(), contract)
-    return output.resolve()
+    meta = json.loads((corpus_dir / "corpus_meta.json").read_text(encoding="utf-8"))
+    audit = meta.get("a1_post_wave_audit") if isinstance(meta, dict) else None
+    holdout = audit.get("validation_holdout") if isinstance(audit, dict) else None
+    if not isinstance(holdout, dict):
+        raise OverlayError("corpus lacks an audit-bound validation holdout")
+    path = Path(str(holdout.get("path", ""))).resolve(strict=True)
+    expected_sha = holdout.get("file_sha256")
+    if _sha256_file(path) != expected_sha:
+        raise OverlayError("audit-bound validation holdout byte binding drift")
+    bound = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(bound, dict) or set(bound) != exact_fields:
+        raise OverlayError("audit-bound validation holdout schema drift")
+    if payload.get("game_seeds") != bound.get("game_seeds"):
+        raise OverlayError("trainer receipt seeds differ from audit-bound holdout")
+    return path
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--corpus-dir", required=True)
     parser.add_argument("--validation-manifest", required=True)
-    parser.add_argument(
-        "--validation-contract-output",
-        default="",
-        help="required only when --validation-manifest is an older trainer receipt",
-    )
     parser.add_argument("--output", required=True)
     parser.add_argument("--component-id", default="stage_c")
     parser.add_argument("--phase-weight", action="append", default=[])
@@ -206,11 +169,6 @@ def main() -> None:
     validation_manifest = _canonical_validation_contract(
         corpus_dir=Path(args.corpus_dir),
         source=Path(args.validation_manifest),
-        output=(
-            None
-            if not args.validation_contract_output
-            else Path(args.validation_contract_output)
-        ),
     )
     payload = build_overlay(
         corpus_dir=Path(args.corpus_dir),
