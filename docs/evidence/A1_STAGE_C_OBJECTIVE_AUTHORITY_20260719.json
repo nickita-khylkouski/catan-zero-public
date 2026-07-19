@@ -97,6 +97,39 @@
       "absolute_mse_improvement_vs_exact_parent": 0.0072727682101257,
       "relative_mse_improvement_vs_exact_parent": 0.0114924,
       "finding": "The isolated value surface improves the exact parent by 1.149% MSE at step 12 and has a short U-shaped dose frontier; longer training is not automatically better."
+    },
+    "matched_coherent_public_n128_h2h": {
+      "contract": "50 paired same-seed seat swaps; candidate and baseline both use the deployed coherent-public n128 operator",
+      "candidate": {
+        "sha256": "sha256:bec31af8412e4866d750e7db433ae250e4855550e2754e3c5b6ff2370178c0cb"
+      },
+      "vs_exact_v15": {
+        "pairs": 50,
+        "games": 100,
+        "candidate_wins": 56,
+        "baseline_wins": 44,
+        "ww_pairs": 14,
+        "ll_pairs": 8,
+        "split_pairs": 28,
+        "truncations": 0,
+        "errors": 0,
+        "superiority_pentanomial_llr": 0.4695801469997382,
+        "verdict": "continue"
+      },
+      "vs_prior_corrected_production": {
+        "pairs": 50,
+        "games": 100,
+        "candidate_wins": 55,
+        "baseline_wins": 45,
+        "ww_pairs": 11,
+        "ll_pairs": 6,
+        "split_pairs": 33,
+        "truncations": 0,
+        "errors": 0,
+        "superiority_pentanomial_llr": 0.4698468878744425,
+        "verdict": "continue"
+      },
+      "finding": "Both independent matched panels point in the same positive direction, but neither 100-game panel meets the configured promotion threshold."
     }
   },
   "decision": {
