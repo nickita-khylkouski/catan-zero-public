@@ -510,6 +510,10 @@ def _engine_namespace(
         settings["validation_game_seed_manifest"] = validation_manifest
     if public_args.init_checkpoint:
         settings["init_checkpoint"] = public_args.init_checkpoint
+    if public_args.a1_value_only_child_receipt:
+        settings["a1_value_only_child_receipt"] = (
+            public_args.a1_value_only_child_receipt
+        )
 
     unsupported: list[str] = []
     for name, value in settings.items():
