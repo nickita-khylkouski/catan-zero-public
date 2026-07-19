@@ -78,7 +78,7 @@ RARE_STRATEGIC_ACTION_TYPES = (
 )
 RARE_ACTION_TARGET_MASS_FRACTION = 0.02
 WIDE_CHOICE_MIN_LEGAL_ACTIONS = 20
-WIDE_CHOICE_TARGET_MASS_FRACTION = 0.10
+WIDE_CHOICE_TARGET_MASS_FRACTION = 0.03
 LEGACY_ADMISSION_SCHEMA = "a1-coherent-n128-corpus-admission-v1"
 SUPPORTED_BASE_ADMISSION_SCHEMAS = frozenset(
     {
@@ -2016,6 +2016,7 @@ def _rare_action_balance_weights(
 
 def _wide_choice_balance_weights(
     legal_widths: np.ndarray,
+    phases: np.ndarray,
     *,
     selected: np.ndarray,
     base_weights: np.ndarray,
@@ -2024,10 +2025,12 @@ def _wide_choice_balance_weights(
     """Give genuinely wide decisions a bounded share of the sampling measure."""
 
     widths = np.asarray(legal_widths, dtype=np.int64)
+    phase_names = np.asarray(phases).astype(str, copy=False)
     scope = np.asarray(selected, dtype=np.bool_)
     base = np.asarray(base_weights, dtype=np.float64)
     if (
         widths.ndim != 1
+        or phase_names.shape != widths.shape
         or scope.shape != widths.shape
         or base.shape != widths.shape
         or not np.any(scope)
@@ -2035,31 +2038,76 @@ def _wide_choice_balance_weights(
         or np.any(base <= 0.0)
     ):
         raise OverlayError("wide-choice balancing scope is empty or malformed")
-    wide = scope & (widths >= WIDE_CHOICE_MIN_LEGAL_ACTIONS)
+    wide = (
+        scope
+        & (phase_names == "PLAY_TURN")
+        & (widths >= WIDE_CHOICE_MIN_LEGAL_ACTIONS)
+    )
+    scope_count = int(np.count_nonzero(scope))
+    wide_count = int(np.count_nonzero(wide))
+    if wide_count == 0:
+        raise OverlayError(
+            "wide-choice balancing found no PLAY_TURN root with legal width >= "
+            f"{WIDE_CHOICE_MIN_LEGAL_ACTIONS}"
+        )
     observed_mass = float(base[wide].sum())
-    non_wide_mass = float(base[scope & ~wide].sum())
-    target_mass = float(
-        WIDE_CHOICE_TARGET_MASS_FRACTION
-        * non_wide_mass
-        / (1.0 - WIDE_CHOICE_TARGET_MASS_FRACTION)
-    )
-    requested_multiplier = (
-        max(1.0, target_mass / observed_mass) if observed_mass > 0.0 else 1.0
-    )
-    raw = base.copy()
-    raw[wide] *= requested_multiplier
+    base_mass_fraction = float(observed_mass / base[scope].sum())
+    feasible_maximum = float(min(1.0, float(cap) * wide_count / scope_count))
+    target_fraction = float(WIDE_CHOICE_TARGET_MASS_FRACTION)
+    if target_fraction > feasible_maximum + 1.0e-12:
+        raise OverlayError(
+            "wide-choice target is infeasible under the declared row cap: "
+            f"target={target_fraction:.12g} maximum={feasible_maximum:.12g}"
+        )
+
+    scoped_base = base[scope].copy()
+    scoped_wide = wide[scope]
+
+    def _weights_for(multiplier: float) -> np.ndarray:
+        raw_scope = scoped_base.copy()
+        raw_scope[scoped_wide] *= float(multiplier)
+        return _unit_mean_capped_weights(raw_scope, cap=cap)
+
+    def _mass_fraction(multiplier: float) -> float:
+        normalized = _weights_for(multiplier)
+        return float(normalized[scoped_wide].sum() / normalized.sum())
+
+    requested_multiplier = 1.0
+    if base_mass_fraction < target_fraction - 1.0e-12:
+        low, high = 1.0, 2.0
+        while _mass_fraction(high) < target_fraction:
+            high *= 2.0
+            if not math.isfinite(high):
+                raise OverlayError("wide-choice multiplier search did not converge")
+        for _ in range(96):
+            middle = (low + high) / 2.0
+            if _mass_fraction(middle) < target_fraction:
+                low = middle
+            else:
+                high = middle
+        requested_multiplier = high
+
     result = base.copy()
-    result[scope] = _unit_mean_capped_weights(raw[scope], cap=cap)
+    result[scope] = _weights_for(requested_multiplier)
     realized_mass = float(result[wide].sum())
+    target_mass = float(target_fraction * result[scope].sum())
     return result, {
         "minimum_legal_actions": WIDE_CHOICE_MIN_LEGAL_ACTIONS,
-        "target_mass_fraction": WIDE_CHOICE_TARGET_MASS_FRACTION,
+        "phase": "PLAY_TURN",
+        "target_mass_fraction": target_fraction,
         "target_mass": target_mass,
-        "row_count": int(np.count_nonzero(wide)),
+        "row_count": wide_count,
         "base_weight_mass": observed_mass,
+        "base_mass_fraction": base_mass_fraction,
         "requested_multiplier": float(requested_multiplier),
         "realized_weight_mass": realized_mass,
         "realized_mass_fraction": float(realized_mass / result[scope].sum()),
+        "feasible_maximum_mass_fraction": feasible_maximum,
+        "capped_row_count": int(
+            np.count_nonzero(np.isclose(result[scope], float(cap)))
+        ),
+        "effective_sample_size_before": _effective_sample_size(base[scope]),
+        "effective_sample_size_after": _effective_sample_size(result[scope]),
         "composition": (
             "production_inverse_inclusion_weight_times_wide_choice_multiplier"
         ),
@@ -2122,6 +2170,7 @@ def _selected_sampling_weights(
         raise OverlayError("Stage-C selected training split is empty or misaligned")
     train = ~validation
     legal_widths = np.asarray([width for _, _, width in descriptors], dtype=np.int64)
+    phases = np.asarray([phase for _, phase, _ in descriptors]).astype(str)
     weights = np.ones(raw.size, dtype=np.float64)
     teacher_action_types = None
     rare_action_balance = None
@@ -2178,6 +2227,7 @@ def _selected_sampling_weights(
     if arm == "WIDE_CHOICE_BALANCED":
         train_weights, training_balance = _wide_choice_balance_weights(
             legal_widths,
+            phases,
             selected=train,
             base_weights=production_weights,
             cap=float(production_weight_cap),
@@ -2187,6 +2237,7 @@ def _selected_sampling_weights(
         if np.any(validation):
             validation_weights, validation_balance = _wide_choice_balance_weights(
                 legal_widths,
+                phases,
                 selected=validation,
                 base_weights=production_weights,
                 cap=float(production_weight_cap),
@@ -2204,7 +2255,6 @@ def _selected_sampling_weights(
             for label in sorted(set(labels[train].tolist()))
         }
 
-    phases = np.asarray([phase for _, phase, _ in descriptors]).astype(str)
     width_buckets = np.asarray(
         [alignment._width_bucket(width) for _, _, width in descriptors]  # noqa: SLF001
     ).astype(str)
@@ -2219,7 +2269,14 @@ def _selected_sampling_weights(
         "inverse_inclusion_formula": "candidate_count / selected_count",
         "normalization_scope": "training_and_validation_roots_independently",
         "production_weight_cap": (
-            float(production_weight_cap) if arm == "PRODUCTION_WEIGHTED" else None
+            float(production_weight_cap)
+            if arm
+            in {
+                "PRODUCTION_WEIGHTED",
+                "RARE_ACTION_BALANCED",
+                "WIDE_CHOICE_BALANCED",
+            }
+            else None
         ),
         "raw_inverse_inclusion": {
             "min": float(raw[train].min()),

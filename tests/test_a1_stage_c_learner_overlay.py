@@ -847,8 +847,13 @@ def test_wide_choice_balanced_sampling_raises_width_20_mass() -> None:
     subset = {
         "row_index": np.arange(rows, dtype=np.int64),
         "stratum": np.asarray(["ordinary"] * rows),
-        "phase": np.asarray(["PLAY_TURN"] * rows),
-        "legal_width": np.asarray([4] * 90 + [24] * 10, dtype=np.int64),
+        "phase": np.asarray(
+            ["BUILD_INITIAL_SETTLEMENT"] + ["PLAY_TURN"] * (rows - 1)
+        ),
+        "legal_width": np.asarray(
+            [54] + [4] * 89 + [24] + [4] * 7 + [24] * 2,
+            dtype=np.int64,
+        ),
     }
     patch = {"row_index": subset["row_index"]}
     export = {
@@ -872,9 +877,12 @@ def test_wide_choice_balanced_sampling_raises_width_20_mass() -> None:
     assert np.mean(weights[~validation]) == pytest.approx(1.0)
     assert np.max(weights[~validation]) <= 4.0
     assert weights[90] > weights[0]
+    assert weights[0] == pytest.approx(weights[1])
     balance = report["wide_choice_balance"]["training"]
-    assert balance["row_count"] == 8
-    assert balance["realized_mass_fraction"] == pytest.approx(0.10)
+    assert balance["row_count"] == 1
+    assert balance["phase"] == "PLAY_TURN"
+    assert balance["realized_mass_fraction"] == pytest.approx(0.03)
+    assert balance["requested_multiplier"] > 1.0
     assert balance["composition"] == (
         "production_inverse_inclusion_weight_times_wide_choice_multiplier"
     )
