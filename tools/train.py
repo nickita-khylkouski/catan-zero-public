@@ -510,7 +510,12 @@ def _engine_namespace(
         settings["validation_game_seed_manifest"] = validation_manifest
     if public_args.init_checkpoint:
         settings["init_checkpoint"] = public_args.init_checkpoint
-    if public_args.a1_value_only_child_receipt:
+    # ``_engine_namespace`` is also replayed from train_bc while validating a
+    # canonical recipe.  That projection deliberately contains only the
+    # public recipe fields and therefore predates this optional one-off
+    # lineage receipt.  Treat an omitted field exactly like the parser
+    # default rather than crashing every distributed rank before training.
+    if getattr(public_args, "a1_value_only_child_receipt", ""):
         settings["a1_value_only_child_receipt"] = (
             public_args.a1_value_only_child_receipt
         )
@@ -697,7 +702,9 @@ def _parent_initializer_binding(
         public_args.init_checkpoint, where="learner initializer"
     )
     receipt_raw = str(public_args.information_contract_migration_receipt or "")
-    child_receipt_raw = str(public_args.a1_value_only_child_receipt or "")
+    child_receipt_raw = str(
+        getattr(public_args, "a1_value_only_child_receipt", "") or ""
+    )
     if receipt_raw and child_receipt_raw:
         raise SystemExit(
             "value-only-child initialization cannot also claim an information migration"

@@ -87,6 +87,23 @@ def test_parent_production_recipe_can_collect_two_signal_observations() -> None:
     assert engine["minimum_feature_learning_signal_observations"] == 2
 
 
+def test_engine_projection_defaults_optional_value_only_child_receipt() -> None:
+    """Canonical recipe replay omits one-off child-receipt CLI fields.
+
+    train_bc replays the checked-in parent recipe with this minimal namespace
+    while checking immutable authority.  An optional experimental receipt must
+    therefore behave like its parser default rather than abort every DDP rank.
+    """
+
+    config, engine = train._load_recipe(PARENT_RECIPE)  # noqa: SLF001
+    resolved = train._engine_namespace(  # noqa: SLF001
+        config=config,
+        engine_settings=engine,
+        public_args=_public_args(init_checkpoint="/tmp/parent.pt"),
+    )
+    assert resolved.a1_value_only_child_receipt == ""
+
+
 def test_completed_q_opt_in_binds_reliability_inputs() -> None:
     config, engine = train._load_recipe(PARENT_RECIPE)  # noqa: SLF001
     baseline_args = train._engine_namespace(  # noqa: SLF001
