@@ -34,6 +34,7 @@ def test_two_stream_anchor_backpropagates_through_aux_and_separates_controller()
             aux,
             torch.tensor(3.0),
             torch.tensor(6.0),
+            base_coefficient=1.0,
             aux_coefficient=0.25,
         )
     )
@@ -44,6 +45,32 @@ def test_two_stream_anchor_backpropagates_through_aux_and_separates_controller()
     assert aux.grad.item() == pytest.approx(0.25)
     assert controller_sum.item() == pytest.approx(0.75)
     assert controller_denominator.item() == pytest.approx(11.5)
+
+
+def test_two_stream_anchor_can_disable_base_stream_exactly() -> None:
+    """AUX-only policy training must not retain a hidden base KL gradient."""
+
+    base = torch.tensor(0.4, requires_grad=True)
+    aux = torch.tensor(0.5, requires_grad=True)
+    objective, controller_sum, controller_denominator = (
+        _combine_policy_kl_anchor_streams(
+            base,
+            torch.tensor(4.0),
+            torch.tensor(10.0),
+            aux,
+            torch.tensor(3.0),
+            torch.tensor(6.0),
+            base_coefficient=0.0,
+            aux_coefficient=1.0,
+        )
+    )
+
+    objective.backward()
+
+    assert base.grad.item() == pytest.approx(0.0)
+    assert aux.grad.item() == pytest.approx(1.0)
+    assert controller_sum.item() == pytest.approx(3.0)
+    assert controller_denominator.item() == pytest.approx(6.0)
 
 
 def _base_data(**overrides):

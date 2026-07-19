@@ -13,11 +13,33 @@ from tools.train_bc import (
     _epoch_order,
     _policy_action_type_target_mass_admission,
     _policy_phase_objective_mass_admission,
+    _require_exact_two_stream_phase_mass_admission,
     compute_policy_surprise_kl,
     per_game_capped_policy_surprise_sampling_weights,
     per_game_policy_surprise_sampling_report,
     policy_surprise_sampling_weights,
 )
+
+
+def test_hard_decision_floors_refuse_base_only_admission_for_aux_objective() -> None:
+    """AUX-only policy training cannot be certified with base-stream mass."""
+
+    with pytest.raises(SystemExit, match="two-stream admission"):
+        _require_exact_two_stream_phase_mass_admission(
+            {"PLAY_TURN": 0.1},
+            policy_aux_active_batch_size=512,
+            policy_base_loss_weight=0.0,
+            policy_aux_loss_weight=1.0,
+        )
+
+
+def test_hard_decision_floors_keep_single_stream_admission_available() -> None:
+    _require_exact_two_stream_phase_mass_admission(
+        {"PLAY_TURN": 0.1},
+        policy_aux_active_batch_size=0,
+        policy_base_loss_weight=1.0,
+        policy_aux_loss_weight=0.0,
+    )
 
 
 def _planned_weighted_phase_admission(

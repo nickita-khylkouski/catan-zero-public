@@ -18308,6 +18308,12 @@ def main(
         )
     )
     hard_decision_policy_mass_minima = _hard_decision_policy_mass_minima(args)
+    _require_exact_two_stream_phase_mass_admission(
+        hard_decision_policy_mass_minima,
+        policy_aux_active_batch_size=int(args.policy_aux_active_batch_size),
+        policy_base_loss_weight=float(args.policy_base_loss_weight),
+        policy_aux_loss_weight=float(args.policy_aux_loss_weight),
+    )
     phase_admission_sampler_rng_state = copy.deepcopy(
         rng.bit_generator.state
         if resume_progress is None
@@ -21441,7 +21447,8 @@ def main(
             )
         )
         auxiliary_loss_epochs["policy_kl_anchor_loss"] = (
-            auxiliary_loss_epochs["policy_kl_anchor_base_loss"]
+            float(args.policy_base_loss_weight)
+            * auxiliary_loss_epochs["policy_kl_anchor_base_loss"]
             + float(args.policy_aux_loss_weight)
             * auxiliary_loss_epochs["policy_kl_anchor_aux_loss"]
         )
@@ -25413,6 +25420,7 @@ def _train_entity_batch(
             policy_aux_kl_anchor_loss,
             policy_aux_kl_anchor_loss_sum,
             policy_aux_kl_anchor_loss_denominator,
+            base_coefficient=float(policy_base_loss_weight),
             aux_coefficient=float(policy_aux_loss_weight),
         )
         # Value-uncertainty auxiliary head: regress the value head's own squared
@@ -25933,8 +25941,10 @@ def _train_entity_batch(
             kl_anchor_loss_denominator.item()
         ),
         "policy_kl_anchor_eligible_rows": int(
-            policy_base_kl_anchor_loss_denominator.item()
-            + policy_aux_kl_anchor_loss_denominator.item()
+            float(policy_base_loss_weight)
+            * policy_base_kl_anchor_loss_denominator.item()
+            + float(policy_aux_loss_weight)
+            * policy_aux_kl_anchor_loss_denominator.item()
         ),
         "policy_kl_anchor_base_loss": float(
             policy_base_kl_anchor_loss.item()
@@ -26709,7 +26719,7 @@ def _combine_policy_aux_validation_metrics(
     combined_policy = (
         base_coefficient * base_policy + coefficient * aux_policy
     )
-    combined_anchor = base_anchor + coefficient * aux_anchor
+    combined_anchor = base_coefficient * base_anchor + coefficient * aux_anchor
     base_value = float(base_metrics.get("value_loss", 0.0))
     aux_opening_value = float(aux_metrics.get("value_loss", 0.0))
     combined_value = (
@@ -26720,6 +26730,7 @@ def _combine_policy_aux_validation_metrics(
         float(base_metrics["loss"])
         + policy_coefficient * (base_coefficient - 1.0) * base_policy
         + policy_coefficient * coefficient * aux_policy
+        + anchor_coefficient * (base_coefficient - 1.0) * base_anchor
         + anchor_coefficient * coefficient * aux_anchor
         + value_coefficient * opening_mix * (
             aux_opening_value - base_value
@@ -26736,11 +26747,12 @@ def _combine_policy_aux_validation_metrics(
         )
     )
     controller_denominator = (
-        base_anchor_denominator + coefficient * aux_anchor_denominator
+        base_coefficient * base_anchor_denominator
+        + coefficient * aux_anchor_denominator
     )
     controller_anchor = (
         (
-            base_anchor * base_anchor_denominator
+            base_coefficient * base_anchor * base_anchor_denominator
             + coefficient * aux_anchor * aux_anchor_denominator
         )
         / controller_denominator
@@ -33823,6 +33835,7 @@ def _combine_policy_kl_anchor_streams(
     aux_sum,
     aux_denominator,
     *,
+    base_coefficient: float,
     aux_coefficient: float,
 ):
     """Combine base/AUX trust-region objectives and controller evidence.
@@ -33834,12 +33847,15 @@ def _combine_policy_kl_anchor_streams(
     interpretation without leaving AUX drift invisible.
     """
 
+    base = float(base_coefficient)
     coefficient = float(aux_coefficient)
+    if not math.isfinite(base) or base < 0.0:
+        raise ValueError("policy base KL coefficient must be finite and non-negative")
     if not math.isfinite(coefficient) or coefficient < 0.0:
         raise ValueError("policy AUX KL coefficient must be finite and non-negative")
-    objective = base_mean + coefficient * aux_mean
-    controller_sum = base_sum + coefficient * aux_sum
-    controller_denominator = base_denominator + coefficient * aux_denominator
+    objective = base * base_mean + coefficient * aux_mean
+    controller_sum = base * base_sum + coefficient * aux_sum
+    controller_denominator = base * base_denominator + coefficient * aux_denominator
     return objective, controller_sum, controller_denominator
 
 
@@ -44734,6 +44750,40 @@ def _hard_decision_policy_mass_minima(args) -> dict[str, float] | None:
     if sum(minima.values()) > 1.0:
         raise SystemExit("hard-decision policy-mass minima cannot sum above one")
     return minima
+
+
+def _require_exact_two_stream_phase_mass_admission(
+    minimum_phase_mass_fractions: Mapping[str, float] | None,
+    *,
+    policy_aux_active_batch_size: int,
+    policy_base_loss_weight: float,
+    policy_aux_loss_weight: float,
+) -> None:
+    """Refuse to certify hard-decision mass from the wrong policy stream.
+
+    The current planned-batch admission replays the base sampler only.  It is
+    exact for ordinary training, but it cannot certify the actual objective
+    once the independently sampled AUX teacher stream has nonzero weight.  In
+    particular, an AUX-only recipe could appear to meet a hard-decision floor
+    using base rows that contribute exactly zero gradient.  Keep the floor
+    fail-closed until the admission consumes the exact coefficient-weighted
+    two-stream measure.
+    """
+
+    if minimum_phase_mass_fractions is None:
+        return
+    if policy_aux_active_batch_size < 0:
+        raise SystemExit("policy AUX active batch size must be non-negative")
+    if not math.isfinite(policy_base_loss_weight) or policy_base_loss_weight < 0.0:
+        raise SystemExit("policy base loss weight must be finite and non-negative")
+    if not math.isfinite(policy_aux_loss_weight) or policy_aux_loss_weight < 0.0:
+        raise SystemExit("policy AUX loss weight must be finite and non-negative")
+    if policy_aux_active_batch_size > 0 and policy_aux_loss_weight > 0.0:
+        raise SystemExit(
+            "hard-decision policy-mass floors with a nonzero AUX stream require "
+            "an exact coefficient-weighted two-stream admission; base-only "
+            "preflight would certify the wrong training objective"
+        )
 
 
 def _planned_weighted_policy_phase_objective_mass_admission(
