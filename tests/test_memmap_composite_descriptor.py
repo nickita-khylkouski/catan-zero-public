@@ -9,6 +9,7 @@ import pytest
 
 from catan_zero.rl.flywheel.composite_contract import measure_memmap_component
 from tools import train_bc
+from tools import a1_make_diagnostic_phase_overlay as phase_overlay
 from tools.mixed_memmap_corpus import ConcatMemmapCorpus
 
 
@@ -148,6 +149,40 @@ def _descriptor_v2(
     return path
 
 
+def _single_component_descriptor_v2(
+    tmp_path: Path,
+    *,
+    policy_aux_phase_sampling_weights: dict[str, float],
+) -> Path:
+    """A no-copy diagnostic overlay for one immutable Stage-C corpus."""
+
+    overrides = {
+        "per_game_policy_weight": True,
+        "per_game_policy_weight_mode": "equal",
+    }
+    payload = {
+        "schema_version": "memmap_composite_v2",
+        "diagnostic_only": True,
+        "promotion_eligible": False,
+        "learner_recipe_overrides": overrides,
+        "learner_recipe_overrides_sha256": _canonical(overrides),
+        "policy_kl_anchor_component_ids": ["stage_c"],
+        "policy_distillation_component_ids": ["stage_c"],
+        "value_training_component_ids": ["stage_c"],
+        "policy_aux_phase_sampling_weights": policy_aux_phase_sampling_weights,
+        "components": [
+            {
+                **_component(tmp_path, "stage-c"),
+                "component_id": "stage_c",
+                "game_sampling_ratio": 1.0,
+            }
+        ],
+    }
+    path = tmp_path / "single-component-composite-v2.json"
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return path
+
+
 def test_descriptor_authenticates_ordered_component_bytes(tmp_path):
     path = _descriptor(tmp_path)
     verified = train_bc._preflight_memmap_composite_descriptor(path)
@@ -236,6 +271,47 @@ def test_v2_authenticates_policy_aux_phase_allocation(tmp_path):
     assert verified["descriptor_fingerprint"] == train_bc._training_data_fingerprint(
         str(path), "memmap"
     )
+
+
+def test_v2_allows_single_component_diagnostic_phase_overlay(tmp_path):
+    allocation = {
+        "BUILD_INITIAL_SETTLEMENT": 0.04,
+        "BUILD_INITIAL_ROAD": 0.04,
+        "DISCARD": 0.12,
+        "MOVE_ROBBER": 0.15,
+        "PLAY_TURN": 0.65,
+    }
+    path = _single_component_descriptor_v2(
+        tmp_path, policy_aux_phase_sampling_weights=allocation
+    )
+    verified = train_bc._preflight_memmap_composite_descriptor(path)
+
+    assert verified["component_ids"] == ["stage_c"]
+    assert verified["component_game_sampling_ratios"] == [1.0]
+    assert verified["policy_distillation_component_ids"] == ["stage_c"]
+    assert verified["policy_aux_phase_sampling_weights"] == allocation
+    corpus = train_bc.load_teacher_data_memmap(path, composite_meta=verified)
+    assert len(corpus.corpora) == 1
+    assert corpus.component_ids == ("stage_c",)
+    assert corpus.policy_aux_phase_scope_authenticated is True
+
+
+def test_diagnostic_phase_overlay_binds_one_existing_corpus(tmp_path) -> None:
+    component = _component(tmp_path, "stage-c-overlay")
+    allocation = {"PLAY_TURN": 0.7, "DISCARD": 0.3}
+    payload = phase_overlay.build_overlay(
+        corpus_dir=Path(component["corpus_dir"]),
+        validation_manifest=Path(component["validation_manifest"]),
+        component_id="stage_c",
+        phase_weights=allocation,
+    )
+    output = tmp_path / "overlay.json"
+    phase_overlay._write_once(output, payload)
+    verified = train_bc._preflight_memmap_composite_descriptor(output)
+
+    assert verified["component_ids"] == ["stage_c"]
+    assert verified["policy_aux_phase_sampling_weights"] == allocation
+    assert output.stat().st_mode & 0o222 == 0
 
 
 def test_v2_authenticates_stored_policy_component_temperatures(tmp_path):

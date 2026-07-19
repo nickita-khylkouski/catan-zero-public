@@ -6880,12 +6880,37 @@ def _preflight_memmap_composite_descriptor(
             "diagnostic composite may not claim unauthenticated category semantics"
         )
     raw_components = descriptor.get("components")
-    if not isinstance(raw_components, list) or (
-        len(raw_components) != 2
+    # A v2 descriptor is normally a multi-corpus mixture.  A diagnostic-only
+    # v2 descriptor may also wrap one immutable corpus when it needs to bind a
+    # new *sampling* contract (for example, exact auxiliary phase allocation)
+    # without copying, filtering, or mutating the corpus bytes.  It must never
+    # be promotion eligible: one component has no mixture semantics to certify.
+    minimum_components = (
+        2
         if schema_version == "memmap_composite_v1"
-        else len(raw_components) < 2
-    ):
-        requirement = "exactly two" if schema_version == "memmap_composite_v1" else "at least two"
+        else 2
+        if is_flywheel_production
+        else 1
+    )
+    component_count_invalid = (
+        not isinstance(raw_components, list)
+        or (
+            schema_version == "memmap_composite_v1"
+            and isinstance(raw_components, list)
+            and len(raw_components) != 2
+        )
+        or (
+            schema_version != "memmap_composite_v1"
+            and isinstance(raw_components, list)
+            and len(raw_components) < minimum_components
+        )
+    )
+    if component_count_invalid:
+        requirement = (
+            "exactly two"
+            if schema_version == "memmap_composite_v1"
+            else "at least two" if is_flywheel_production else "at least one"
+        )
         raise SystemExit(f"{schema_version} requires {requirement} ordered components")
     overrides = descriptor.get("learner_recipe_overrides")
     required_override_fields = {
@@ -9029,9 +9054,9 @@ def _load_composite_validation_contract(
     validation_max_samples: int,
     validation_game_seed_ranges: list[tuple[int, int]],
 ) -> dict[str, object]:
-    """Validate both bound holdouts and return their game-disjoint union."""
+    """Validate bound holdouts and return their game-disjoint union."""
     raw_components = composite_meta.get("components")
-    if not isinstance(raw_components, list) or len(raw_components) < 2:
+    if not isinstance(raw_components, list) or not raw_components:
         raise SystemExit("authenticated memmap composite metadata has invalid components")
     contracts: list[dict[str, object]] = []
     seen: set[int] = set()
@@ -27083,7 +27108,7 @@ def _validated_objective_matched_validation_wrapper(
         or not allowed_measure
         or not isinstance(metrics, dict)
         or not isinstance(components, dict)
-        or len(components) < 2
+        or not components
         or not isinstance(ratios, dict)
         or set(components) != set(ratios)
         or isinstance(samples, bool)
@@ -28160,7 +28185,7 @@ def evaluate_composite_validation_measure(
     if (
         ratios.shape != (len(corpora),)
         or len(component_ids) != len(corpora)
-        or len(corpora) < 2
+        or not corpora
         or not np.isfinite(ratios).all()
         or np.any(ratios <= 0.0)
         or not math.isclose(float(ratios.sum()), 1.0, rel_tol=0.0, abs_tol=1e-9)
@@ -29917,6 +29942,12 @@ def load_teacher_data_memmap(
                         str(adapter_versions_by_component[component_id])
                         for component_id in authenticated["component_ids"]
                     ]
+                ),
+                allow_single_component=(
+                    authenticated["schema_version"] == "memmap_composite_v2"
+                    and authenticated["diagnostic_only"] is True
+                    and authenticated["promotion_eligible"] is False
+                    and len(authenticated["components"]) == 1
                 ),
             )
         except BaseException:

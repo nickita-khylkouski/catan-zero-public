@@ -473,7 +473,7 @@ _ConcatLazyColumn = _ConcatColumn
 
 
 class ConcatMemmapCorpus:
-    """Dict-like global row view over two or more compatible MemmapCorpus parts."""
+    """Dict-like global row view over compatible authenticated corpus parts."""
 
     def __init__(
         self,
@@ -481,9 +481,15 @@ class ConcatMemmapCorpus:
         *,
         dirs: Sequence[str | Path] | None = None,
         component_adapter_versions: Sequence[str] | None = None,
+        allow_single_component: bool = False,
     ) -> None:
-        if len(corpora) < 2:
-            raise SystemExit("composite memmap corpus requires at least two components")
+        if len(corpora) < 1 or (
+            len(corpora) == 1 and not allow_single_component
+        ):
+            raise SystemExit(
+                "composite memmap corpus requires at least two components unless "
+                "an authenticated diagnostic overlay explicitly allows one"
+            )
         self.corpora = tuple(corpora)
         self.component_dirs = (
             tuple(Path(path) for path in dirs) if dirs is not None else tuple()
