@@ -14,6 +14,11 @@ import json
 import math
 import os
 from pathlib import Path
+import sys
+
+# Direct ``python tools/...py`` execution puts ``tools/`` rather than the
+# repository root on sys.path.  Keep the CLI usable by the sealed executor.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from tools import train_bc
 

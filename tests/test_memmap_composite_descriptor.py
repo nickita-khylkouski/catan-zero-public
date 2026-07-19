@@ -198,6 +198,16 @@ def test_descriptor_authenticates_ordered_component_bytes(tmp_path):
     )
 
 
+def test_v1_refuses_more_than_two_components(tmp_path) -> None:
+    path = _descriptor(tmp_path)
+    payload = json.loads(path.read_text())
+    payload["components"].append(_component(tmp_path, "third"))
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(SystemExit, match="exactly two"):
+        train_bc._preflight_memmap_composite_descriptor(path)
+
+
 def test_descriptor_accepts_completed_q_reliability_overrides(tmp_path):
     path = _descriptor(tmp_path)
     payload = json.loads(path.read_text())
