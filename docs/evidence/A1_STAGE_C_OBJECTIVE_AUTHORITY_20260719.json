@@ -130,6 +130,34 @@
         "verdict": "continue"
       },
       "finding": "Both independent matched panels point in the same positive direction, but neither 100-game panel meets the configured promotion threshold."
+    },
+    "composed_aux_policy_plus_value_repair": {
+      "candidate_sha256": "sha256:d42f52122d0f722f20a9e38e27ad08bbec14a946113a299e8b76f6ddfbd913fb",
+      "initialization": "exact AUX-only policy child; policy, action decoder, and shared trunk frozen; private value surface only",
+      "selected_step": 24,
+      "clean_outcome_mse_frontier": [
+        {"step": 0, "mse": 0.6311814356860486},
+        {"step": 8, "mse": 0.6304278158956395},
+        {"step": 12, "mse": 0.6257952265321151},
+        {"step": 16, "mse": 0.6248979828291108},
+        {"step": 24, "mse": 0.6240161752431124}
+      ],
+      "relative_mse_improvement_vs_policy_child": 0.011352,
+      "matched_coherent_public_n128_h2h_vs_exact_v15": {
+        "pairs": 50,
+        "games": 100,
+        "candidate_wins": 56,
+        "baseline_wins": 44,
+        "candidate_win_rate": 0.56,
+        "ww_pairs": 10,
+        "ll_pairs": 4,
+        "split_pairs": 36,
+        "truncations": 0,
+        "errors": 0,
+        "superiority_pentanomial_llr": 1.374592575658733,
+        "verdict": "continue"
+      },
+      "finding": "The composition reproduces a positive 56-44 matched n128 screen with zero failures. It is selected as the research parent for the next substantive learner, but not promoted solely from this 100-game screen."
     }
   },
   "decision": {
