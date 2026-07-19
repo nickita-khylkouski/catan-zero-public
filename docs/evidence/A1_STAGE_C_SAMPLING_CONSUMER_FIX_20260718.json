@@ -1,0 +1,60 @@
+{
+  "schema_version": "a1-stage-c-sampling-consumer-fix-evidence-v1",
+  "date": "2026-07-18",
+  "status": "fixed_and_live_learner_verified",
+  "fix_commit": "d731dfe1",
+  "bug": {
+    "summary": "Canonical direct policy-AUX authority authenticated Stage-C sampling weights but replaced them with uniform weights.",
+    "affected_named_arms": [
+      "PRODUCTION_WEIGHTED",
+      "STRATEGIC_BALANCED",
+      "RARE_ACTION_BALANCED"
+    ],
+    "impact": "The named sampling treatments produced identical AUX sampling distributions, invalidating comparisons among those arms."
+  },
+  "before": {
+    "base_measure": "authenticated_a1_direct_uniform_row",
+    "effective_sample_size": 86638.00000000004,
+    "checkpoint_sha256": "sha256:2fcec9268810879ff152f1b65be54b603a0934a5f9fee0198ff85ad96d410c44",
+    "active_policy_teacher_gap_closure": 0.026855018682437892,
+    "common_uniform_clean_outcome_scalar_mse": 0.6275484522564808
+  },
+  "after": {
+    "base_measure": "stage_c_production_weighted",
+    "effective_sample_size": 66794.84110630833,
+    "checkpoint_sha256": "sha256:f09cdbc7d3043b67ad3b44ebc783a27407c1e7c1b146b9476adb7313fc64c09d",
+    "active_policy_teacher_gap_closure": 0.027286242170231012,
+    "common_uniform_clean_outcome_scalar_mse": 0.6273012299651092
+  },
+  "value_bias_diagnosis": {
+    "training_target_mean": 0.076077,
+    "validation_target_mean": 0.091813,
+    "opening_aux_target_mean": 0.040078,
+    "outcome_balance_is_root_cause": false,
+    "enable_sampler_balanced_v1": false
+  },
+  "strength_panel": {
+    "operator": "coherent_public_n128.schema22",
+    "base_seed": 202607184500,
+    "pairs": 50,
+    "games": 100,
+    "candidate_wins": 49,
+    "baseline_wins": 51,
+    "ww_pairs": 10,
+    "ll_pairs": 11,
+    "split_pairs": 29,
+    "errors": [],
+    "status": "strength_neutral"
+  },
+  "realized_sampling_shift": {
+    "aux_draws": 6144,
+    "unique_aux_rows": 6144,
+    "play_turn_draws_before": 2770,
+    "play_turn_draws_after": 4015,
+    "normal_choice_draws_before": 2653,
+    "normal_choice_draws_after": 3886,
+    "rare_selected_action_draws_before": 290,
+    "rare_selected_action_draws_after": 417,
+    "note": "Selected-action labels are diagnostic and are not the teacher argmax contract."
+  }
+}

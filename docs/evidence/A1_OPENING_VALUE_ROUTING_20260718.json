@@ -1,7 +1,7 @@
 {
   "schema_version": "a1-opening-value-routing-evidence-v1",
   "date": "2026-07-18",
-  "status": "commissioned_strength_neutral",
+  "status": "commissioned_strength_neutral_dose16_stopped",
   "code_commit": "d8549a132bd482537868ea06b899936b173cabb4",
   "parent": {
     "name": "warmup0",
@@ -67,10 +67,34 @@
     "elapsed_sec": 984.5759900679695,
     "verdict": "strength_neutral_at_12_steps"
   },
+  "dose16": {
+    "checkpoint_sha256": "sha256:2348bb95fce2c5197aea85bbc91612ce24e3b43ac8d89750ef085268fba0d16c",
+    "optimizer_steps": 16,
+    "common_uniform_clean_outcome_scalar_mse": 0.6235937158766919,
+    "active_policy_teacher_gap_closure": 0.030099,
+    "calibration_warning": {
+      "multi_action_value_bias": -0.04217306050456273,
+      "forced_value_bias": -0.07429773704789806,
+      "play_turn_value_bias": -0.060789887814477465
+    },
+    "paired_h2h_vs_v15": {
+      "operator": "coherent_public_n128.schema22",
+      "base_seed": 202607184400,
+      "pairs": 50,
+      "games": 100,
+      "candidate_wins": 50,
+      "baseline_wins": 50,
+      "ww_pairs": 8,
+      "ll_pairs": 8,
+      "split_pairs": 34,
+      "errors": [],
+      "verdict": "strength_neutral"
+    }
+  },
   "conclusion": {
     "retain_opening_value_routing": true,
     "promotion_claim": false,
-    "reason": "The treatment materially improved opening value calibration, left PLAY_TURN calibration unchanged, and tied its exact parent in paired play.",
-    "next_experiment": "Extend the same independently initialized recipe to 16 optimizer steps because policy teacher-gap closure was still improving at step 12."
+    "reason": "The treatment materially improved opening value calibration but tied at both 12 and 16 steps. The longer dose also developed systematic negative value bias.",
+    "next_experiment": "Stop the opening-value dose frontier. Evaluate the corrected authenticated Stage-C sampling consumer independently."
   }
 }
