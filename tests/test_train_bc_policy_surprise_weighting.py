@@ -10,6 +10,7 @@ from tools.train_bc import (
     _coverage_fixed_loss_normalizers,
     _coverage_importance_weights,
     _coverage_policy_signal_admission,
+    _exact_two_stream_policy_phase_objective_mass_admission,
     _epoch_order,
     _policy_action_type_target_mass_admission,
     _policy_phase_objective_mass_admission,
@@ -21,16 +22,145 @@ from tools.train_bc import (
 )
 
 
-def test_hard_decision_floors_refuse_base_only_admission_for_aux_objective() -> None:
-    """AUX-only policy training cannot be certified with base-stream mass."""
+def _two_stream_base_receipt(*, world_size: int = 1, accum: int = 1):
+    """Minimal planned base receipt: one synchronous microbatch in epoch zero."""
 
-    with pytest.raises(SystemExit, match="two-stream admission"):
-        _require_exact_two_stream_phase_mass_admission(
-            {"PLAY_TURN": 0.1},
-            policy_aux_active_batch_size=512,
+    return {
+        "identity_sha256": "base-receipt",
+        "geometry": {
+            "world_size": world_size,
+            "grad_accum_steps": accum,
+        },
+        "epoch_receipts": [
+            {
+                "epoch": 0,
+                "consumed_synchronous_global_microbatch_count": 1,
+            }
+        ],
+        "per_phase": {"PLAY_TURN": {"policy_objective_mass_fraction": 1.0}},
+    }
+
+
+def _two_stream_phase_data():
+    return {
+        "phase": np.asarray(
+            [
+                "PLAY_TURN",
+                "PLAY_TURN",
+                "PLAY_TURN",
+                "PLAY_TURN",
+                "BUILD_INITIAL_SETTLEMENT",
+                "BUILD_INITIAL_ROAD",
+                "DISCARD",
+                "MOVE_ROBBER",
+            ]
+        )
+    }
+
+
+def test_exact_two_stream_admission_accepts_aux_only_hard_phase_mass():
+    report = _exact_two_stream_policy_phase_objective_mass_admission(
+        _two_stream_phase_data(),
+        np.arange(8, dtype=np.int64),
+        base_admission=_two_stream_base_receipt(),
+        policy_sample_weights=np.ones(8, dtype=np.float64),
+        policy_aux_sampling_weights=np.ones(8, dtype=np.float64) / 8.0,
+        policy_aux_phase_loss_weights=None,
+        minimum_phase_mass_fractions={
+            "BUILD_INITIAL_SETTLEMENT": 0.02,
+            "BUILD_INITIAL_ROAD": 0.02,
+            "DISCARD": 0.02,
+            "MOVE_ROBBER": 0.02,
+        },
+        policy_base_loss_weight=0.0,
+        policy_aux_loss_weight=1.0,
+        policy_aux_active_batch_size=8,
+        sampler_seed=2,
+        policy_aux_sampling_mode="weighted_permutation_cycles_v1",
+        ddp={"enabled": False, "world_size": 1, "rank": 0, "local_rank": 0},
+        initial_policy_aux_global_draw_offset=0,
+    )
+
+    assert report["admitted"] is True
+    assert report["schema_version"] == "policy-phase-exact-two-stream-admission-v1"
+    assert report["per_phase"]["BUILD_INITIAL_SETTLEMENT"][
+        "policy_objective_mass_fraction"
+    ] == pytest.approx(1.0 / 8.0)
+    assert report["per_phase"]["PLAY_TURN"][
+        "policy_objective_mass_fraction"
+    ] == pytest.approx(4.0 / 8.0)
+
+
+def test_exact_two_stream_admission_uses_loss_coefficients_and_undoes_phase_weights():
+    policy_weights = np.asarray([4.0, 4.0, 4.0, 4.0, 2.0, 2.0, 2.0, 2.0])
+    report = _exact_two_stream_policy_phase_objective_mass_admission(
+        _two_stream_phase_data(),
+        np.arange(8, dtype=np.int64),
+        base_admission=_two_stream_base_receipt(),
+        policy_sample_weights=policy_weights,
+        policy_aux_sampling_weights=np.ones(8, dtype=np.float64) / 8.0,
+        policy_aux_phase_loss_weights={
+            "PLAY_TURN": 4.0,
+            "BUILD_INITIAL_SETTLEMENT": 2.0,
+            "BUILD_INITIAL_ROAD": 2.0,
+            "DISCARD": 2.0,
+            "MOVE_ROBBER": 2.0,
+        },
+        minimum_phase_mass_fractions=None,
+        policy_base_loss_weight=1.0,
+        policy_aux_loss_weight=1.0,
+        policy_aux_active_batch_size=8,
+        sampler_seed=2,
+        policy_aux_sampling_mode="weighted_permutation_cycles_v1",
+        ddp={"enabled": False, "world_size": 1, "rank": 0, "local_rank": 0},
+        initial_policy_aux_global_draw_offset=0,
+    )
+
+    # The phase allocation has already selected the AUX measure, so undoing
+    # phase loss multipliers yields 4/8 PLAY and 1/8 for every hard phase.
+    # With equal stream coefficients, the base's all-PLAY mass contributes half.
+    assert report["per_phase"]["PLAY_TURN"][
+        "policy_objective_mass_fraction"
+    ] == pytest.approx(0.75)
+    assert report["per_phase"]["DISCARD"][
+        "policy_objective_mass_fraction"
+    ] == pytest.approx(1.0 / 16.0)
+
+
+def test_exact_two_stream_admission_refuses_aux_hard_phase_below_floor():
+    with pytest.raises(SystemExit, match="exact two-stream"):
+        _exact_two_stream_policy_phase_objective_mass_admission(
+            _two_stream_phase_data(),
+            np.arange(8, dtype=np.int64),
+            base_admission=_two_stream_base_receipt(),
+            policy_sample_weights=np.ones(8, dtype=np.float64),
+            policy_aux_sampling_weights=np.ones(8, dtype=np.float64) / 8.0,
+            policy_aux_phase_loss_weights=None,
+            minimum_phase_mass_fractions={
+                "BUILD_INITIAL_SETTLEMENT": 0.2,
+                "BUILD_INITIAL_ROAD": 0.2,
+                "DISCARD": 0.2,
+                "MOVE_ROBBER": 0.2,
+            },
             policy_base_loss_weight=0.0,
             policy_aux_loss_weight=1.0,
+            policy_aux_active_batch_size=8,
+            sampler_seed=2,
+            policy_aux_sampling_mode="weighted_permutation_cycles_v1",
+            ddp={"enabled": False, "world_size": 1, "rank": 0, "local_rank": 0},
+            initial_policy_aux_global_draw_offset=0,
         )
+
+
+def test_hard_decision_floors_defer_aux_objective_to_exact_two_stream_replay() -> None:
+    """The early validator must not reject a valid AUX-only objective."""
+
+    _require_exact_two_stream_phase_mass_admission(
+        {"PLAY_TURN": 0.1},
+        policy_aux_active_batch_size=512,
+        policy_base_loss_weight=0.0,
+        policy_aux_loss_weight=1.0,
+    )
 
 
 def test_hard_decision_floors_keep_single_stream_admission_available() -> None:

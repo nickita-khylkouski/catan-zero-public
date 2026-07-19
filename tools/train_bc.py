@@ -18308,6 +18308,11 @@ def main(
         )
     )
     hard_decision_policy_mass_minima = _hard_decision_policy_mass_minima(args)
+    exact_two_stream_phase_admission = (
+        hard_decision_policy_mass_minima is not None
+        and int(args.policy_aux_active_batch_size) > 0
+        and float(args.policy_aux_loss_weight) > 0.0
+    )
     _require_exact_two_stream_phase_mass_admission(
         hard_decision_policy_mass_minima,
         policy_aux_active_batch_size=int(args.policy_aux_active_batch_size),
@@ -18331,7 +18336,15 @@ def main(
                 if base_sampler == BASE_SAMPLER_WEIGHTED_REPLACEMENT_V1
                 else None
             ),
-            minimum_phase_mass_fractions=hard_decision_policy_mass_minima,
+            # A positive independently-normalized AUX stream changes the policy
+            # objective.  Its exact admission runs after the authenticated AUX
+            # sampling measure exists; do not let this base-only replay certify
+            # (or reject) that different objective first.
+            minimum_phase_mass_fractions=(
+                None
+                if exact_two_stream_phase_admission
+                else hard_decision_policy_mass_minima
+            ),
             objective_measure=policy_objective_measure,
             sampler_rng_state=phase_admission_sampler_rng_state,
             epochs=int(effective_epoch_limit),
@@ -18592,6 +18605,43 @@ def main(
                         policy_aux_phase_sampling_weights,
                     )
                 )
+    if exact_two_stream_phase_admission:
+        if policy_aux_sampling_weights is None:
+            raise SystemExit(
+                "exact two-stream phase admission requires the authenticated "
+                "policy AUX sampling measure"
+            )
+        aux_cycle_mode = (
+            str(args.policy_aux_sampling_mode)
+            == POLICY_AUX_SAMPLING_WEIGHTED_CYCLES_V1
+        )
+        phase_admission_aux_offset = _restore_policy_aux_global_draw_offset(
+            resume_progress,
+            required=aux_cycle_mode,
+        )
+        policy_phase_objective_mass_admission = _rank0_authoritative_call(
+            ddp,
+            "exact two-stream policy phase objective-mass admission",
+            lambda: _exact_two_stream_policy_phase_objective_mass_admission(
+                data,
+                train_indices,
+                base_admission=policy_phase_objective_mass_admission,
+                policy_sample_weights=training_policy_sample_weights,
+                policy_aux_sampling_weights=policy_aux_sampling_weights,
+                policy_aux_phase_loss_weights=policy_aux_phase_loss_weights,
+                minimum_phase_mass_fractions=hard_decision_policy_mass_minima,
+                policy_base_loss_weight=float(args.policy_base_loss_weight),
+                policy_aux_loss_weight=float(args.policy_aux_loss_weight),
+                policy_aux_active_batch_size=int(args.policy_aux_active_batch_size),
+                sampler_seed=int(sampler_seed),
+                policy_aux_sampling_mode=str(args.policy_aux_sampling_mode),
+                ddp=ddp,
+                initial_policy_aux_global_draw_offset=phase_admission_aux_offset,
+            ),
+        )
+        base_sampler_report["policy_phase_objective_mass_admission"] = dict(
+            policy_phase_objective_mass_admission
+        )
     if int(ddp["rank"]) == 0:
         policy_sample_weight_report = sample_weight_quality(data, policy_sample_weights)
         value_sample_weight_report = sample_weight_quality(data, value_sample_weights)
@@ -44778,12 +44828,259 @@ def _require_exact_two_stream_phase_mass_admission(
         raise SystemExit("policy base loss weight must be finite and non-negative")
     if not math.isfinite(policy_aux_loss_weight) or policy_aux_loss_weight < 0.0:
         raise SystemExit("policy AUX loss weight must be finite and non-negative")
-    if policy_aux_active_batch_size > 0 and policy_aux_loss_weight > 0.0:
+    # A caller with an AUX stream must defer the actual admission until its
+    # authenticated AUX sampling measure has been constructed.  This helper is
+    # deliberately only a shape/coefficients validator; the exact two-stream
+    # replay below is the authority.  Keeping the validation here preserves the
+    # old fail-closed behaviour for malformed recipes without treating a valid
+    # AUX-only objective as an error.
+
+
+def _exact_two_stream_policy_phase_objective_mass_admission(
+    data,
+    train_indices: np.ndarray,
+    *,
+    base_admission: Mapping[str, object],
+    policy_sample_weights: np.ndarray,
+    policy_aux_sampling_weights: np.ndarray,
+    policy_aux_phase_loss_weights: Mapping[str, float] | None,
+    minimum_phase_mass_fractions: Mapping[str, float] | None,
+    policy_base_loss_weight: float,
+    policy_aux_loss_weight: float,
+    policy_aux_active_batch_size: int,
+    sampler_seed: int,
+    policy_aux_sampling_mode: str,
+    ddp: Mapping[str, int | bool],
+    initial_policy_aux_global_draw_offset: int,
+) -> dict[str, object]:
+    """Replay the exact coefficient-weighted base+AUX policy objective.
+
+    The base and AUX losses are normalized independently in
+    ``_train_entity_batch`` before their configured coefficients are added.
+    Consequently a valid hard-decision admission must replay the AUX stream
+    rather than trying to infer it from the base sampler or from row counts.
+    ``base_admission`` supplies the already replayed base-stream fractions;
+    this helper reproduces the rank-strided AUX order consumed beside those
+    same base microbatches and combines the two normalized measures.
+    """
+
+    base_coefficient = float(policy_base_loss_weight)
+    aux_coefficient = float(policy_aux_loss_weight)
+    aux_batch_size = int(policy_aux_active_batch_size)
+    if (
+        not math.isfinite(base_coefficient)
+        or base_coefficient < 0.0
+        or not math.isfinite(aux_coefficient)
+        or aux_coefficient < 0.0
+        or aux_batch_size <= 0
+    ):
+        raise ValueError("two-stream phase admission received invalid coefficients")
+    if base_coefficient <= 0.0 and aux_coefficient <= 0.0:
+        raise SystemExit("two-stream policy objective has zero total coefficient")
+    if aux_coefficient <= 0.0:
+        return dict(base_admission)
+    if "epoch_receipts" not in base_admission or "geometry" not in base_admission:
         raise SystemExit(
-            "hard-decision policy-mass floors with a nonzero AUX stream require "
-            "an exact coefficient-weighted two-stream admission; base-only "
-            "preflight would certify the wrong training objective"
+            "exact two-stream phase admission requires an exact planned base "
+            "sampler receipt"
         )
+    rows = np.asarray(train_indices, dtype=np.int64)
+    aux_sampling = np.asarray(policy_aux_sampling_weights, dtype=np.float64)
+    policy_weights = np.asarray(policy_sample_weights, dtype=np.float64)
+    if (
+        rows.ndim != 1
+        or aux_sampling.shape != rows.shape
+        or policy_weights.ndim != 1
+        or np.any(rows < 0)
+        or np.any(rows >= policy_weights.size)
+        or not np.isfinite(aux_sampling).all()
+        or np.any(aux_sampling < 0.0)
+        or float(aux_sampling.sum()) <= 0.0
+    ):
+        raise ValueError("two-stream AUX sampling measure is malformed")
+    if "phase" not in data:
+        raise SystemExit("exact two-stream phase admission requires a phase column")
+
+    geometry = dict(base_admission["geometry"])
+    world_size = int(geometry["world_size"])
+    grad_accum_steps = int(geometry["grad_accum_steps"])
+    if world_size <= 0 or grad_accum_steps <= 0:
+        raise ValueError("two-stream phase admission has invalid base geometry")
+    receipts = list(base_admission["epoch_receipts"])
+    if not receipts:
+        raise SystemExit("exact two-stream phase admission has no planned batches")
+
+    aux_phase_group_attributions: list[dict[str, float]] = []
+    aux_phase_draw_counts: Counter[str] = Counter()
+    aux_offset = int(initial_policy_aux_global_draw_offset)
+    if aux_offset < 0:
+        raise ValueError("two-stream AUX global offset must be non-negative")
+    phase_column = data["phase"]
+    for receipt in receipts:
+        if not isinstance(receipt, Mapping):
+            raise ValueError("two-stream base epoch receipt is malformed")
+        epoch = int(receipt["epoch"])
+        microbatches = int(receipt["consumed_synchronous_global_microbatch_count"])
+        if microbatches <= 0:
+            continue
+        local_draws = microbatches * aux_batch_size
+        weighted_cycles = (
+            str(policy_aux_sampling_mode) == POLICY_AUX_SAMPLING_WEIGHTED_CYCLES_V1
+        )
+        aux_rng = np.random.default_rng(
+            np.random.SeedSequence(
+                [int(sampler_seed), 0xA17C1E]
+                if weighted_cycles
+                else [int(sampler_seed), 0xA17C1E, epoch]
+            )
+        )
+        # Ask the existing sampler for its complete global order.  The actual
+        # trainer builds this same global order then gives rank r its r::world
+        # slice; calculating the unsliced order here lets rank 0 authenticate
+        # the DDP-reduced denominator exactly.
+        global_draws = local_draws * world_size
+        global_order = _policy_aux_epoch_order(
+            aux_rng,
+            len(rows),
+            aux_sampling,
+            local_draws=global_draws,
+            ddp={"enabled": False, "world_size": 1, "rank": 0, "local_rank": 0},
+            mode=str(policy_aux_sampling_mode),
+            global_draw_offset=aux_offset if weighted_cycles else 0,
+        )
+        expected = microbatches * aux_batch_size * world_size
+        if global_order.shape != (expected,):
+            raise RuntimeError("two-stream AUX global order length drift")
+        if weighted_cycles:
+            aux_offset += expected
+        for start in range(0, expected, aux_batch_size * world_size):
+            positions = global_order[start : start + aux_batch_size * world_size]
+            source_rows = rows[positions]
+            weights = _policy_aux_loss_weights_without_phase_multiplication(
+                data,
+                source_rows,
+                policy_weights,
+                policy_aux_phase_loss_weights,
+            )
+            phases = np.asarray(phase_column[source_rows]).astype(str, copy=False)
+            if phases.shape != source_rows.shape:
+                raise ValueError("two-stream AUX phase column is not row-aligned")
+            denominator = float(np.sum(weights, dtype=np.float64))
+            if not math.isfinite(denominator) or denominator <= 0.0:
+                raise SystemExit(
+                    "exact two-stream phase admission found an inactive AUX "
+                    "microbatch"
+                )
+            attribution: dict[str, float] = {}
+            for phase in np.unique(phases):
+                selected = phases == phase
+                name = str(phase)
+                aux_phase_draw_counts[name] += int(np.count_nonzero(selected))
+                attribution[name] = float(
+                    np.sum(weights[selected], dtype=np.float64) / denominator
+                )
+            aux_phase_group_attributions.append(attribution)
+
+    if not aux_phase_group_attributions:
+        raise SystemExit("exact two-stream phase admission produced no AUX batches")
+    aux_batch_count = len(aux_phase_group_attributions)
+    # Training divides each microbatch loss by its accumulation-group size;
+    # reconstruct that same per-optimizer-step average before taking the
+    # run-wide mean.  This preserves a final partial group exactly.
+    aux_optimizer_attributions: list[dict[str, float]] = []
+    for start in range(0, aux_batch_count, grad_accum_steps):
+        group = aux_phase_group_attributions[start : start + grad_accum_steps]
+        combined: Counter[str] = Counter()
+        for attribution in group:
+            combined.update(attribution)
+        aux_optimizer_attributions.append(
+            {phase: float(value) / float(len(group)) for phase, value in combined.items()}
+        )
+
+    base_per_phase = dict(base_admission.get("per_phase", {}))
+    all_phases = sorted(
+        set(base_per_phase)
+        | set(aux_phase_draw_counts)
+        | set(HARD_DECISION_POLICY_MASS_PHASES)
+    )
+    coefficient_total = base_coefficient + aux_coefficient
+    minima = (
+        None
+        if minimum_phase_mass_fractions is None
+        else {
+            phase: float(minimum_phase_mass_fractions[phase])
+            for phase in HARD_DECISION_POLICY_MASS_PHASES
+        }
+    )
+    per_phase: dict[str, dict[str, object]] = {}
+    for phase in all_phases:
+        base_fraction = float(
+            dict(base_per_phase.get(phase, {})).get("policy_objective_mass_fraction", 0.0)
+        )
+        aux_values = np.asarray(
+            [attribution.get(phase, 0.0) for attribution in aux_optimizer_attributions],
+            dtype=np.float64,
+        )
+        aux_fraction = float(aux_values.mean())
+        fraction = (
+            base_coefficient * base_fraction + aux_coefficient * aux_fraction
+        ) / coefficient_total
+        minimum = None if minima is None else minima.get(phase)
+        per_phase[phase] = {
+            "base_policy_objective_mass_fraction": base_fraction,
+            "aux_policy_objective_mass_fraction": aux_fraction,
+            "policy_objective_mass_fraction": fraction,
+            "aux_planned_draw_count": int(aux_phase_draw_counts.get(phase, 0)),
+            "minimum_policy_objective_mass_fraction": minimum,
+            "admitted": None if minimum is None else fraction >= minimum,
+        }
+    admitted = None if minima is None else all(
+        bool(per_phase[phase]["admitted"])
+        for phase in HARD_DECISION_POLICY_MASS_PHASES
+    )
+    report: dict[str, object] = {
+        "schema_version": "policy-phase-exact-two-stream-admission-v1",
+        "available": True,
+        "admission_enforced": minima is not None,
+        "admitted": admitted,
+        "reason": (
+            "reviewed_minima_satisfied" if admitted is True else
+            "reviewed_minima_not_commissioned" if admitted is None else
+            "hard_decision_policy_objective_mass_below_reviewed_minimum"
+        ),
+        "objective_measure": "exact_coefficient_weighted_two_stream_synchronous_global_minibatch_v1",
+        "normalization": "independently_self_normalized_streams_then_configured_coefficients_v1",
+        "base_admission_identity_sha256": base_admission.get("identity_sha256"),
+        "policy_base_loss_weight": base_coefficient,
+        "policy_aux_loss_weight": aux_coefficient,
+        "policy_aux_active_batch_size": aux_batch_size,
+        "policy_aux_sampling_mode": str(policy_aux_sampling_mode),
+        "policy_aux_sampling_weights_sha256": _array_content_sha256(aux_sampling),
+        "policy_aux_phase_loss_weights": (
+            None if policy_aux_phase_loss_weights is None else dict(policy_aux_phase_loss_weights)
+        ),
+        "sampler_seed": int(sampler_seed),
+        "initial_policy_aux_global_draw_offset": int(initial_policy_aux_global_draw_offset),
+        "final_policy_aux_global_draw_offset": int(aux_offset),
+        "aux_planned_synchronous_global_microbatch_count": aux_batch_count,
+        "aux_planned_optimizer_batch_count": len(aux_optimizer_attributions),
+        "required_phases": list(HARD_DECISION_POLICY_MASS_PHASES),
+        "minimum_phase_mass_fractions": minima,
+        "per_phase": per_phase,
+    }
+    report["identity_sha256"] = _canonical_json_sha256(report)
+    if admitted is False:
+        details = ", ".join(
+            f"{phase}={per_phase[phase]['policy_objective_mass_fraction']:.6g}"
+            f"<{minima[phase]:.6g}"
+            for phase in HARD_DECISION_POLICY_MASS_PHASES
+            if not bool(per_phase[phase]["admitted"])
+        )
+        raise SystemExit(
+            "hard-decision exact two-stream policy-mass admission refused before "
+            f"the first optimizer step: {details}"
+        )
+    return report
 
 
 def _planned_weighted_policy_phase_objective_mass_admission(
