@@ -94,6 +94,11 @@
         "canonical_sha256": "852ca1b782f0dd76824ff60e32198fc2f278187f005c56fbc69b4587b1f7da66",
         "name": "a1-v15-auxonly-base0-aux1-warmup0-step12",
         "path": "configs/training/a1_v15_auxonly_base0_aux1_warmup0_step12_35m_b200.schema1.json"
+      },
+      {
+        "canonical_sha256": "edef39be66bb1e5e32b21905d384495af44a572de16f503e0d8234a8e8e791ee",
+        "name": "a1-v15-auxonly-base0-aux1-warmup0-step12-seed2",
+        "path": "configs/training/a1_v15_auxonly_base0_aux1_warmup0_step12_35m_b200_seed2.schema1.json"
       }
     ]
   }

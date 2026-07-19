@@ -422,6 +422,7 @@ def test_authenticated_catalog_listing_has_no_second_identity_registry() -> None
         "a1-parent-update-active-p25-35m-b200",
         "a1-v15-split1-value-repair-warmup0-step32",
         "a1-v15-auxonly-base0-aux1-warmup0-step12",
+        "a1-v15-auxonly-base0-aux1-warmup0-step12-seed2",
     ]
     assert all(Path(entry["path"]).is_absolute() for entry in train)
     assert all(len(entry["canonical_sha256"]) == 64 for entry in train)
