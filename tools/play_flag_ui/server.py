@@ -10,11 +10,9 @@ Run:  .venv/bin/python server.py   →  http://localhost:8765
 """
 from __future__ import annotations
 
-import copy
-import os
 import json
+import os
 import random
-import re
 import sys
 import threading
 import time
@@ -27,10 +25,13 @@ sys.path.insert(0, str(REPO / "vendor" / "catanatron" / "catanatron"))
 
 from catanatron.game import Game  # noqa: E402
 from catanatron.json import GameEncoder  # noqa: E402
-from catanatron.models.enums import Action, ActionType  # noqa: E402
+from catanatron.models.enums import (  # noqa: E402
+    CITY, ROAD, SETTLEMENT, Action, ActionType,
+)
 from catanatron.models.player import Color, Player  # noqa: E402
 from catanatron.players.minimax import AlphaBetaPlayer  # noqa: E402
 from catanatron.players.value import ValueFunctionPlayer  # noqa: E402
+from catanatron.state_functions import get_actual_victory_points  # noqa: E402
 
 DATA = ROOT / "data"
 GAMES_DIR = DATA / "games"
@@ -113,11 +114,100 @@ def describe_action(a: Action) -> str:
     return f"{t.value} {v}"
 
 
-_HIDDEN_HAND_RE = re.compile(
-    r"_(WOOD|BRICK|SHEEP|WHEAT|ORE|KNIGHT|YEAR_OF_PLENTY|MONOPOLY|ROAD_BUILDING|VICTORY_POINT)_IN_HAND$"
-)
+# -- board geometry + view snapshot (shape shared with the Caratan viewer UI;
+# -- math copied from catanatron's own renderer: cube_to_pixel + node deltas) --
+import math  # noqa: E402
+
+SQRT3 = math.sqrt(3)
+_NODE_DELTA = {
+    "NORTH": (0.0, -1.0),
+    "NORTHEAST": (SQRT3 / 2, -0.5),
+    "SOUTHEAST": (SQRT3 / 2, 0.5),
+    "SOUTH": (0.0, 1.0),
+    "SOUTHWEST": (-SQRT3 / 2, 0.5),
+    "NORTHWEST": (-SQRT3 / 2, -0.5),
+}
+_DEV_KEYS = ("KNIGHT", "YEAR_OF_PLENTY", "MONOPOLY", "ROAD_BUILDING", "VICTORY_POINT")
+
+
+def tile_center(cube):
+    x, _y, z = cube
+    return (SQRT3 * x + SQRT3 / 2 * z, 1.5 * z)
+
+
+def static_board(game) -> dict:
+    """Unit-scaled geometry from the serialized board (static per seed)."""
+    g = json.loads(json.dumps(game, cls=GameEncoder))
+    tiles = []
+    for t in g["tiles"]:
+        coord = tuple(t["coordinate"])
+        tile = t.get("tile", {}) or {}
+        cx, cy = tile_center(coord)
+        ttype = tile.get("type")
+        tiles.append({"coord": list(coord), "x": cx, "y": cy, "type": ttype,
+                      "resource": tile.get("resource"), "number": tile.get("number"),
+                      "port": (tile.get("resource") or "3:1") if ttype == "PORT" else None,
+                      "direction": tile.get("direction") if ttype == "PORT" else None})
+    nodes = {}
+    for nid, n in g["nodes"].items():
+        cx, cy = tile_center(n["tile_coordinate"])
+        dx, dy = _NODE_DELTA[n["direction"]]
+        nodes[str(nid)] = {"x": cx + dx, "y": cy + dy}
+    return {"tiles": tiles, "nodes": nodes, "edges": [list(e["id"]) for e in g["edges"]]}
+
+
+def snapshot(state, hide_hand_of=None) -> dict:
+    """Exact per-ply state from the engine. The bot's hand is redacted to
+    public counts server-side (honest-information play)."""
+    buildings, roads, hands, vp, awards = {}, {}, {}, {}, {}
+    for color in state.colors:
+        bc = state.buildings_by_color[color]
+        for nid in bc.get(SETTLEMENT, []):
+            buildings[str(nid)] = {"color": color.value, "type": "SETTLEMENT"}
+        for nid in bc.get(CITY, []):
+            buildings[str(nid)] = {"color": color.value, "type": "CITY"}
+        for edge in bc.get(ROAD, []):
+            a, b = sorted(edge)
+            roads[f"{a}-{b}"] = color.value
+        i = state.color_to_index[color]
+        ps = state.player_state
+        if color == hide_hand_of:
+            hands[color.value] = {
+                "hidden": True,
+                "total": sum(ps[f"P{i}_{r}_IN_HAND"] for r in RESOURCES),
+                "DEV": sum(ps.get(f"P{i}_{d}_IN_HAND", 0) for d in _DEV_KEYS),
+            }
+        else:
+            hand = {r: ps[f"P{i}_{r}_IN_HAND"] for r in RESOURCES}
+            dev = {d: ps.get(f"P{i}_{d}_IN_HAND", 0) for d in _DEV_KEYS}
+            hand["DEV"] = sum(dev.values())
+            hand["dev_cards"] = dev
+            hands[color.value] = hand
+        vp[color.value] = get_actual_victory_points(state, color)
+        awards[color.value] = {
+            "road_len": ps.get(f"P{i}_LONGEST_ROAD_LENGTH", 0),
+            "knights": ps.get(f"P{i}_PLAYED_KNIGHT", 0),
+            "has_road": bool(ps.get(f"P{i}_HAS_ROAD", False)),
+            "has_army": bool(ps.get(f"P{i}_HAS_ARMY", False)),
+        }
+    robber = state.board.robber_coordinate
+    return {"buildings": buildings, "roads": roads,
+            "robber": list(robber) if robber else None,
+            "hands": hands, "vp": vp, "awards": awards}
+
+
+def all_rolls(game) -> list:
+    """Every dice roll so far (newest last), from the recorded ROLL actions."""
+    out = []
+    for rec in getattr(game.state, "action_records", []):
+        act = rec.action if hasattr(rec, "action") else rec[0]
+        if act.action_type == ActionType.ROLL and act.value:
+            d = list(act.value)
+            out.append({"color": act.color.value, "dice": d, "total": sum(d)})
+    return out
+
+
 RESOURCES = ("WOOD", "BRICK", "SHEEP", "WHEAT", "ORE")
-DEVS = ("KNIGHT", "YEAR_OF_PLENTY", "MONOPOLY", "ROAD_BUILDING", "VICTORY_POINT")
 
 
 class Session:
@@ -128,6 +218,7 @@ class Session:
         self.human_color = Color[human_color_name]
         self.bot_color = Color.RED if self.human_color == Color.BLUE else Color.BLUE
         self.trace: list[dict] = []  # executed actions (post-execution records)
+        self._board_cache = None
         self.started = time.strftime("%Y%m%d_%H%M%S")
         self.log_path = GAMES_DIR / f"{self.started}_seed{seed}.jsonl"
         self._build_game(replay_to=None)
@@ -193,8 +284,8 @@ class Session:
 
     # -- api ---------------------------------------------------------------
     def state_payload(self):
-        d = json.loads(json.dumps(self.game, cls=GameEncoder))
-        d = self._redact(d)
+        if self._board_cache is None:
+            self._board_cache = static_board(self.game)
         human_turn = (self.game.winning_color() is None
                       and self.game.state.current_color() == self.human_color)
         actions = []
@@ -203,46 +294,27 @@ class Session:
                 actions.append({"i": i, "type": a.action_type.value,
                                 "value": action_to_json(a)[2],
                                 "desc": describe_action(a)})
+        view = snapshot(self.game.state, hide_hand_of=self.bot_color)
+        view["board"] = self._board_cache
+        view["rolls"] = all_rolls(self.game)
         return {
             "seed": self.seed,
             "opponent": self.opponent_kind,
             "human_color": self.human_color.value,
             "bot_color": self.bot_color.value,
             "decision_index": len(self.trace),
+            "num_turns": self.game.state.num_turns,
             "human_turn": human_turn,
             "winner": (self.game.winning_color().value
                        if self.game.winning_color() else None),
             "actions": actions,
-            "log": [{"i": e["i"], "desc": e["desc"],
-                     "color": e["action"][0]} for e in self.trace[-14:]],
+            "log": [{"i": e["i"],
+                     "desc": ("Discard a card" if (e["action"][0] == self.bot_color.value
+                              and e["action"][1] == "DISCARD_RESOURCE") else e["desc"]),
+                     "color": e["action"][0]} for e in self.trace[-40:]],
             "categories": CATEGORIES,
-            "game": d,
+            "view": view,
         }
-
-    def _redact(self, d):
-        """Hide the bot's exact hand; keep public counts. Also mask bot dev buys."""
-        colors = d.get("colors", [])
-        try:
-            bot_idx = colors.index(self.bot_color.value)
-        except ValueError:
-            return d
-        ps = d.get("player_state", {})
-        prefix = f"P{bot_idx}_"
-        n_res = sum(ps.get(f"{prefix}{r}_IN_HAND", 0) for r in RESOURCES)
-        n_dev = sum(ps.get(f"{prefix}{c}_IN_HAND", 0) for c in DEVS)
-        for k in list(ps):
-            if k.startswith(prefix) and _HIDDEN_HAND_RE.search(k):
-                del ps[k]
-        ps[f"{prefix}NUM_RESOURCES_IN_HAND"] = n_res
-        ps[f"{prefix}NUM_DEVS_IN_HAND"] = n_dev
-        redacted = []
-        for rec in d.get("action_records", [])[-14:]:
-            if (rec and rec[0] == self.bot_color.value
-                    and rec[1] == "BUY_DEVELOPMENT_CARD"):
-                rec = [rec[0], rec[1], "HIDDEN"]
-            redacted.append(rec)
-        d["action_records"] = redacted
-        return d
 
     def act(self, index: int):
         with self.lock:
