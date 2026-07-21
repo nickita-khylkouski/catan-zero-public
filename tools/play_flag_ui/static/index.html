@@ -29,6 +29,16 @@ body{background:var(--bg);color:var(--ink)}
 #dicebar .rchip{display:flex;align-items:center;gap:5px;font-size:12px;color:var(--muted2);
   background:var(--card);border:1px solid var(--line);border-radius:9px;padding:3px 8px}
 
+/* ===== bot action banner (plays back opponent moves) ===== */
+#actbanner{position:absolute;top:78px;left:50%;transform:translateX(-50%);z-index:6;display:none;
+  align-items:center;gap:11px;background:rgba(14,21,33,.93);border:1.5px solid #37445a;border-radius:13px;
+  padding:9px 14px;font-size:14px;font-weight:700;box-shadow:0 6px 20px rgba(0,0,0,.4);white-space:nowrap}
+#actbanner.on{display:flex;animation:fadeup .18s}
+#actbanner .aicon{font-size:19px}
+#actbanner .skip{background:var(--card2);border:1px solid var(--line);color:var(--muted2);border-radius:8px;
+  padding:4px 10px;font-size:11.5px;font-weight:700;cursor:pointer;margin-left:4px}
+#actbanner .skip:hover{color:var(--ink)}
+
 /* ===== busy / status strip under the dice ===== */
 #busy{position:absolute;top:78px;left:50%;transform:translateX(-50%);z-index:5;display:none;
   background:rgba(14,21,33,.85);border:1px solid var(--line);border-radius:12px;padding:7px 14px;
@@ -162,6 +172,8 @@ body{background:var(--bg);color:var(--ink)}
   <svg id="svg" viewBox="0 0 10 10" preserveAspectRatio="xMidYMid meet"></svg>
   <div id="dicebar" class="empty"></div>
   <div id="busy"><span>🤖 opponent is thinking…</span></div>
+  <div id="actbanner"><span class="aicon" id="abicon"></span><span id="abtext"></span>
+    <button class="skip" onclick="skipAnim()">⏩ Skip (space)</button></div>
   <div id="players"></div>
   <div id="topbar">
     <select id="opponent">
@@ -307,10 +319,55 @@ function setBusy(b) { BUSY = b; $("busy").classList.toggle("on", !!(b && P && !P
 function refresh(d) {
   if (!d) return;
   if (d.no_game) { newGame(); return; }
-  P = d; MODE = "idle"; SEL = null; hidePrompt();
+  ++ANIMGEN; ANIM = false;         // cancel any playback still running
+  P = d; MODE = "idle"; SEL = null; hidePrompt(); hideBanner();
+  const events = d.events || [];
+  if (events.length) { animateEvents(events); return; }
   render();
   autoMode();
 }
+
+/* ---- opponent-move playback ------------------------------------------- */
+let ANIM = false, ANIMSKIP = false, ANIMGEN = 0;
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const EV_ICON = { ROLL:"🎲", BUILD_ROAD:"🛣️", BUILD_SETTLEMENT:"🏠", BUILD_CITY:"🏛️",
+  BUY_DEVELOPMENT_CARD:"🃏", PLAY_KNIGHT_CARD:"⚔️", PLAY_MONOPOLY:"💰", PLAY_YEAR_OF_PLENTY:"🎁",
+  PLAY_ROAD_BUILDING:"🛤️", MOVE_ROBBER:"🦹", MARITIME_TRADE:"⚖️", DISCARD_RESOURCE:"🗑", END_TURN:"✔" };
+function delayFor(ev) {
+  if (ev.type === "END_TURN") return 380;
+  if (ev.type === "ROLL") return 950;
+  if (ev.type === "MOVE_ROBBER") return 1150;
+  return 850;
+}
+async function animateEvents(events) {
+  const gen = ++ANIMGEN;
+  ANIM = true; ANIMSKIP = false;
+  const finalView = P.view;
+  const nRolls = events.filter(e => e.type === "ROLL").length;
+  let rolls = finalView.rolls.slice(0, finalView.rolls.length - nRolls);
+  for (const ev of events) {
+    if (ANIMSKIP || gen !== ANIMGEN) break;
+    if (ev.type === "ROLL" && Array.isArray(ev.value))
+      rolls = rolls.concat([{color: ev.color, dice: ev.value, total: ev.value[0]+ev.value[1]}]);
+    P.view = {...finalView, ...ev.snap, board: finalView.board, rolls};
+    render(ev);
+    showBanner(ev);
+    await sleep(delayFor(ev));
+  }
+  if (gen !== ANIMGEN) return;     // superseded by a newer refresh
+  ANIM = false; hideBanner();
+  P.view = finalView;
+  render();
+  autoMode();
+}
+function skipAnim() { ANIMSKIP = true; }
+function showBanner(ev) {
+  $("abicon").textContent = EV_ICON[ev.type] || "•";
+  $("abtext").innerHTML =
+    `<span style="color:${pcol(ev.color)}">${who(ev.color)}</span>&nbsp; ${ev.desc}`;
+  $("actbanner").classList.add("on");
+}
+function hideBanner() { $("actbanner").classList.remove("on"); }
 async function newGame() {
   closeModal(true);
   const d = await api("/api/new", {opponent: $("opponent").value, seed: $("seed").value || null,
@@ -318,6 +375,7 @@ async function newGame() {
   if (d && !d.error) refresh(d);
 }
 async function act(i) {
+  if (ANIM) return;
   MODE = "idle"; SEL = null; hidePrompt();
   const d = await api("/api/act", {i});
   if (d && !d.error) refresh(d);
@@ -332,11 +390,12 @@ async function undo() {
 /* ============================================================
    Rendering
    ============================================================ */
-function render() {
+function render(fx) {
   if (!P || !P.view || !P.view.board) return;
   T = fit($("svg"), P.view.board);
   const g = drawBoard($("svg"), P.view, T);
   drawOverlay(g);
+  drawEventFx(g, fx);
   renderDice();
   renderPlayers();
   renderHand();
@@ -402,7 +461,7 @@ function renderHand() {
     html += devsHeld.map(([k,v]) => {
       const play = {KNIGHT:"PLAY_KNIGHT_CARD", YEAR_OF_PLENTY:"PLAY_YEAR_OF_PLENTY",
                     MONOPOLY:"PLAY_MONOPOLY", ROAD_BUILDING:"PLAY_ROAD_BUILDING"}[k];
-      const can = play && legalTypes.has(play) && !BUSY;
+      const can = play && legalTypes.has(play) && !BUSY && !ANIM;
       return `<div class="hcard dev ${can?"playable":""}" style="background:linear-gradient(180deg,#4c4270,#332b54)" `+
         `title="${DEV_NAME[k]}${can?" — click to play":""}" ${can?`onclick="devClick('${play}')"`:""}>`+
         `<div class="ic">${DEV_ICON[k]}</div><div class="nm">${DEV_NAME[k]}</div><div class="ct">${v}</div></div>`;
@@ -420,7 +479,7 @@ function renderDock() {
   const D = $("dock");
   if (!P) { D.innerHTML = ""; return; }
   const G = groups();
-  const yourTurn = P.human_turn && !BUSY && !P.winner && MODE !== "select";
+  const yourTurn = P.human_turn && !BUSY && !ANIM && !P.winner && MODE !== "select";
   const btn = (icon, sub, enabled, tip, onclick, cls="") =>
     `<button class="dbtn ${cls}" ${enabled?"":"disabled"} title="${tip}" ${enabled?`onclick="${onclick}"`:""}>`+
     `${icon}<span class="sub">${sub}</span></button>`;
@@ -519,6 +578,23 @@ function drawOverlay(g) {
       g.appendChild(h); }
   }
 }
+/* gold highlight on the piece the opponent just played (during playback) */
+function drawEventFx(g, ev) {
+  if (!ev) return;
+  const B = P.view.board;
+  if (ev.type === "BUILD_SETTLEMENT" || ev.type === "BUILD_CITY") {
+    const n = B.nodes[ev.value]; if (!n) return; const [x,y] = T(n.x,n.y);
+    g.appendChild(el("circle", {cx:x, cy:y, r:.44, fill:"none", stroke:"#f5c33b", "stroke-width":.08, opacity:.95}));
+  } else if (ev.type === "BUILD_ROAD" && Array.isArray(ev.value)) {
+    const [p,q] = ev.value, na = B.nodes[p], nb = B.nodes[q]; if (!na||!nb) return;
+    const [x1,y1] = T(na.x,na.y), [x2,y2] = T(nb.x,nb.y);
+    g.appendChild(el("line", {x1,y1,x2,y2, stroke:"#f5c33b", "stroke-width":.42, "stroke-linecap":"round", opacity:.4}));
+  } else if (ev.type === "MOVE_ROBBER" && ev.value) {
+    const t = B.tiles.find(t => t.coord.join() === ev.value[0].join()); if (!t) return;
+    g.appendChild(el("polygon", {points:hexPts(T,t.x,t.y,.97), fill:"none", stroke:"#f5c33b", "stroke-width":.09, opacity:.95}));
+  }
+}
+
 function stealModal(opts) {
   openModal("Steal from whom?", opts.map(a =>
     ({html: a.value[1]
@@ -559,7 +635,7 @@ function closeModal(force) {
 $("modalwrap").addEventListener("click", e => { if (e.target.id === "modalwrap") closeModal(); });
 
 function flagModal() {
-  if (!P) return;
+  if (!P || ANIM) return;
   MODAL_LOCKED = false;
   const cats = (P.categories||[]).map(c=>`<option value="${c}">${c.replace(/_/g," ")}</option>`).join("");
   $("modal").innerHTML =
@@ -622,7 +698,8 @@ document.addEventListener("keydown", e => {
     if (e.key === "Escape") closeModal();
     return;
   }
-  if (e.key === "f" || e.key === "F") { e.preventDefault(); flagModal(); }
+  if (e.key === " " && ANIM) { e.preventDefault(); skipAnim(); return; }
+  if (e.key === "f" || e.key === "F") { e.preventDefault(); if (!ANIM) flagModal(); }
   if (e.key === "Escape") { closeModal(); cancelSelect(); }
   if (e.key === "l" || e.key === "L") $("logpanel").classList.toggle("hidden");
 });

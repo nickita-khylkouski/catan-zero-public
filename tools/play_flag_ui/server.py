@@ -218,6 +218,7 @@ class Session:
         self.human_color = Color[human_color_name]
         self.bot_color = Color.RED if self.human_color == Color.BLUE else Color.BLUE
         self.trace: list[dict] = []  # executed actions (post-execution records)
+        self.events: list[dict] = []  # bot actions since the human last saw the board
         self._board_cache = None
         self.started = time.strftime("%Y%m%d_%H%M%S")
         self.log_path = GAMES_DIR / f"{self.started}_seed{seed}.jsonl"
@@ -278,6 +279,16 @@ class Session:
                        if p.color == self.game.state.current_color())
             action = bot.decide(self.game, self.game.playable_actions)
             self._execute(action)
+            e = self.trace[-1]
+            color, type_name, value = e["action"]
+            desc = e["desc"]
+            if color == self.bot_color.value and type_name == "DISCARD_RESOURCE":
+                desc, value = "Discard a card", None  # discards are private
+            self.events.append({
+                "i": e["i"], "color": color, "type": type_name,
+                "value": value, "desc": desc,
+                "snap": snapshot(self.game.state, hide_hand_of=self.bot_color),
+            })
         if self.game.winning_color() is not None:
             self._log({"type": "end", "winner": self.game.winning_color().value,
                        "decisions": len(self.trace), "ts": time.time()})
@@ -297,6 +308,7 @@ class Session:
         view = snapshot(self.game.state, hide_hand_of=self.bot_color)
         view["board"] = self._board_cache
         view["rolls"] = all_rolls(self.game)
+        events, self.events = self.events, []  # consumed once, by the next render
         return {
             "seed": self.seed,
             "opponent": self.opponent_kind,
@@ -313,6 +325,7 @@ class Session:
                               and e["action"][1] == "DISCARD_RESOURCE") else e["desc"]),
                      "color": e["action"][0]} for e in self.trace[-40:]],
             "categories": CATEGORIES,
+            "events": events,
             "view": view,
         }
 
@@ -339,6 +352,7 @@ class Session:
                 raise ValueError("nothing to undo")
             keep = self.trace[:idx]
             self.trace = []
+            self.events = []  # stale animation queue; undo re-renders directly
             self._build_game(replay_to=None)
             for rec in keep:
                 self._execute_replay(rec)
